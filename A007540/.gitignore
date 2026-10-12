@@ -7,3 +7,5 @@ third_party/Wilson-prime/ntt-0.1.2
 third_party/Wilson-prime/ntt/ntt-0.1.2/tune
 third_party/Wilson-prime/ntt/ntt-0.1.2/tune.log
 third_party/Wilson-prime/ntt/ntt-0.1.2/tunetab.new
+runs/*/wilsonres.bin
+runs/*/part*/wilsonres.bin

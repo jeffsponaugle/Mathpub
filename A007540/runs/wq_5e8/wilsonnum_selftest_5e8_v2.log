@@ -1,0 +1,22 @@
+table: 13679315 primes, p in [7, 249999991]
+primes <= 250000000: 13679318;  spf table to 166666668  (5.0 s)
+table complete for all primes in [7, 250000000]
+generalised Wilson quotients for 2748 prime powers p^k <= N (k>=2)  (682.0 s)
+cross-check: 3000 random n <= 30000000 plus 11 known terms vs direct definition: 0 mismatches  (3658 s)
+WILSON 23025711  (known)
+WILSON 558771  (known)
+WILSON 8121909  (known)
+WILSON 24365727  (known)
+WILSON 399292158  (known)
+WILSON 26921605  (known)
+WILSON 12326713  (known)
+WILSON 86286991  (known)
+WILSON 5  (known)
+WILSON 13  (known)
+WILSON 1964215  (known)
+WILSON 139459265  (known)
+WILSON 563  (known)
+WILSON 341569806  (known)
+WILSON 5971  (known)
+SUMMARY N=500000000: 487323449 n tested at their largest prime power, 160129 full tests, 15 Wilson numbers > 1 found  (3692 s, 8 threads)
+LIST 1 5 13 563 5971 558771 1964215 8121909 12326713 23025711 24365727 26921605 86286991 139459265 341569806 399292158

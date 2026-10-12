@@ -5082,12 +5082,29 @@ void printallres(int cores)  {
   
    int i,j;
    FILE* out;
-   out=fopen("wilsonres.txt","a+");
-   
-   for(i=0;i<cores;i++)
+   /* [A157250 patch] binary output: for each prime p the pair (p, w_p) as two little-endian uint64,
+      where w_p = ((p-1)!+1)/p mod p is the Wilson quotient, written to wilsonres.bin.
+      The original text output (wilsonres.txt) is kept only if WILSON_TEXT is set. */
+   {
+     static mpz_t wq; static int wq_init=0; unsigned long long buf[2];
+     if(!wq_init){mpz_init(wq);wq_init=1;}
+     out=fopen("wilsonres.bin","ab");
+     for(i=0;i<cores;i++)
+       for(j=0;j<numsol2[i];j++){
+          mpz_add_ui(wq,saved_r2[i][j],1);
+          assert(mpz_divisible_p(wq,saved_p2[i][j]));
+          mpz_divexact(wq,wq,saved_p2[i][j]);           /* = w_p, already < p since r < p^2 */
+          buf[0]=mpz_get_ui(saved_p2[i][j]); buf[1]=mpz_get_ui(wq);
+          fwrite(buf,sizeof(buf),1,out);
+       }
+     fclose(out);
+   }
+   if(getenv("WILSON_TEXT")){
+     out=fopen("wilsonres.txt","a+");
+     for(i=0;i<cores;i++)
        for(j=0;j<numsol2[i];j++)gmp_fprintf(out,"%Zd %Zd\n",saved_p2[i][j],saved_r2[i][j]);
-   fclose(out);
-   
+     fclose(out);
+   }
    return;
 }
 

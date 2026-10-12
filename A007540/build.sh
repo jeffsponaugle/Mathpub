@@ -34,4 +34,6 @@ $CC $FLAGS -o ../../pw13 pw13.c $NTT $GMP/.libs/libgmp.a -lm
 $CC -O2 -w -o ../../wilsontest wilsontest.c -I$GMP $GMP/.libs/libgmp.a -lm
 cd ../..
 cc -O2 -o tools/wilson_brute tools/wilson_brute.c -lpthread
-echo "built: pw13 wilsontest tools/wilson_brute"
+cc -O2 -o tools/wilsonnum tools/wilsonnum.c -lpthread -lm          # A157250 Wilson-number sieve (see A157250.md)
+cc -O2 -o tools/wilsonnum_brute tools/wilsonnum_brute.c -lpthread
+echo "built: pw13 wilsontest tools/wilson_brute tools/wilsonnum tools/wilsonnum_brute"

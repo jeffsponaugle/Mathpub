@@ -1,0 +1,1 @@
+Done the st=7-en=31250000 range. p==1 mod 2

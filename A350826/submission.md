@@ -27,7 +27,7 @@ checked with the tools in this directory (`a350826.c`, `cuda/a350826_cuda.cu`, `
 | A350826(18) = 3439443854 | to submit (own GPU run; equals the value implied by Desfontaines' pi_6) |
 | A350826(19) = 24711327817 | to submit (own GPU run; equals the value implied by Desfontaines' pi_6) |
 | A350826(20) = 180637585474 | to submit (**new**, computed 2026-10-02 on two DGX Sparks; = A063501(20) − A063501(19)) |
-| A350826 comment "as far as we know ... same length" | to replace by a verified statement for 3 <= n <= 24 |
+| A350826 comment "as far as we know ... same length" | supplement (signed comment) with the proof for 3 <= n <= 1000 |
 | Dead link in A350826 (`PI_06.html`) | to fix (`PI_06.php`), as already done in A063501 |
 | pi_6(2^64) | our **48629688861** vs Luhn's table **48629687343** (+1518); ours computed three times (section 3); Jeff is contacting Luhn |
 | A350826(1..17), A063501(1..17), A022008 b-file, A271000 b-file, A200503/A200504/A233426 (terms 1..56), A343636 (n = 0..23) | re-verified, all agree |
@@ -50,22 +50,43 @@ These are exactly the first differences of the updated A063501 from n = 18 on:
 4010758480 − 571314626 = 3439443854, 28722086297 − 4010758480 = 24711327817,
 209359671771 − 28722086297 = 180637585474.
 
-### COMMENTS — replace the second comment
+### COMMENTS — add a signed comment (recommended), or update the second comment
 
-Current:
+The second comment is M. F. Hasler's (the author's):
 
 > For n = 1 and n = 2 (see Example), the last member of the sextuplet has one digit more than
 > the initial member (so the count would be 0 for these two, if all terms of the sextuplet had to
 > have the same length). As far as we know, for all n > 2, all members of the sextuplets have the
 > same length. A sufficient condition for this is that A033874(n) > 16.
 
-Proposed:
+**Option A (recommended): leave it as is and add a new signed comment after it.** This follows the
+OEIS habit of not rewriting other contributors' comments; "as far as we know, for all n > 2" stays true
+as a statement about all n, and the new comment adds what is now verified:
 
 ```
-For n = 1 and n = 2 (see Example), the last member of the sextuplet has one digit more than the initial member (so the count would be 0 for these two, if all terms of the sextuplet had to have the same length). For 3 <= n <= 24, all members of each sextuplet have the same length: no initial member p satisfies 10^n - 16 <= p < 10^n. A sufficient condition for this is A033874(n) > 16, which fails for n = 3, 5, 7, 8, 12, 15, 17, 18, 20; for those n it was checked directly. Hence a(n) = A063501(n) - A063501(n-1) for 4 <= n <= 24.
+For n >= 3, a prime sextuplet with members of different lengths would have to start at p = 10^n - 3, the only number == 7 (mod 30) in [10^n - 16, 10^n). Unless n == 8 (mod 12), one of its members is divisible by 7, 11 or 101 (11 | p+4 for odd n; p is not == 6 (mod 7) unless n == 2 (mod 6); 101 | p+4 for n == 2 (mod 4)); for n == 8 (mod 12) and n <= 1000, one of its members is composite. Hence for 3 <= n <= 1000 all members of each sextuplet have the same length, and a(n) = A063501(n) - A063501(n-1) for 4 <= n <= 1000. - _Jeff Sponaugle_, Oct 08 2026
 ```
 
-(Checked with `a350826 count 10^n-16 10^n` for n = 3..24, `verify/reverify_oeis.txt`.)
+(Use the date of the submission.) Why this holds, and why it does not depend on the terms computed so
+far: sextuplets other than (7, ..., 23) start at p == 97 (mod 210), so p == 7 (mod 30), and 10^n == 10
+(mod 30), so p = 10^n - 3 is the only start that could put members on both sides of 10^n; 10^n - 3 itself
+is prime for n = 1, 2, 3, 17 (A033874), and n = 1, 2 are exactly the cases where the dividing prime 11
+or 101 is itself the member p+4 (7+4 = 11, 97+4 = 101). The congruences depend only on n mod 12 (checked
+for all residues); for n == 8 (mod 12), 8 <= n <= 1000, a base-2 Fermat witness proves a member composite.
+For 3 <= n <= 24 the tool also checked the window [10^n - 16, 10^n) directly (`verify/reverify_oeis.txt`).
+
+**Option B: update the comment in place** (replace "As far as we know, for all n > 2, ..." by the
+verified range), with a note to the editors that explains why and offers Option A as the fallback:
+
+```
+For n = 1 and n = 2 (see Example), the last member of the sextuplet has one digit more than the initial member (so the count would be 0 for these two, if all terms of the sextuplet had to have the same length). For 3 <= n <= 1000, all members of each sextuplet have the same length: the only possible exception is p = 10^n - 3, which has a member divisible by 7, 11 or 101 unless n == 8 (mod 12), and a composite member for n == 8 (mod 12), n <= 1000. A sufficient condition for this is that A033874(n) > 16. Hence a(n) = A063501(n) - A063501(n-1) for 4 <= n <= 1000.
+```
+
+Note to the editors for Option B:
+
+```
+I updated the second comment instead of adding a new one because it is the place where the question is discussed: its "as far as we know" dates from 2022, when only a(1..17) were known (Hugo Pfoertner checked those terms then, per the 2022 discussion). The property matters for exactly the new terms: the sufficient condition A033874(n) > 16 fails for n = 17, 18 and 20, so a(18)-a(20) equal the differences of A063501 only because no sextuplet straddles 10^n; this is now shown for all 3 <= n <= 1000 (the only candidate start is 10^n - 3, excluded by 7, 11 or 101 unless n == 8 (mod 12), and by a composite member for those n up to 1000). The edit keeps the original remarks on n = 1, 2 and on the sufficient condition and only replaces the hedge by the verified range. If you prefer to keep the original wording, I am happy to put the new part into a separate signed comment instead.
+```
 
 ### Optional comment (rigour of the counting)
 
@@ -134,7 +155,7 @@ Keyword `more` stays.
 Short version, in the style of the A063501 note that was accepted:
 
 ```
-3 new terms: a(18)-a(19) agree with Karl Desfontaines's counts in Luhn's table, a(20) is new; they are the first differences of A063501(17..20), which was just extended (#29). The comment on members of different length is now checked for 3 <= n <= 24, and the dead link to Luhn's table is fixed.
+3 new terms: a(18)-a(19) agree with Karl Desfontaines's counts in Luhn's table, a(20) is new; they are the first differences of A063501(17..20), which was just extended (#29). A new comment shows that no sextuplet has members of different lengths for 3 <= n <= 1000, and the dead link to Luhn's table is fixed.
 ```
 
 Longer version, if the editors ask how the terms were computed:
@@ -162,7 +183,7 @@ Approved as #29 (Oct 03 2026). Live entry now:
 Optional follow-up (not in the approved edit; could go in after the A350826 edit):
 
 ```
-FORMULA:    a(n) = Sum_{k=1..n} A350826(k) for 3 <= n <= 24 (no prime sextuplet has members on both sides of 10^n for these n).
+FORMULA:    a(n) = Sum_{k=1..n} A350826(k) for 3 <= n <= 1000 (no prime sextuplet has members on both sides of 10^n for these n; see A350826).
 CROSSREFS:  Cf. A343636, A350826.
 ```
 

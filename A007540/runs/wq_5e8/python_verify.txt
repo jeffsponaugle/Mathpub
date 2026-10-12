@@ -1,0 +1,5 @@
+5971 factors {7: 1, 853: 1} P(n) mod n^2 = 1 e(n) = -1 -> WILSON NUMBER (0 s)
+24365727 factors {3: 2, 139: 1, 19477: 1} P(n) mod n^2 = 1 e(n) = -1 -> WILSON NUMBER (7 s)
+86286991 factors {7: 2, 1760959: 1} P(n) mod n^2 = 1 e(n) = -1 -> WILSON NUMBER (28 s)
+399292158 factors {2: 1, 3: 1, 17: 1, 97: 1, 40357: 1} P(n) mod n^2 = 1 e(n) = -1 -> WILSON NUMBER (89 s)
+139459265 factors {5: 1, 11: 1, 71: 2, 503: 1} P(n) mod n^2 = 1 e(n) = -1 -> WILSON NUMBER (38 s)

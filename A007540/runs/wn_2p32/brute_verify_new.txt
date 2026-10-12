@@ -1,0 +1,12 @@
+683139612  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+1197876474  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+1366279224  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+1597168632  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+2049418836  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+2340914226  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+2395752948  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+2732558448  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+3074128254  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+3194337264  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+3623403714  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER
+4098837672  P(n) mod n^2 = 1  e(n)=-1  WILSON NUMBER

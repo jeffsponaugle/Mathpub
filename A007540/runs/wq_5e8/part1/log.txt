@@ -1,0 +1,14 @@
+Found 10 core(s) on this computer.
+Please give the number of availables core(s) for this code! Not found unfinished workunit.
+The allowed (even) e values are:
+2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44,48,50,54,60,66,70,84,90
+Choose one: Please give start and end value of the search! Give how many primes to process at once: Do you want to print to file all residues (0/1)? (Warning large text file!): Would you like to use large savefile for frequent save (in approx. every 1800 seconds or before we exit) (0/1)? All interesting residues in wilson.txt (res=-1+kp, where abs(k)<=max(100,p/5000))
+Give the Wall time you would like to spend on this run in seconds ! Precompute pow table.
+done.
+All precomputations are done, start the clock.
+Testing p=31250017...62499971, p==1 mod 2, stage=0, (1771090 primes for that e=2 is the best) time=0 sec.
+Done the first stage in 11 sec., 10 sec. cpu clock time, found ((q-1)/e)! mod m^2, where q=31250017, e=2, m=product of 1771090 primes
+Done the second stage in 73 sec., 71 sec. cpu clock time, computed 1771090 values of the form ((p-1)/e)!/((q-1)/e)! mod p^2, where q=31250017, e=2
+Done the third stage in 0 sec., 1 sec. cpu clock time, computed the polynomial gcd's for e=2.
+CPU time used: 85 sec.; Wall clock time passed: 87 sec.; 
+Done the st=31250001-en=62500000 range. Time=87 sec., 85 sec. cpu clock time
