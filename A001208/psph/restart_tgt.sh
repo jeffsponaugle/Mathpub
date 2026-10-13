@@ -1,5 +1,12 @@
 #!/bin/sh
 # usage: sh restart_tgt.sh NEWTGT   -- restart the job chain with a new target for job 1 (run on the box, in its psph dir)
+#
+# Used during the n(9,8) search (Oct 1-2 2026) to raise the target of the h9k8 range on mathd / mathb / mathg after a
+# better basis had been found (a higher target prunes more; results stay exact as long as the target is <= the optimum).
+# Steps: stop jobs.sh, the h9k8 run_range.sh and the workers; rewrite the target in jobs.sh with GNU sed -i (Linux);
+# delete the partial .out/.err of the interrupted chunk; restart jobs.sh with nohup and show the new processes.
+# Inputs: NEWTGT.  Outputs: edited jobs.sh, a "=== RESTART" line in jobs.log, status on stdout.
+# Caveat: completed chunks keep the target they ran with; the audit only needs every target <= the final optimum.
 NEW=$1
 cd "$(dirname "$0")"
 # order matters: stop the chain driver first so it cannot advance to the next job, then the range driver, then the workers

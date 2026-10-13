@@ -1,6 +1,12 @@
 #!/bin/sh
 # Resumable exact search for n(9,8) = A053348(9) = A005344(8).  Work items 0..11002 at split depth 4,
 # processed in chunks of 400; a chunk is marked done by an empty .done file.  Re-run this script to resume.
+#
+# The first phase of the n(9,8) search, on the M1 Pro (Sep 30 - Oct 1 2026, 10 threads).  TGT can be overridden from
+# the environment (default 5522 = the best basis known at the time + 1); S2 is only written to the log (psph uses its
+# automatic deep-hole count).  Chunk i = items [400 i, 400 (i+1)); tools/collect_h9k8.py relies on this layout.
+# Output in logs/overnight: h9k8_progress.log, h9k8_solutions.log, h9k8_chunk_i.{out,err,done}.  The later phases ran
+# with psph/run_range.sh on the x86 boxes (see DEPLOY.md).
 P=/Users/Jeff.Sponaugle/src/math/A001208/psph/psph
 L=/Users/Jeff.Sponaugle/src/math/A001208/logs/overnight
 TGT=${TGT:-5522}

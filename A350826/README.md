@@ -181,8 +181,13 @@ the CPU.
 * Arithmetic: base-2 strong pseudoprimes (A001262) pass SPRP and fail BPSW, strong Lucas
   pseudoprimes (A217255) pass Lucas and fail SPRP, every odd n < 2e5, 200,000 random
   n < 2^80 (CPU) and 65,536 (GPU) agree with deterministic Miller–Rabin.
-* Wheel invariance (CPU selftest): one w = 23 class against its refinements for
-  w = 29 ... 43, with different B and segment sizes, at 1e18 and across 2^64.
+* Wheel invariance (CPU selftest): three w = 23 classes against their refinements for
+  w = 29 ... 43, with different B, segment sizes and pattern bounds, at 1e18 and across 2^64.
+* Small-prime patterns (CPU selftest, since 2026-10-12): the small ranges run with pattern
+  bounds 0, 64, 256 and 1024 and must agree with direct search; configurations with the same
+  w and B must leave identical survivor counts. Mutation tests confirm that an off-by-one in
+  the pattern phase and a dropped pattern are both caught (the earlier selftest ran without
+  patterns and missed them).
 * a(18) GPU chunk 0 recomputed by the CPU tool: identical log line.
 * Related OEIS data re-verified with `verify/reverify_oeis.py` (`verify/reverify_oeis.txt`): A022008
   b-file (10000 terms), A271000 b-file (5940 terms), A200503/A200504/A233426 terms 1..56 (all record

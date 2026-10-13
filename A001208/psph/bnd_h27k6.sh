@@ -5,6 +5,12 @@
 # a shift of at most 7, so up to 7 items could fall through at a boundary where the lower chunk used TGT
 # 176381 and the upper one 177915. Re-running items [B-8,B+8) at TGT 176381 (the larger enumeration) for
 # every chunk boundary B = 100000*i covers every such item regardless of which side used which target.
+#
+# Ran on mathg from Oct 3 2026 02:43 UTC with 4 threads beside the main 32-thread run; restart_bnd.sh later removed
+# the "nice -n 19" from the deployed copy (this local copy still has it).  Completed 29/29 windows; the bases it reported
+# were all below the best known value.  Superseded in coverage by bnd2_h27k6.sh once a third target was in use.
+# Resumable: windows with a w_i.done marker are skipped.  Output: logs/h27k6_bnd/{progress.log, solutions.log,
+# w_i.out, w_i.err, w_i.done}.  No arguments; no exit status of interest.
 cd ~/A001208/psph
 L=logs/h27k6_bnd; mkdir -p $L
 for i in $(seq 1 29); do

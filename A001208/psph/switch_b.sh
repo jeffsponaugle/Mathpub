@@ -1,4 +1,9 @@
 #!/bin/sh
+# One-off reconfiguration script (rebalance #6, Oct 3 2026 ~01:10 PDT, run on mathb in its psph directory): after
+# chunk 21 run chunks 22-24 at TGT 186943 (jobs7.sh); chunks 25 and 26 go to mathd and mathg.
+# Pattern: kill the old wrapper only (the running run_range.sh driver and psph keep going), touch .done SKIP markers
+# for chunks that move to another box (unless they had already started there), start the new wrapper with nohup,
+# log the switch in jobs.log and show the running wrappers / drivers.  Kept for the record of how the chunks moved.
 cd ~/A001208/psph
 for p in $(pgrep -f "sh [j]obs6.sh"); do kill $p; done
 sleep 1

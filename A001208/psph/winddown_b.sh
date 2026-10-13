@@ -1,5 +1,7 @@
 #!/bin/sh
 # mathb wind-down: kill the wrapper so nothing starts after chunk 29; the running driver/psph finish chunk 29 on their own.
+# One-off, Oct 3 2026 07:59 PDT (Jeff asked to wind the x86 boxes down); chunk 29 finished at 08:13 PDT and completed
+# the A001211(27) search.  Prints the remaining wrappers / driver / psph count and the chunk's last progress line.
 cd ~/A001208/psph
 for p in $(pgrep -f "sh [j]obs8.sh"); do kill $p; done
 sleep 1

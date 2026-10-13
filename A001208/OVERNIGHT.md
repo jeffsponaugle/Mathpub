@@ -83,3 +83,7 @@ so the true n(9,8) is probably 5500-5800 and n(27,6) probably 185000-195000.
   remaining chunks across other machines (`psph -i lo:hi`, deterministic item order).
 - Next candidates for the CPU after (9,8): k=6 h=27 (target 176381), k=4 h=303 with `psph16` (target
   71148328, 2000-3300 core-h, best done on the 96-core box), k=5 h=91.
+
+- 15:20 Oct 12 — the suspended GPU k=21 run no longer exists: the Mac was restarted for the macOS 27 upgrade. The k=21
+  growth measurement stopped at ~2.5e13 of ~3.4e13 nodes (no result); rerun from scratch if it is still wanted. Note: after
+  the upgrade clang cannot link with the default SDK; build with `SDKROOT=$(xcrun --sdk macosx --show-sdk-path) make` (Xcode 26.6 linker vs Command Line Tools 27.0 SDK).

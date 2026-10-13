@@ -1,43 +1,142 @@
 /*
- * a350826_cuda.cu
+ * a350826_cuda.cu - count prime sextuplets (p, p+4, p+6, p+10, p+12, p+16) on an NVIDIA GPU
  *
- * CUDA version of ../a350826.c: counts prime sextuplets (p, p+4, p+6, p+10, p+12,
- * p+16) by initial member p in [LO, HI), for OEIS A350826 / A063501.  It uses the
- * same wheel classes, chunks, per-bin counts and checksums, chunk-log lines and
- * checkpoint format as the CPU tool, so runs can be compared chunk by chunk (for the
- * same w, B and chunk) and a checkpoint written by one tool can be resumed by the
- * other.
+ * Purpose
+ * =======
+ * CUDA version of ../a350826.c for the OEIS sequences A350826 (sextuplets by number of digits
+ * of the initial member p) and A063501 (pi_6(10^n)).  It uses the same wheel classes, chunks,
+ * per-bin counts and checksums, chunk-log lines and checkpoint format as the CPU tool, so runs
+ * can be compared chunk by chunk (same range, wheel, bound, chunk size and bins; see
+ * `a350826 recheck`) and a checkpoint written by one tool can be resumed by the other.  On two
+ * DGX Sparks (GB10, sm_121) it confirmed a(18) = 3439443854 and a(19) = 24711327817 and
+ * computed a(20) = 180637585474 (Oct 2026; README.md).
  *
- * GPU layout
- * ----------
- * One thread block (NT = 512 threads) per residue class r mod M.  The class
- * progression p = p0 + M k is sieved in segments of SEGB bits held in shared memory:
+ * Theory of operation
+ * ===================
+ * The mathematics is that of a350826.c (sections 1-7 and 9 of its header): the admissible
+ * residues, the wheel with its C(w) classes, one progression p = p0 + M k per class, the phase
+ * phi = -p0 M^-1 mod q of each sieving prime with the class-independent offsets
+ * K_j = -d_j M^-1 mod q, base-2 strong probable-prime tests followed by a strong Lucas test
+ * (BPSW), why the count is exact, and the order-independent checksums.  This file differs in
+ * how the work is mapped onto the GPU.
  *
- *   - primes q < PATMAX (default 256): 64-bit word patterns as in the CPU tool
- *     (T_q[s] = bits i with (s + i) mod q in {0, k1..k5}); thread t owns the WPT words
- *     [t WPT, (t+1) WPT) and ORs the patterns into registers;
- *   - primes PATMAX <= q < QW (default 4096, "medium"): one warp per prime; lane l
- *     marks rounds l-1, l+31, ... (a round = one period of q = six bits) with
- *     shared-memory atomicOr;
- *   - primes QW <= q <= B ("large"): one thread per prime, phases in registers, the
- *     CPU tool's round loop with atomicOr.
+ * 1. Launches.  A chunk (D.chunk consecutive classes, at most G.cap = 65536) is one launch.
+ *    The host computes the residues of its classes (class_r) and copies them to the device.
+ *    A launch is cut into sub-launches of G.sub classes, chosen so that their expected number
+ *    of survivors (with a 1.3x margin) fits the survivor buffer of G.bcap = 2^25 entries.
+ *    Each sub-launch runs three kinds of kernels on one stream:
+ *      sext_kernel   one thread block (NT = 512 threads) per class: sieve the class and append
+ *                    its survivors (initial members p) to the survivor buffer;
+ *      round_kernel  six times, m = 0..5: keep the p whose member p + OFF[m] passes the base-2
+ *                    strong test, moving them between two ping-pong buffers;
+ *      cand_kernel   strong Lucas test of all six members of each remaining candidate, then
+ *                    count and checksum it in its bin.
+ *    All sub-launches of a launch add into one Res record (counts and checksums per bin,
+ *    statistics, SPSP cases), which is copied back to the host and folded into the totals.
  *
- * Survivors go to a shared list and are tested breadth first: all of them get the
- * base-2 strong test of p, the passing ones that of p+4, and so on, so warps stay
- * converged.  When all six members pass, each gets a strong Lucas test (BPSW) on
- * the GPU; failures are reported as SPSP lines and not counted.  Initial members
- * below 2^20 are tested on the host.  Arithmetic: Montgomery with R = 2^64 below
- * 2^64 and R = 2^128 (unsigned __int128) above.
+ * 2. Sieving one class (sext_kernel).  The class is processed in segments of SEGB = 2^18 bits
+ *    (the last one may be shorter), each held as a bitmap in shared memory (32 KB; 1 = killed).
+ *    The sieving primes w < q <= B are split into three groups, each handled in the way that
+ *    suits its size:
+ *      pattern primes  q < pmax (-p, default 256; at most MAXPAT = 64 primes): the 64-bit word
+ *                      patterns T_q[s] of the CPU tool (section 5 of its header).  Thread t
+ *                      builds the WPT = 8 words [8t, 8t+8) of the segment in registers as the
+ *                      OR of T_q[(64 j - phi) mod q] over these primes and stores them, which
+ *                      also initialises the bitmap;
+ *      medium primes   pmax <= q < QW (-Q, default 4096; at most 2048 primes): one warp per
+ *                      prime at a time; lane l marks the rounds l-1, l+31, l+63, ... (a round is
+ *                      the six positions phi + t q + {0, K_1, ..., K_5} for one t).  Each lane
+ *                      keeps the phases of its own primes in registers, and __shfl_sync hands
+ *                      them to the warp when that prime is marked;
+ *      large primes    QW <= q <= B (at most NT * MAXLPT = 24576 primes): one thread per prime,
+ *                      the round loop of the CPU tool's mark_prime(), phases in registers (the
+ *                      template parameter LPT = primes per thread is 12, 24 or 48, whichever
+ *                      is the smallest that suffices).
+ *    Marks are 32-bit atomicOr operations on shared memory, since threads share words.  After
+ *    a barrier every thread takes the clear bits of its WPT words (bits beyond the segment
+ *    end masked off); a warp-wide prefix sum and one atomicAdd per warp reserve room in the
+ *    survivor buffer, where each survivor is stored as its initial member p (two u64
+ *    words).  For the next segment the phases move on by SEGB: phi = (phi - SEGB mod q) mod q
+ *    for pattern and medium primes, the end position of the round loop for large primes.
+ *
+ * 3. Testing (round_kernel, cand_kernel).  Breadth first, as on the CPU: round m reads the
+ *    survivors kept by round m - 1 and keeps those whose member p + OFF[m] is a base-2 strong
+ *    probable prime, one thread per number, with one atomicAdd per warp for the output
+ *    positions.  About half drop out per round, so few numbers reach cand_kernel, which
+ *    runs the strong Lucas test on all six members.  A member that fails it is a base-2
+ *    strong pseudoprime (SPSP): the candidate is counted in res->spsp, recorded (the first
+ *    MAXSPSP per launch) and not counted as a sextuplet.  Otherwise the sextuplet is added
+ *    to the count and checksum of its bin (binary search over the boundaries).  Testing in
+ *    separate kernels with one thread per number, instead of inside the sieve kernel, made
+ *    the tool about 2.7 times faster.
+ *
+ * 4. Arithmetic.  Montgomery multiplication throughout: R = 2^64 below 2^64 (d_mmul64, the
+ *    "subtracting" form of a350826.c); for base-2 tests of members in [2^64, 2^96), R = 2^96
+ *    with three 32-bit limbs (d_mmul96, CIOS method: the GPU's integer multiplier is 32 bits
+ *    wide, and 64-bit products take several steps); for the Lucas tests above 2^64 and any
+ *    test above 2^96, R = 2^128 with two 64-bit limbs (d_mmul128).  The Montgomery form of 1,
+ *    R mod n, is computed without a slow wide division: a floating-point estimate of the
+ *    quotient, lowered so that it cannot be too large, is corrected exactly (d_r64, d_r96,
+ *    d_r128).
+ *
+ * 5. Survivor-buffer overflow.  If a sub-launch finds more survivors than the buffer holds,
+ *    the extra ones are dropped and res->ovf is set.  The host then discards that launch's
+ *    results and redoes the chunk in 8 pieces with 1/8 of the sub-launch size
+ *    (redo_in_pieces); an overflow even then is a fatal error.  The sub-launch sizing makes
+ *    this rare (it is not exercised by the selftest).
+ *
+ * 6. Host driver (run_count).  Two CUDA streams, each with its own buffers, keep two launches
+ *    in flight while the host prepares the next.  The host waits for them in chunk order and
+ *    folds each into the totals, so "chunks [0, frontier) are done" holds exactly as in the
+ *    CPU tool, and the checkpoint (-S) and chunk log (-L) mean the same.  Initial members
+ *    below 2^20 are tested on the host (small_region) and added to chunk 0.  SIGINT and
+ *    SIGTERM stop the launching of new chunks; launches in flight finish and are folded.
+ *
+ * 7. Limits.  As in a350826.c (HI <= 2^80, B <= 2^20, 7 <= w <= 47, MAXBIN bins), and further:
+ *    at most 64 pattern, 2048 medium and 24576 large primes (with the default -Q, B up to
+ *    about 2.9e5; 2^18 always fits), chunks of at most 65536 classes, the survivors of one
+ *    class must fit the buffer (2^25), at most MAXSPSP SPSP cases printed per chunk (all are
+ *    counted).  Device memory: about 2 GiB, almost all of it the four survivor buffers
+ *    (512 MiB each).
+ *
+ * 8. Errors and exit status.  As in a350826.c: die() (message, exit status 1) for invalid
+ *    arguments, inconsistent checkpoints, failed allocations, any CUDA error (CK), a class too
+ *    long for the wheel, too many medium or large primes, and an unrecoverable survivor-buffer
+ *    overflow; usage() exits with status 2.  Exit status: count 0 if complete, 1 if stopped
+ *    early (PARTIAL results); selftest 1 if any test fails; bench, num and mrbench 0.
+ *
+ * 9. Build-time geometry (-D...): NT threads per block (512), MINB blocks per SM for
+ *    __launch_bounds__ (2), SEGB segment bits (2^18; SEGB/64 must be a multiple of NT).  The
+ *    grids of the test kernels (48 * 8 and 48 * 4 blocks) suit the 48 SMs of GB10.
+ *    -DNOATOMIC replaces the atomic ORs by plain ones, for timing experiments only (the
+ *    results are then wrong).
+ *
+ * Code map
+ * ========
+ *   host helpers (parsing, hashing) -> reference arithmetic (host) -> wheel, sieving primes
+ *   and patterns (host tables) -> device arithmetic (64-, 128- and 96-bit Montgomery, base-2
+ *   and Lucas tests) -> kernels (sext_kernel, round_kernel, cand_kernel, test_kernel) -> host
+ *   driver (device buffers, checkpoints, launches, folding, run_count) -> parameters and
+ *   commands -> selftest and debug commands -> main.
  *
  * Usage
- * -----
- *   a350826_cuda count LO HI [-b B1,B2,..] [-w W] [-B B] [-c CH] [-C C0:C1 | -P I/N]
- *                            [-S FILE] [-i SECS] [-L FILE] [-q] [-d DEV]
- *   a350826_cuda bench LO HI [-n N] [-w W] [-B B] [-d DEV]
+ * =====
+ *   a350826_cuda count LO HI [-b B1,B2,..] [-w W] [-B B] [-p P] [-Q QW] [-c CH]
+ *                            [-C C0:C1 | -P I/N] [-S FILE] [-i SECS] [-L FILE] [-q] [-d DEV]
+ *   a350826_cuda bench LO HI [-n N] [-w W] [-B B] [-p P] [-Q QW] [-d DEV] [-X MASK]
  *   a350826_cuda selftest [N] [-d DEV]
- * Same meaning as for a350826.c; -d selects the CUDA device.
+ *   a350826_cuda num X [X ...]          (debug) GPU base-2 and Lucas tests of single numbers
+ *   a350826_cuda mrbench X [N]          (debug) round_kernel throughput on N random odd
+ *                                       numbers near X (N <= 2^25, default 2^24)
+ * The options mean the same as for a350826.c (there is no -t: the GPU does all the work;
+ * -s is replaced by the build-time SEGB).  -p pattern bound (default 256), -Q bound between
+ * medium and large primes (4096), -d CUDA device, -n sample classes for bench (20000).
+ * -X MASK (for bench only; with count the results are wrong) skips parts of the work to time
+ * the rest: 1 tests, 2 patterns, 4 medium primes, 8 large primes, 16 survivor output.
+ * The selftest checks the GPU arithmetic against the host reference, A350826(1..N) (default
+ * N = 14) against the OEIS data, and the reference windows of verify_a350826.py.
  *
- * Build:  nvcc -O3 -std=c++17 -arch=sm_121 -o a350826_cuda a350826_cuda.cu
+ * Build:  nvcc -O3 -std=c++17 -arch=sm_121 -o a350826_cuda a350826_cuda.cu   (or `make`)
  */
 
 #include <cstdio>
@@ -61,12 +160,12 @@ typedef uint64_t u64;
 typedef int64_t i64;
 typedef unsigned __int128 u128;
 
-#define GOLD    0x9E3779B97F4A7C15ULL
-#define MAXBIN  256
-#define MAXSPSP 1024
-#define P0      ((u64)1 << 20)
-#define BMAX    ((u32)1 << 20)
-#define HIMAX   ((u128)1 << 80)
+#define GOLD    0x9E3779B97F4A7C15ULL  /* 2^64 / golden ratio: odd constant of splitmix64 */
+#define MAXBIN  256             /* most bins per run (-b gives at most MAXBIN - 1 boundaries) */
+#define MAXSPSP 1024            /* SPSP cases recorded per launch (all are counted) */
+#define P0      ((u64)1 << 20)  /* initial members below P0 are tested on the host */
+#define BMAX    ((u32)1 << 20)  /* largest sieving bound accepted by -B (must not exceed P0) */
+#define HIMAX   ((u128)1 << 80) /* largest HI (the host reference test is deterministic far beyond) */
 
 /* kernel geometry (override with -D at build time) */
 #ifndef NT
@@ -84,21 +183,25 @@ typedef unsigned __int128 u128;
 #if SEGW % NT
 #error "SEGB/64 must be a multiple of NT"
 #endif
-#define MAXPAT  64                  /* pattern primes */
+#define MAXPAT  64                  /* most pattern primes (their phases are kept in shared memory) */
 #define MAXMPL  4                   /* medium primes per lane (NWARP * 32 * MAXMPL total) */
 #define MAXLPT  48                  /* large primes per thread (NT * MAXLPT total) */
 
+/* The six offsets of the pattern: p + OFF[m], m = 0..5, are the members of a sextuplet. */
 static const u32 OFF[6] = {0, 4, 6, 10, 12, 16};
 
-static bool stderr_tty;
-static volatile sig_atomic_t g_stop = 0;
+static bool stderr_tty;                     /* stderr is a terminal: rewrite the status line in place */
+static volatile sig_atomic_t g_stop = 0;    /* set by SIGINT/SIGTERM: launch no more chunks */
 
+/* CK: check the result of a CUDA runtime call; any error is fatal (die() with the CUDA message
+   and the source line).  Errors inside kernels show up at the next synchronising call. */
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) die("CUDA error %s at %s:%d", cudaGetErrorString(e_), __FILE__, __LINE__); } while (0)
 
 /* ------------------------------------------------------------------ */
 /* Host helpers (as in a350826.c)                                      */
 /* ------------------------------------------------------------------ */
 
+/* now: seconds from a fixed point of the monotonic clock (status lines, rates, timings). */
 static double now(void)
 {
     struct timespec ts;
@@ -106,6 +209,13 @@ static double now(void)
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/*
+ * die: report a fatal error and end the program.
+ *   In:     printf-style format and arguments.
+ *   Out:    does not return; clears the status line on a terminal, prints the message and a
+ *           newline to stderr, exit(1).  A checkpoint on disk stays valid (it is replaced
+ *           atomically).
+ */
 static void die(const char *fmt, ...)
 {
     va_list ap;
@@ -117,6 +227,11 @@ static void die(const char *fmt, ...)
     exit(1);
 }
 
+/*
+ * fmt_dur: format a duration: "3d04h05m", "1h02m03s", "4m05s" or "12.3s"; negative, NaN or
+ * absurd (> 1e12 s) values, such as an unknown ETA, give "?".
+ *   In:     s = seconds; buf, n = caller's buffer and its size.   Out: buf.
+ */
 static const char *fmt_dur(double s, char *buf, size_t n)
 {
     if (s < 0 || s != s || s > 1e12) { snprintf(buf, n, "?"); return buf; }
@@ -128,6 +243,11 @@ static const char *fmt_dur(double s, char *buf, size_t n)
     return buf;
 }
 
+/*
+ * u128s: decimal string of an unsigned 128-bit number (printf has no conversion for u128).
+ *   Out:    pointer to a static buffer from a ring of 16, so up to 16 results can be used in one
+ *           printf call; each buffer is overwritten 16 calls later.  Host only, single thread.
+ */
 static const char *u128s(u128 x)
 {
     static char ring[16][44];
@@ -140,6 +260,7 @@ static const char *u128s(u128 x)
     return b;
 }
 
+/* mul_ok: true and *r = a*b if the product fits in 128 bits, false (and *r unchanged) if not. */
 static bool mul_ok(u128 a, u128 b, u128 *r)
 {
     if (a && b > ~(u128)0 / a) return false;
@@ -147,6 +268,7 @@ static bool mul_ok(u128 a, u128 b, u128 *r)
     return true;
 }
 
+/* all_digits: true iff s[0 .. n) is non-empty and consists of decimal digits only. */
 static bool all_digits(const char *s, size_t n)
 {
     if (n == 0) return false;
@@ -155,6 +277,15 @@ static bool all_digits(const char *s, size_t n)
     return true;
 }
 
+/*
+ * parse_term: parse one term of a number given on the command line (as in a350826.c).
+ *   In:     s[0 .. n) (need not be NUL-terminated).  Accepts plain decimal, powers "B^E"
+ *           ("2^64") and scientific notation "MeE" with an optional fractional mantissa
+ *           ("1.5e19") when the value is an integer.
+ *   Out:    true and *out = the value.
+ *   Errors: false for an empty or over-long term (80 characters or more), misplaced
+ *           characters, a non-integer value or a value above 2^128 - 1.
+ */
 static bool parse_term(const char *s, size_t n, u128 *out)
 {
     char buf[80], *c;
@@ -193,6 +324,11 @@ static bool parse_term(const char *s, size_t n, u128 *out)
     return true;
 }
 
+/*
+ * parse_num: parse a number: one term, or "X+Y" / "X-Y" of two terms, split at the last '+' or
+ * '-' that is not part of an exponent ("1e18+2e12", "2^64-1e12").
+ *   Errors: die() for a malformed term, an overflowing sum or a negative difference.
+ */
 static u128 parse_num(const char *s)
 {
     size_t n = strlen(s);
@@ -213,6 +349,8 @@ static u128 parse_num(const char *s)
     return v;
 }
 
+/* parse_u64: parse_num() restricted to [lo, hi] for an option value; die() naming `what` if
+   the number is malformed or out of range. */
 static u64 parse_u64(const char *s, u64 lo, u64 hi, const char *what)
 {
     u128 v = parse_num(s);
@@ -220,6 +358,11 @@ static u64 parse_u64(const char *s, u64 lo, u64 hi, const char *what)
     return (u64)v;
 }
 
+/*
+ * mix64: one splitmix64 step (add GOLD, then the finalizer), a bijective 64-bit mixing
+ * function.  The checksums depend on it: it must stay identical to d_mix64() below, to
+ * a350826.c and to verify_a350826.py.
+ */
 static inline u64 mix64(u64 z)
 {
     z += GOLD;
@@ -228,9 +371,16 @@ static inline u64 mix64(u64 z)
     return z ^ (z >> 31);
 }
 
+/* hashp: checksum contribution of a sextuplet start p (added mod 2^64 per bin, so the checksum
+   does not depend on the order in which sextuplets are found). */
 static inline u64 hashp(u128 p) { return mix64((u64)p ^ ((u64)(p >> 64) * GOLD)); }
 
-/* reference primality (host) */
+/* ---- reference primality (host; slow and simple, for the small region and the selftest) ---- */
+
+/*
+ * mulmod_ref: a*b mod n for 1 <= n < 2^127: one 128-bit product for n < 2^64, otherwise
+ * double-and-add over the bits of b (a + a cannot overflow since n < 2^127).
+ */
 static u128 mulmod_ref(u128 a, u128 b, u128 n)
 {
     if (!(n >> 64)) return ((a % n) * (b % n)) % n;
@@ -244,6 +394,7 @@ static u128 mulmod_ref(u128 a, u128 b, u128 n)
     return r;
 }
 
+/* powmod_ref: a^e mod n (1 <= n < 2^127) by binary exponentiation with mulmod_ref. */
 static u128 powmod_ref(u128 a, u128 e, u128 n)
 {
     u128 r = 1 % n;
@@ -256,6 +407,12 @@ static u128 powmod_ref(u128 a, u128 e, u128 n)
     return r;
 }
 
+/*
+ * mr_ref: strong probable-prime (Miller-Rabin) test of n to base a.
+ *   In:     odd n > a, n < 2^127.
+ *   Out:    true if n is a strong probable prime to base a (every prime is), false if a is a
+ *           witness that n is composite.
+ */
 static bool mr_ref(u128 n, u64 a)
 {
     u128 d = n - 1;
@@ -271,6 +428,13 @@ static bool mr_ref(u128 n, u64 a)
     return false;
 }
 
+/*
+ * is_prime_ref: deterministic primality test for n < 2^81: trial division by the primes up to
+ * 41, then strong tests to the 13 prime bases 2..41, which prove primality below
+ * 3317044064679887385961981 (Sorenson and Webster 2015).
+ *   Out:    true iff n is prime.
+ *   Errors: die() for n >= 2^81, where the test would no longer be a proof.
+ */
 static bool is_prime_ref(u128 n)
 {
     static const u32 sp[] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41};
@@ -285,6 +449,7 @@ static bool is_prime_ref(u128 n)
     return true;
 }
 
+/* is_sext_ref: true iff p, p+4, p+6, p+10, p+12 and p+16 are all prime (p + 16 < 2^81). */
 static bool is_sext_ref(u128 p)
 {
     for (int i = 0; i < 6; i++) if (!is_prime_ref(p + OFF[i])) return false;
@@ -295,20 +460,24 @@ static bool is_sext_ref(u128 p)
 /* Wheel, sieving primes, patterns (host; as in a350826.c)             */
 /* ------------------------------------------------------------------ */
 
+/* The wheel (a350826.c, theory section 3).  SMALLP: possible wheel primes; MAXWD bounds the
+   number of wheel primes >= 11 (11 of them for w = 47). */
 #define MAXWD 12
 static const u32 SMALLP[] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47};
 
 static struct {
-    u32 w;
-    u64 M, C;
-    int nd;
-    u32 q[MAXWD], na[MAXWD];
-    u8 a[MAXWD][48];
-    u64 E[MAXWD];
-    u64 rad[MAXWD];
-    u64 r0;
+    u32 w;                  /* largest wheel prime */
+    u64 M, C;               /* modulus (product of the primes <= w), number of classes */
+    int nd;                 /* wheel primes > 7 */
+    u32 q[MAXWD], na[MAXWD];  /* wheel primes >= 11 and their numbers of allowed residues (q - 6) */
+    u8 a[MAXWD][48];        /* allowed residues mod q, increasing */
+    u64 E[MAXWD];           /* CRT idempotents: E = 1 (mod q), 0 (mod M/q) */
+    u64 rad[MAXWD];         /* mixed-radix weights of the class index (last prime least significant) */
+    u64 r0;                 /* 97 * E_210 mod M: every class is 97 mod 210 */
 } W;
 
+/* invmod: a^-1 mod m (2 <= m < 2^63) by the extended Euclidean algorithm; die() if
+   gcd(a, m) != 1 (a bug: all callers pass coprime values). */
 static u64 invmod(u64 a, u64 m)
 {
     i64 t = 0, nt = 1;
@@ -322,6 +491,7 @@ static u64 invmod(u64 a, u64 m)
     return (u64)(t < 0 ? t + (i64)m : t);
 }
 
+/* wheel_ok: true iff w is one of the primes 7, 11, ..., 47 allowed as largest wheel prime. */
 static bool wheel_ok(u32 w)
 {
     if (w < 7 || w > 47) return false;
@@ -329,6 +499,12 @@ static bool wheel_ok(u32 w)
     return false;
 }
 
+/*
+ * wheel_setup: build the wheel with largest prime w (global W), as in a350826.c: M, the allowed
+ * residues mod each wheel prime >= 11, the CRT idempotents, r0 = 97 E_210 and the mixed-radix
+ * weights of the class index.
+ *   Errors: die() if w is not one of 7, 11, ..., 47.
+ */
 static void wheel_setup(u32 w)
 {
     if (!wheel_ok(w)) die("wheel prime must be one of 7, 11, 13, ..., 47");
@@ -357,6 +533,11 @@ static void wheel_setup(u32 w)
     for (int j = W.nd - 1; j >= 0; j--) { W.rad[j] = rad; rad *= W.na[j]; }
 }
 
+/*
+ * class_r: residue r mod M of class number c in [0, W.C): r = 97 E_210 + sum_j a_j E_j mod M,
+ * where a_j is allowed residue number (c / rad_j) mod na_j of wheel prime j.  As c runs over
+ * [0, C), r runs over all admissible residues once each.  (The u128 sum cannot overflow.)
+ */
 static inline u64 class_r(u64 c)
 {
     u128 r = W.r0;
@@ -364,6 +545,8 @@ static inline u64 class_r(u64 c)
     return (u64)(r % W.M);
 }
 
+/* small_primes: malloc'ed array of the primes <= n (sieve of Eratosthenes), *count = their
+   number; the caller frees it.  die() if memory runs out. */
 static u32 *small_primes(u32 n, int *count)
 {
     u8 *s = (u8 *)calloc(n + 1, 1);
@@ -383,21 +566,40 @@ static u32 *small_primes(u32 n, int *count)
     return p;
 }
 
+/* cmp_u32: qsort comparator for u32 values, ascending. */
 static int cmp_u32(const void *a, const void *b)
 {
     u32 x = *(const u32 *)a, y = *(const u32 *)b;
     return x < y ? -1 : x > y;
 }
 
-/* host copies of the device tables */
+/* Host copies of the device tables (tables_setup; uploaded by dev_upload).  Per sieving prime i
+   (w < q <= B, increasing): q[i]; k[j * np + i] = K_(j+1), j = 0..4 (structure of arrays, so
+   neighbouring threads read neighbouring words); minv[i] = M^-1 mod q; bmod[i] = base mod q;
+   segmod[i] = SEGB mod q (phase change per full segment).  Per pattern prime i: the q words of
+   T_q at tab[poff[i]], pstep[i] = 64 mod q (change of s per word), pstept[i] = 64 WPT mod q
+   (per thread). */
 static struct {
-    u32 B, patmax, qw;
-    int np, npat, nmed, nlarge;
+    u32 B, patmax, qw;      /* sieving bound, pattern bound (-p), medium/large bound (-Q) */
+    int np, npat, nmed, nlarge;   /* primes in all, and in the three groups (in this order) */
     u32 *q, *k, *minv, *bmod, *segmod, *pstep, *pstept, *poff;   /* k: 5 * np, SoA */
-    u64 *tab;
+    u64 *tab;               /* pattern tables, ntab words */
     size_t ntab;
 } SP;
 
+/*
+ * tables_setup: build all host tables for sieving bound B (global SP); needs wheel_setup.
+ *   In:     B with W.w < B <= 2^20; patmax = pattern bound; qw = bound between medium and large
+ *           primes; base = max(LO, 2^20), the first number handled by the GPU.
+ *   Out:    SP as described above.  The primes are split into the three groups of the theory
+ *           (section 2): pattern primes q < patmax (at most MAXPAT, the smallest ones), medium
+ *           primes q < qw, large primes the rest.
+ *   Errors: die() if B is out of range, memory runs out, there are more than
+ *           NWARP * 32 * MAXMPL = 2048 medium primes (lower -Q) or more than NT * MAXLPT = 24576
+ *           large primes (lower -B).
+ *   Notes:  the pattern primes are among the first 64 primes above w (all below 410), so the
+ *           local array bad[1024] is large enough for any -p.
+ */
 static void tables_setup(u32 B, u32 patmax, u32 qw, u128 base)
 {
     if (B <= W.w || B > BMAX) die("sieving bound must be in (w, 2^20]");
@@ -425,7 +627,7 @@ static void tables_setup(u32 B, u32 patmax, u32 qw, u128 base)
         const u32 q = pr[i];
         if (q <= W.w) continue;
         const u32 mi = (u32)invmod(W.M % q, q);
-        u32 c[5];
+        u32 c[5];                             /* K = -d M^-1 mod q for d = 4, 6, 10, 12, 16 */
         for (int k = 1; k < 6; k++) c[k - 1] = (u32)((q - (u64)OFF[k] * mi % q) % q);
         qsort(c, 5, sizeof *c, cmp_u32);
         SP.q[np] = q;
@@ -447,7 +649,7 @@ static void tables_setup(u32 B, u32 patmax, u32 qw, u128 base)
     SP.nlarge = SP.np - m;
     if (SP.nmed > NWARP * 32 * MAXMPL) die("too many medium primes (raise MAXMPL or lower QW)");
     if (SP.nlarge > NT * MAXLPT) die("too many large primes for B = %u (max %d)", B, NT * MAXLPT);
-    /* pattern tables */
+    /* pattern tables: T_q[s] has bit i set iff (s + i) mod q is a bad offset {0, K_1..K_5} */
     size_t words = 0;
     for (int i = 0; i < SP.npat; i++) words += SP.q[i];
     SP.tab = (u64 *)malloc(sizeof(u64) * (words ? words : 1));
@@ -475,33 +677,45 @@ static void tables_setup(u32 B, u32 patmax, u32 qw, u128 base)
 /* Device code                                                         */
 /* ------------------------------------------------------------------ */
 
+/* Run parameters in constant memory (P, written by dev_upload).  With span = HI - 1 - base =
+   Q0 M + rem0, a class whose first term is base + delta has Q0 + 1 terms if delta <= rem0 and
+   Q0 terms otherwise, so the GPU needs no 128-bit division.  u128 values are split into 64-bit
+   halves (lo, hi). */
 struct DevP {
-    u64 M, bmM, Q0, rem0, base_lo, base_hi;
-    int nbins, npat, nmed, nlarge, np;
-    int skip;               /* bench ablation: 1 tests, 2 patterns, 4 medium, 8 large */
-    u64 bnd_lo[MAXBIN + 1], bnd_hi[MAXBIN + 1];
+    u64 M, bmM, Q0, rem0, base_lo, base_hi;   /* modulus, base mod M, span / M, span % M, base */
+    int nbins, npat, nmed, nlarge, np;   /* bins; sizes of the prime groups and in all */
+    int skip;               /* bench ablation: 1 tests, 2 patterns, 4 medium, 8 large, 16 survivor output */
+    u64 bnd_lo[MAXBIN + 1], bnd_hi[MAXBIN + 1];   /* bin boundaries bnd[0] = LO .. bnd[nbins] = HI */
 };
 
 struct Cnt {                    /* per sub-launch buffer counters */
     unsigned long long nb[7];   /* survivors in the buffer before round m (nb[0] from the sieve) */
-};
+};                              /* (nb[6]: candidates for cand_kernel; zeroed per sub-launch) */
 
+/* Results of one launch (one chunk), accumulated by all its kernels with atomics: per bin the
+   count and checksum, and the statistics of acc_t; SPSP cases (member n, candidate p, as
+   low/high u64 halves) for the host's SPSP lines. */
 struct Res {
     unsigned long long cnt[MAXBIN], cks[MAXBIN];
     unsigned long long surv, cand, spsp, bits;
     unsigned int ovf;           /* survivor buffer overflow: redo the launch in pieces */
-    unsigned int nsp;
+    unsigned int nsp;           /* SPSP cases found (only the first MAXSPSP are recorded) */
     unsigned long long sp_n[MAXSPSP][2], sp_p[MAXSPSP][2];
 };
 
+/* Device pointers to the tables of SP (same layout), passed to sext_kernel by value. */
 struct DevT {
     const u32 *q, *k, *minv, *bmod, *segmod, *pstep, *pstept, *poff;
     const u64 *tab;
 };
 
-__constant__ DevP P;
-__constant__ u32 OFFD[6] = {0, 4, 6, 10, 12, 16};
+__constant__ DevP P;                            /* run parameters */
+__constant__ u32 OFFD[6] = {0, 4, 6, 10, 12, 16};   /* OFF on the device */
 
+/* ---- device arithmetic: 64-bit Montgomery (R = 2^64), as in a350826.c ---- */
+
+/* d_inv64: n^-1 mod 2^64 for odd n (Newton iteration from x = n, correct to 3 bits; five steps
+   give 96 >= 64 bits). */
 __device__ __forceinline__ u64 d_inv64(u64 n)
 {
     u64 x = n;
@@ -510,6 +724,12 @@ __device__ __forceinline__ u64 d_inv64(u64 n)
     return x;
 }
 
+/*
+ * d_mmul64: Montgomery product a*b/2^64 mod n.
+ *   In:     a, b < n; odd n < 2^64; ni = n^-1 mod 2^64 (d_inv64, the positive inverse).
+ *   Out:    a*b*2^-64 mod n in [0, n).  "Subtracting" form: with m = lo(ab) ni mod 2^64, the
+ *           value hi(ab) - hi(mn) lies in (-n, n); a negative one is fixed by adding n.
+ */
 __device__ __forceinline__ u64 d_mmul64(u64 a, u64 b, u64 n, u64 ni)
 {
     const u64 tl = a * b, th = __umul64hi(a, b);
@@ -519,12 +739,20 @@ __device__ __forceinline__ u64 d_mmul64(u64 a, u64 b, u64 n, u64 ni)
     return th < mh ? r + n : r;
 }
 
+/* d_madd64, d_msub64, d_mhalf64: (a + b), (a - b) and a/2 mod n for 0 <= a, b < n, odd n
+   (d_madd64 also handles the wrap of a + b past 2^64; halving an odd a gives (a + n)/2). */
 __device__ __forceinline__ u64 d_madd64(u64 a, u64 b, u64 n) { u64 s = a + b; return (s < a || s >= n) ? s - n : s; }
 __device__ __forceinline__ u64 d_msub64(u64 a, u64 b, u64 n) { return a >= b ? a - b : a - b + n; }
 __device__ __forceinline__ u64 d_mhalf64(u64 a, u64 n) { return (a & 1) ? (a >> 1) + (n >> 1) + 1 : a >> 1; }
 
-/* 2^64 mod n for odd n > 1: with f = floor(2^64/n) < 256 estimated in float (error < 1),
-   k = max(1, f_est - 1) <= f, r = 2^64 - k n, then subtract n until r < n */
+/*
+ * d_r64: 2^64 mod n, the Montgomery form of 1.
+ *   In:     odd n > 1.   Out: 2^64 mod n, in [0, n).
+ *   Method: for n >= 2^56, f = floor(2^64/n) < 256 is estimated in float (error < 1);
+ *           k = max(1, f_est - 1) <= f, r = 2^64 - k n (computed mod 2^64), then n is
+ *           subtracted until r < n (at most twice).  Smaller n use the slower 64-bit remainder
+ *           (0 - n) % n.
+ */
 __device__ __forceinline__ u64 d_r64(u64 n)
 {
     if (n >> 56) {
@@ -537,6 +765,13 @@ __device__ __forceinline__ u64 d_r64(u64 n)
     return (u64)(0 - n) % n;
 }
 
+/*
+ * d_sprp2_64: base-2 strong probable-prime test for odd n, 2 < n < 2^64 (as sprp2_64 in
+ * a350826.c).
+ *   Out:    true for primes and base-2 strong pseudoprimes, false if n is certainly composite.
+ *   Method: n - 1 = d 2^s; 2^d mod n left to right in Montgomery form (square, and double with
+ *           an addition for a 1 bit), then up to s - 1 squarings looking for -1.
+ */
 __device__ bool d_sprp2_64(u64 n)
 {
     const u64 ni = d_inv64(n);
@@ -559,6 +794,9 @@ __device__ bool d_sprp2_64(u64 n)
     return false;
 }
 
+/* ---- strong Lucas test (Selfridge parameters), as in a350826.c ---- */
+
+/* d_jacobi: Jacobi symbol (a/n) for odd n >= 1: -1, 0 or +1 (0 iff gcd(a, n) > 1 for n > 1). */
 __device__ int d_jacobi(i64 a, u128 n)
 {
     int t = 1;
@@ -581,6 +819,7 @@ __device__ int d_jacobi(i64 a, u128 n)
     return n == 1 ? t : 0;
 }
 
+/* d_is_square: true iff n (< 2^126) is a perfect square (double sqrt, corrected by +-1 steps). */
 __device__ bool d_is_square(u128 n)
 {
     u128 r = (u128)sqrt((double)n);
@@ -589,6 +828,12 @@ __device__ bool d_is_square(u128 n)
     return r * r == n;
 }
 
+/*
+ * d_selfridge: first D in 5, -7, 9, -11, ... with (D/n) = -1 (Selfridge's method A).
+ *   In:     odd n > 1.
+ *   Out:    1 and *Dout = D; or 0 if n is certainly composite: a perfect square (the search
+ *           would not end), or gcd(D, n) > 1 for some D with |D| != n.
+ */
 __device__ int d_selfridge(u128 n, i64 *Dout)
 {
     if (d_is_square(n)) return 0;
@@ -603,7 +848,11 @@ __device__ int d_selfridge(u128 n, i64 *Dout)
     return 1;
 }
 
-/* v * x mod n for small v >= 0 (double and add) */
+/*
+ * d_mulsmall64: v * x mod n by double-and-add over the bits of v.
+ *   In:     x < n, n odd; any v >= 0 (callers pass the small |Q| and |D|).   Out: v x mod n.
+ *   Makes the Montgomery forms v R mod n of Q and D (x = R mod n) without a wide division.
+ */
 __device__ u64 d_mulsmall64(u64 v, u64 x, u64 n)
 {
     u64 r = 0;
@@ -614,6 +863,16 @@ __device__ u64 d_mulsmall64(u64 v, u64 x, u64 n)
     return r;
 }
 
+/*
+ * d_slprp64: strong Lucas probable-prime test with P = 1, Q = (1 - D)/4 (as slprp64 in
+ * a350826.c), the Lucas half of BPSW.
+ *   In:     odd n > 13, n < 2^64 (members of candidates: no small factors, passed base 2).
+ *   Out:    true if n is a strong Lucas probable prime (every prime is), false if n is
+ *           certainly composite (squares and numbers sharing a factor with D included).
+ *   Method: n + 1 = d 2^s; U_d, V_d and Q^d left to right in Montgomery form (doubling, and for
+ *           a 1 bit the step k -> k + 1 with halving mod n); n passes if U_d = 0 or
+ *           V_(d 2^r) = 0 for some 0 <= r < s.
+ */
 __device__ bool d_slprp64(u64 n)
 {
     i64 D;
@@ -648,7 +907,14 @@ __device__ bool d_slprp64(u64 n)
     return false;
 }
 
-/* 128-bit Montgomery (n < 2^127), as mmul128 in a350826.c */
+/* ---- 128-bit Montgomery (R = 2^128): Lucas tests above 2^64, base-2 tests above 2^96 ---- */
+
+/*
+ * d_mmul128: Montgomery product a*b/2^128 mod n with two 64-bit limbs (as mmul128 in
+ * a350826.c: schoolbook product, two word-by-word reduction steps, one final subtraction).
+ *   In:     a, b < n; odd n < 2^127; ni = -n^-1 mod 2^64 (note the sign).
+ *   Out:    a*b*2^-128 mod n, in [0, n).
+ */
 __device__ __forceinline__ u128 d_mmul128(u128 a, u128 b, u128 n, u64 ni)
 {
     const u64 a0 = (u64)a, a1 = (u64)(a >> 64), b0 = (u64)b, b1 = (u64)(b >> 64);
@@ -671,11 +937,13 @@ __device__ __forceinline__ u128 d_mmul128(u128 a, u128 b, u128 n, u64 ni)
     return res >= n ? res - n : res;
 }
 
+/* d_madd128, d_msub128, d_mhalf128: as the 64-bit versions, for 0 <= a, b < n < 2^127. */
 __device__ __forceinline__ u128 d_madd128(u128 a, u128 b, u128 n) { u128 s = a + b; return s >= n ? s - n : s; }
 __device__ __forceinline__ u128 d_msub128(u128 a, u128 b, u128 n) { return a >= b ? a - b : a - b + n; }
 __device__ __forceinline__ u128 d_mhalf128(u128 a, u128 n) { return (a & 1) ? (a >> 1) + (n >> 1) + 1 : a >> 1; }
 
-/* 2^128 mod n for 2^64 < n < 2^100.  The quotient Q = floor(2^128/n) < 2^64 is estimated in
+/* d_r128: 2^128 mod n (the Montgomery form of 1 for R = 2^128), in [0, n), for odd n with
+   2^64 < n < 2^100.  The quotient Q = floor(2^128/n) < 2^64 is estimated in
    double (error < 2^13) and lowered by 2^21, so q <= Q and r = 2^128 - q n lies in
    [0, (2^21 + 2^13 + 1) n); one more double estimate brings r below 4n. */
 __device__ u128 d_r128(u128 n)
@@ -692,6 +960,8 @@ __device__ u128 d_r128(u128 n)
     return r;
 }
 
+/* d_sprp2_128: base-2 strong probable-prime test (as d_sprp2_64) with R = 2^128, for odd n with
+   2^64 < n < 2^100 (the range of d_r128).  Used by d_sprp2 only for n >= 2^96. */
 __device__ bool d_sprp2_128(u128 n)
 {
     const u64 ni = 0 - d_inv64((u64)n);
@@ -715,6 +985,7 @@ __device__ bool d_sprp2_128(u128 n)
     return false;
 }
 
+/* d_mulsmall128: v * x mod n by double-and-add (as d_mulsmall64), for x < n < 2^127. */
 __device__ u128 d_mulsmall128(u64 v, u128 x, u128 n)
 {
     u128 r = 0;
@@ -725,6 +996,8 @@ __device__ u128 d_mulsmall128(u64 v, u128 x, u128 n)
     return r;
 }
 
+/* d_slprp128: strong Lucas probable-prime test (as d_slprp64) with R = 2^128, for odd n with
+   2^64 < n < 2^100 (the range of d_r128); members of candidates are below 2^81. */
 __device__ bool d_slprp128(u128 n)
 {
     i64 D;
@@ -762,7 +1035,18 @@ __device__ bool d_slprp128(u128 n)
     return false;
 }
 
-/* 96-bit Montgomery (three 32-bit limbs, R = 2^96, CIOS) for 2^64 <= n < 2^96; ni = -n^-1 mod 2^32 */
+/* ---- 96-bit Montgomery (R = 2^96): base-2 tests of members in [2^64, 2^96) ---- */
+
+/*
+ * d_mmul96: Montgomery product a*b/2^96 mod n with three 32-bit limbs (CIOS: coarsely
+ * integrated operand scanning; the GPU's native multiplier is 32 bits wide).
+ *   In:     a, b < n; odd n with 2^64 <= n < 2^96; ni = -n^-1 mod 2^32.
+ *   Out:    a*b*2^-96 mod n, in [0, n).
+ *   Method: for each limb a_i of a, low to high (CIOS_STEP): t += a_i b; then m = t0 ni mod
+ *           2^32 makes t + m n divisible by 2^32, and t = (t + m n) / 2^32.  The accumulator is
+ *           t3:t2:t1:t0 plus a carry limb t4; it stays below 2n, so one subtraction at the end
+ *           suffices.
+ */
 __device__ __forceinline__ u128 d_mmul96(u128 a, u128 b, u128 n, u32 ni)
 {
     const u32 a0 = (u32)a, a1 = (u32)(a >> 32), a2 = (u32)(a >> 64);
@@ -789,7 +1073,8 @@ __device__ __forceinline__ u128 d_mmul96(u128 a, u128 b, u128 n, u32 ni)
     return r >= n ? r - n : r;
 }
 
-/* 2^96 mod n for 2^64 <= n < 2^96.  Q = floor(2^96/n) <= 2^32 is estimated in float (error
+/* d_r96: 2^96 mod n (the Montgomery form of 1 for R = 2^96), in [0, n), for odd n with
+   2^64 <= n < 2^96.  Q = floor(2^96/n) <= 2^32 is estimated in float (error
    < 2^9) and lowered by 2^10, so r = 2^96 - q n is in [0, 2^11 n); a second float estimate of
    r/n (error < 1) brings r below 3n. */
 __device__ __forceinline__ u128 d_r96(u128 n)
@@ -805,6 +1090,8 @@ __device__ __forceinline__ u128 d_r96(u128 n)
     return r;
 }
 
+/* d_sprp2_96: base-2 strong probable-prime test (as d_sprp2_64) with R = 2^96, for odd n with
+   2^64 <= n < 2^96.  This is where a(20) spent half its time (members above 2^64). */
 __device__ bool d_sprp2_96(u128 n)
 {
     const u32 ni = (u32)(0 - d_inv64((u64)n));
@@ -829,6 +1116,8 @@ __device__ bool d_sprp2_96(u128 n)
     return false;
 }
 
+/* d_sprp2, d_slprp: base-2 and strong Lucas tests for any odd n > 41 below 2^100, choosing
+   the width of the arithmetic by the size of n. */
 __device__ __forceinline__ bool d_sprp2(u128 n)
 {
     if (!(n >> 64)) return d_sprp2_64((u64)n);
@@ -836,6 +1125,7 @@ __device__ __forceinline__ bool d_sprp2(u128 n)
 }
 __device__ __forceinline__ bool d_slprp(u128 n) { return (n >> 64) ? d_slprp128(n) : d_slprp64((u64)n); }
 
+/* d_mix64: device copy of mix64() (must stay identical). */
 __device__ __forceinline__ u64 d_mix64(u64 z)
 {
     z += GOLD;
@@ -844,7 +1134,15 @@ __device__ __forceinline__ u64 d_mix64(u64 z)
     return z ^ (z >> 31);
 }
 
-/* all six members passed base 2: confirm with strong Lucas and record */
+/*
+ * d_candidate: final test and counting of one candidate p, whose six members all passed the
+ * base-2 test.
+ *   In:     p in [LO, HI); res = Res of the launch.
+ *   Out:    res->cand += 1.  If a member fails the strong Lucas test: res->spsp += 1 and, while
+ *           there is room, the member and p are recorded (sp_n, sp_p) for the host's SPSP
+ *           line.  Otherwise res->cnt[b] += 1 and res->cks[b] += hash of p for the bin b with
+ *           bnd[b] <= p < bnd[b+1] (binary search).
+ */
 __device__ void d_candidate(u128 p, Res *res)
 {
     atomicAdd(&res->cand, 1ULL);
@@ -870,7 +1168,12 @@ __device__ void d_candidate(u128 p, Res *res)
     atomicAdd(&res->cks[b], (unsigned long long)d_mix64((u64)p ^ ((u64)(p >> 64) * GOLD)));
 }
 
-/* phase of prime i at the first candidate p0 = base + delta: phi = -(p0 mod q) M^-1 mod q */
+/*
+ * d_phase: phase of sieving prime i at the first term p0 = base + delta of a class:
+ * phi = -(p0 mod q) M^-1 mod q, so that q divides the member p0 + M k + d_j iff
+ * k = phi + K_j (mod q).
+ *   In:     T = device tables; i = prime index; delta < M.   Out: phi in [0, q).
+ */
 __device__ __forceinline__ u32 d_phase(const DevT &T, int i, u64 delta)
 {
     const u32 q = T.q[i];
@@ -884,11 +1187,28 @@ __device__ __forceinline__ u32 d_phase(const DevT &T, int i, u64 delta)
 #else
 #define AOR(a, v) atomicOr((a), (v))
 #endif
-/* unchecked mark, and a branch-free checked one (out-of-range positions OR 0 into word 0) */
+/* Marking bit x of the segment, where bw is the shared bitmap seen as 32-bit words: AMARK
+   for positions known to be inside, MARK checks x < len without a branch (an out-of-range
+   position, including a negative one cast to u32, ORs 0 into word 0) */
 #define AMARK(x) AOR(bw + ((u32)(x) >> 5), 1u << ((u32)(x) & 31))
 #define MARK(x) do { const u32 x_ = (u32)(x); const bool in_ = x_ < len; \
                      AOR(bw + (in_ ? x_ >> 5 : 0u), in_ ? 1u << (x_ & 31) : 0u); } while (0)
 
+/*
+ * sext_kernel: sieve one class per thread block and collect its survivors (theory, section 2).
+ *   In:     cls_r[blockIdx.x] = residue of the block's class (class_r); T = device tables;
+ *           res = Res of the launch; cnt = counters of the sub-launch (cnt->nb[0] = entries
+ *           used in buf); buf = survivor buffer of cap entries (two u64 words each).
+ *           LPT = large-prime phases per thread (LPT * NT >= P.nlarge).  Launched with one
+ *           block of NT threads per class and SEGW * 8 bytes of dynamic shared memory.
+ *   Out:    the initial members p of all survivors appended to buf; res->surv += survivors,
+ *           res->bits += L (terms of the class).  Survivors that do not fit (position >= cap)
+ *           are dropped and set res->ovf, which makes the host redo the launch.
+ *   Steps:  class setup (first term ps = base + delta, length L) and initial phases; per
+ *           segment of SEGB bits: 1. pattern primes, 2. medium primes, 3. large primes,
+ *           4. survivors to buf, then the phase updates for the next segment.
+ *   Errors: none reported; the P.skip bits (bench -X) leave out parts of the work.
+ */
 template <int LPT>
 __global__ void __launch_bounds__(NT, MINB) sext_kernel(const u64 *__restrict__ cls_r, DevT T, Res *__restrict__ res,
                                                         Cnt *__restrict__ cnt, u64 *__restrict__ buf, u64 cap)
@@ -900,13 +1220,19 @@ __global__ void __launch_bounds__(NT, MINB) sext_kernel(const u64 *__restrict__ 
 
     const u64 M = P.M;
     const u64 r = cls_r[blockIdx.x];
+    /* delta = (r - base) mod M: ps = base + delta is the class's first term >= base; L = number
+       of terms below HI (see DevP) */
     const u64 delta = r >= P.bmM ? r - P.bmM : r + (M - P.bmM);
     const u64 L = delta <= P.rem0 ? P.Q0 + 1 : P.Q0;
     if (L == 0) return;
     const u128 ps = (((u128)P.base_hi << 64) | P.base_lo) + delta;
+    /* fits64 is not used below: survivors are stored with 128 bits either way */
     const bool fits64 = ps + (u128)M * (L - 1) + 16 < ((u128)1 << 64);
 
-    /* initial phases */
+    /* initial phases: pattern primes in shared memory (phs[i]); medium primes in registers,
+       spread over the lanes (mph[i] of lane l in warp w belongs to medium prime
+       w + NWARP (l + 32 i)); large primes in registers (lph[i] of thread t belongs to large
+       prime t + NT i) */
     for (int i = tid; i < P.npat; i += NT) phs[i] = d_phase(T, i, delta);
     u32 mph[MAXMPL];
     #pragma unroll
@@ -924,11 +1250,13 @@ __global__ void __launch_bounds__(NT, MINB) sext_kernel(const u64 *__restrict__ 
     unsigned long long nsurv = 0;
     __syncthreads();
 
-    for (u64 k0 = 0; k0 < L; k0 += SEGB) {
+    for (u64 k0 = 0; k0 < L; k0 += SEGB) {     /* segment = terms k0 .. k0 + len - 1 */
         const u32 len = L - k0 < SEGB ? (u32)(L - k0) : SEGB;
         const bool last = k0 + SEGB >= L;
 
-        /* 1. pattern primes, into registers */
+        /* 1. pattern primes, into registers: word j = tid WPT + w gets T_q[(64 j - phi) mod q];
+              s starts at (-phi + 64 WPT tid) mod q and grows by 64 mod q per word.  Storing the
+              words also initialises the bitmap (all zero without pattern primes). */
         {
             u64 acc[WPT];
             #pragma unroll
@@ -951,7 +1279,10 @@ __global__ void __launch_bounds__(NT, MINB) sext_kernel(const u64 *__restrict__ 
         }
         __syncthreads();
 
-        /* 2. medium primes: one warp per prime, lanes take rounds */
+        /* 2. medium primes: one warp per prime, lanes take rounds.  Warp w marks the medium
+              primes w + NWARP (jl + 32 i); lane l takes the rounds t = l - 1, l + 31, ...
+              (b = phi + t q), so lane 0 starts with round -1, whose larger offsets may reach
+              into the segment.  Full rounds (b + K_5 < len) need no range checks. */
         #pragma unroll
         for (int i = 0; i < MAXMPL; i++) {
             for (int jl = 0; jl < 32; jl++) {
@@ -984,7 +1315,8 @@ __global__ void __launch_bounds__(NT, MINB) sext_kernel(const u64 *__restrict__ 
             }
         }
 
-        /* 3. large primes: one thread per prime */
+        /* 3. large primes: one thread per prime, as mark_prime() in a350826.c (round -1, full
+              rounds, the last partial round, next phase from the end position) */
         #pragma unroll
         for (int i = 0; i < LPT; i++) {
             const int g = tid + NT * i;
@@ -1017,7 +1349,10 @@ __global__ void __launch_bounds__(NT, MINB) sext_kernel(const u64 *__restrict__ 
         }
         __syncthreads();
 
-        /* 4. survivors of my words into the global buffer (one atomic per warp) */
+        /* 4. survivors of my words into the global buffer (one atomic per warp): clear bits
+              below len are survivors; an inclusive prefix sum over the lanes gives each thread
+              its offset, lane 31 reserves the warp's total at cnt->nb[0]; entries at or beyond
+              cap are dropped and set res->ovf */
         if (!(P.skip & 16)) {
             u64 x[WPT];
             u32 c = 0;
@@ -1073,8 +1408,18 @@ __global__ void __launch_bounds__(NT, MINB) sext_kernel(const u64 *__restrict__ 
     if (tid == 0) atomicAdd(&res->bits, (unsigned long long)L);
 }
 
-/* Round m of the breadth-first tests: keep the p in `in` (nb[m] of them) whose member
-   p + OFF[m] is a base-2 strong probable prime. */
+/*
+ * round_kernel: round m of the breadth-first base-2 tests (theory, section 3).
+ *   In:     m = 0..5; in = the survivors kept by round m - 1 (for m = 0, the sieve's), their
+ *           number cnt->nb[m] (capped at cap; an overflowed launch is redone anyway);
+ *           out = output buffer of cap entries; cnt->nb[m + 1] = 0 on entry.  Any grid
+ *           (grid-stride loop).
+ *   Out:    out[0 .. cnt->nb[m + 1]) = the p whose member p + OFF[m] is a base-2 strong
+ *           probable prime, in no particular order.
+ *   Method: one thread per number (d_sprp2_96 for members >= 2^64, which are below 2^81);
+ *           __ballot_sync collects the passing lanes, lane 0 reserves room with one atomicAdd
+ *           per warp, and each passing lane writes at its rank among them.
+ */
 __global__ void __launch_bounds__(256, 4) round_kernel(int m, const u64 *__restrict__ in, u64 *__restrict__ out,
                                                        Cnt *__restrict__ cnt, u64 cap)
 {
@@ -1103,7 +1448,8 @@ __global__ void __launch_bounds__(256, 4) round_kernel(int m, const u64 *__restr
     }
 }
 
-/* survivors of all six rounds: strong Lucas confirmation, binning */
+/* cand_kernel: the cnt->nb[6] candidates left after the six rounds (in `in`): strong Lucas
+   tests of their members, counting and binning (d_candidate).  Any grid (grid-stride loop). */
 __global__ void __launch_bounds__(256) cand_kernel(const u64 *__restrict__ in, const Cnt *__restrict__ cnt,
                                                    Res *__restrict__ res)
 {
@@ -1112,7 +1458,13 @@ __global__ void __launch_bounds__(256) cand_kernel(const u64 *__restrict__ in, c
         d_candidate(((u128)in[2 * i + 1] << 64) | in[2 * i], res);
 }
 
-/* self-check kernel: base-2 and Lucas tests on a list of numbers */
+/*
+ * test_kernel: GPU tests of single numbers (selftest and the `num` command).
+ *   In:     v = n numbers (two u64 words each, low first), odd, > 41 and below 2^100 (others
+ *           give meaningless results); one thread per number.
+ *   Out:    out[i] bit 0 = base-2 strong probable prime (d_sprp2), bit 1 = strong Lucas
+ *           probable prime (d_slprp).
+ */
 __global__ void test_kernel(const u64 *v, int n, u8 *out)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1125,11 +1477,15 @@ __global__ void test_kernel(const u64 *v, int n, u8 *out)
 /* Host driver                                                         */
 /* ------------------------------------------------------------------ */
 
+/* Results of a chunk and the run totals (as in a350826.c): per bin count and checksum;
+   survivors, candidates (six members passed base 2), SPSP rejections, terms sieved. */
 typedef struct {
     u64 cnt[MAXBIN], cks[MAXBIN];
     u64 surv, cand, spsp, bits;
 } acc_t;
 
+/* The range of the run: initial members in [lo, hi); base = max(lo, P0), the first number
+   sieved on the GPU; bmM = base mod M; bins bnd[b] .. bnd[b+1]. */
 static struct {
     u128 lo, hi, base;
     u64 bmM;
@@ -1137,6 +1493,8 @@ static struct {
     u128 bnd[MAXBIN + 1];
 } R;
 
+/* Chunks of the run: chunk idx = classes c0 + idx*chunk .. (or entries of `sample` in bench
+   mode); chunks [0, frontier) are folded into tot. */
 static struct {
     u64 chunk, nchunks, frontier, c0, c1;
     acc_t tot;
@@ -1144,20 +1502,29 @@ static struct {
     u64 nsample;
 } D;
 
-static FILE *g_log = NULL;
-static bool g_print = true;
+static FILE *g_log = NULL;                   /* chunk log (-L), or NULL */
+static bool g_print = true;                  /* print SPSP lines (off in bench and selftest) */
 static int g_skip = 0;                       /* bench -X ablation mask */
 static bool g_empty = false;                 /* nothing to sieve (HI <= 2^20) */
-static u64 g_nspsp_printed = 0;
+static u64 g_nspsp_printed = 0;              /* SPSP lines printed so far (information only) */
 
+/* on_sigint: SIGINT/SIGTERM handler: only sets g_stop (async-signal-safe). */
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
+/* acc_add: t += a, field by field (the checksums add mod 2^64). */
 static void acc_add(acc_t *t, const acc_t *a)
 {
     for (int b = 0; b < MAXBIN; b++) { t->cnt[b] += a->cnt[b]; t->cks[b] += a->cks[b]; }
     t->surv += a->surv; t->cand += a->cand; t->spsp += a->spsp; t->bits += a->bits;
 }
 
+/*
+ * log_chunk: append the line of one folded chunk to the chunk log: "C idx survivors
+ * candidates spsp" and "count:cks" per bin (cks in hex) - the format of a350826.c, so
+ * `a350826 recheck` can recompute GPU chunks on the CPU.  idx is absolute (c0/chunk + idx)
+ * when the class range is chunk-aligned (-P parts), else relative.  Write errors are not
+ * checked.
+ */
 static void log_chunk(u64 idx, const acc_t *a)
 {
     /* absolute chunk index when the class range is chunk-aligned (-P parts), else relative */
@@ -1168,6 +1535,12 @@ static void log_chunk(u64 idx, const acc_t *a)
     fflush(g_log);
 }
 
+/*
+ * small_region: sextuplets with initial member in [lo, min(hi, P0)), counted on the host by
+ * direct testing of every p = 7 (mod 30) (the GPU sieve needs p > B, and the sextuplet at 7
+ * is not 97 mod 210).  Added to chunk 0 of a run that starts at class 0 (fold).
+ *   Out:    A->cnt and A->cks of the bins (linear search); nothing if lo >= P0.
+ */
 static void small_region(acc_t *A)
 {
     if (R.lo >= P0) return;
@@ -1183,13 +1556,14 @@ static void small_region(acc_t *A)
     }
 }
 
-/* device state */
+/* Device state.  Index [2] = one set per stream; h* are pinned host buffers (needed for
+   asynchronous copies), d* device buffers. */
 static struct {
-    DevT T;
-    u32 *dq, *dk, *dminv, *dbmod, *dsegmod, *dpstep, *dpstept, *dpoff;
+    DevT T;                 /* device pointers of the tables, passed to sext_kernel */
+    u32 *dq, *dk, *dminv, *dbmod, *dsegmod, *dpstep, *dpstept, *dpoff;   /* device tables (dev_upload) */
     u64 *dtab;
-    u64 *dcls[2], *hcls[2];
-    Res *dres[2], *hres[2];
+    u64 *dcls[2], *hcls[2];   /* class residues of a launch (G.cap entries) */
+    Res *dres[2], *hres[2];   /* results of a launch */
     u64 *dbuf[2][2];        /* survivor ping-pong buffers per stream (2 u64 per entry) */
     Cnt *dcnt[2];
     u64 bcap;               /* entries per survivor buffer */
@@ -1198,6 +1572,8 @@ static struct {
     u64 cap;                /* classes per launch buffer */
 } G;
 
+/* dev_free: free the device tables of the previous configuration (the per-stream buffers of
+   dev_init stay). */
 static void dev_free(void)
 {
     cudaFree(G.dq); cudaFree(G.dk); cudaFree(G.dminv); cudaFree(G.dbmod); cudaFree(G.dsegmod);
@@ -1207,6 +1583,8 @@ static void dev_free(void)
     G.dtab = NULL;
 }
 
+/* dev_copy: device array with a copy of h[0 .. n) (at least one element is allocated);
+   die() on a CUDA error. */
 template <class T> static T *dev_copy(const T *h, size_t n)
 {
     T *d;
@@ -1215,6 +1593,11 @@ template <class T> static T *dev_copy(const T *h, size_t n)
     return d;
 }
 
+/*
+ * dev_upload: copy the tables of SP to the device (replacing the previous ones) and set the
+ * run parameters P in constant memory (see DevP), from SP, R, W and g_skip.
+ *   Errors: die() on any CUDA error.
+ */
 static void dev_upload(void)
 {
     dev_free();
@@ -1245,6 +1628,14 @@ static void dev_upload(void)
     CK(cudaMemcpyToSymbol(P, &p, sizeof p));
 }
 
+/*
+ * dev_init: select CUDA device dev and allocate the per-stream buffers: two streams; class
+ * residues for G.cap = 65536 classes (device and pinned host); one Res (device and pinned
+ * host); two survivor ping-pong buffers of G.bcap = 2^25 entries (512 MiB each) and a Cnt.
+ * Raises the dynamic shared memory limit of the three sext_kernel instances to one segment.
+ *   Notes:  must be called before configure(), which uses G.bcap.
+ *   Errors: die() on any CUDA error (no such device, not enough memory, ...).
+ */
 static void dev_init(int dev)
 {
     CK(cudaSetDevice(dev));
@@ -1268,6 +1659,12 @@ static void dev_init(int dev)
 
 /* ---- checkpoint (same format as a350826.c) ---- */
 
+/*
+ * save_state: write the checkpoint (run parameters, frontier, totals of the folded chunks) to
+ * path.tmp and rename it to path, so it is never half written.
+ *   Errors: a file that cannot be written or renamed only gives a warning; the run goes on and
+ *           the previous checkpoint stays valid.
+ */
 static void save_state(const char *path)
 {
     char tmp[PATH_MAX];
@@ -1285,6 +1682,14 @@ static void save_state(const char *path)
         fprintf(stderr, "\nwarning: cannot update %s: %s\n", path, strerror(errno));
 }
 
+/*
+ * load_state: resume from a checkpoint (written by either tool).
+ *   In:     path; the run must be configured and D.nchunks set.
+ *   Out:    true with D.frontier and D.tot restored; false if the file does not exist.
+ *   Errors: die() if the file cannot be read, is not an a350826 checkpoint, is truncated, has
+ *           a malformed number or bin line, was written for other parameters (range, wheel,
+ *           bound, chunk size, class range, bins) or has its frontier beyond the last chunk.
+ */
 static bool load_state(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -1340,7 +1745,8 @@ static bool load_state(const char *path)
     return true;
 }
 
-/* classes of chunk idx into hcls; returns their number */
+/* fill_chunk: residues of the classes of chunk idx (D.c0 + c, or D.sample[c] in bench mode)
+   into the host buffer h (at least D.chunk entries); returns their number. */
 static u64 fill_chunk(u64 idx, u64 *h)
 {
     const u64 n = D.sample ? D.nsample : D.c1 - D.c0;
@@ -1349,6 +1755,15 @@ static u64 fill_chunk(u64 idx, u64 *h)
     return c1 - c0;
 }
 
+/*
+ * launch_classes: queue the kernels for ncls classes (residues at dcls on the device) on stream
+ * s, in sub-launches of G.sub classes.  Per sub-launch: zero the counters; sext_kernel with the
+ * smallest LPT that holds the large primes; the six round kernels (ping-pong between
+ * dbuf[s][0] and dbuf[s][1], ending in dbuf[s][0]); cand_kernel.  All add into G.dres[s].
+ *   Notes:  asynchronous (results are valid after the stream is synchronised); does nothing if
+ *           the run has nothing to sieve (g_empty); with -X 1 (bench) the tests are left out.
+ *   Errors: die() if a launch is rejected (errors during execution appear at the next sync).
+ */
 static void launch_classes(int s, const u64 *dcls, u64 ncls)
 {
     if (!ncls || g_empty) return;
@@ -1372,6 +1787,8 @@ static void launch_classes(int s, const u64 *dcls, u64 ncls)
     }
 }
 
+/* launch: queue one launch on stream s: copy the ncls class residues from G.hcls[s], zero
+   G.dres[s], launch_classes(), copy the Res back to G.hres[s].  Returns at once. */
 static void launch(int s, u64 ncls)
 {
     CK(cudaMemcpyAsync(G.dcls[s], G.hcls[s], sizeof(u64) * ncls, cudaMemcpyHostToDevice, G.st[s]));
@@ -1380,7 +1797,15 @@ static void launch(int s, u64 ncls)
     CK(cudaMemcpyAsync(G.hres[s], G.dres[s], sizeof(Res), cudaMemcpyDeviceToHost, G.st[s]));
 }
 
-/* a launch overflowed its survivor buffer: redo its classes in pieces, summing the results */
+/*
+ * redo_in_pieces: a launch overflowed its survivor buffer: redo its classes in pieces, summing
+ * the results (theory, section 5).
+ *   In:     s = stream; ncls classes, already in G.dcls[s]; out = where the result goes.
+ *   Out:    *out = sum over 8 pieces of ncls/8 classes, each run with sub-launches of G.sub/8
+ *           classes and synchronised; SPSP records merged (the first MAXSPSP).
+ *   Errors: die() if a piece overflows again or memory runs out.  Not exercised by the
+ *           selftest.
+ */
 static void redo_in_pieces(int s, u64 ncls, Res *out)
 {
     Res *acc = (Res *)calloc(1, sizeof(Res));
@@ -1408,6 +1833,12 @@ static void redo_in_pieces(int s, u64 ncls, Res *out)
     G.sub = sub0;
 }
 
+/*
+ * fold: add the results of chunk idx to the totals, in chunk order (called by run_count).
+ *   In:     idx; r = its Res.
+ *   Out:    D.tot += r (plus the small region for chunk 0 of a run that starts at class 0);
+ *           SPSP lines printed (if g_print; at most MAXSPSP per chunk); chunk-log line (-L).
+ */
 static void fold(u64 idx, const Res *r)
 {
     acc_t a;
@@ -1426,8 +1857,24 @@ static void fold(u64 idx, const Res *r)
     if (g_log) log_chunk(idx, &a);
 }
 
+/* Wall time and number of terms sieved by one run_count call. */
 typedef struct { double seconds; u64 bits; } run_stats_t;
 
+/*
+ * run_count: run the configured count until all chunks are folded or the run is stopped.
+ *   In:     state = checkpoint path or NULL; interval = seconds between checkpoints (and
+ *           between status lines when stderr is not a terminal); quiet = no status output.
+ *           Needs dev_init() and configure() (bench also sets D.sample).
+ *   Out:    D.tot = totals of all folded chunks (including those restored from the
+ *           checkpoint), D.frontier = number of folded chunks; returns the wall time and
+ *           the terms sieved by this call.  Prints a status line (rate and ETA since the
+ *           start of this call) and writes the checkpoint every `interval` seconds and at the
+ *           end.
+ *   Method: two launches in flight on alternating streams; the older one is awaited, redone
+ *           in pieces if it overflowed, and folded, so chunks are folded in order.
+ *   Errors: die() for a chunk larger than the launch buffer, a bad checkpoint or a CUDA error.
+ *           SIGINT/SIGTERM: no new launches; those in flight finish and are folded.
+ */
 static run_stats_t run_count(const char *state, int interval, bool quiet)
 {
     D.nchunks = ((D.sample ? D.nsample : D.c1 - D.c0) + D.chunk - 1) / D.chunk;
@@ -1460,7 +1907,7 @@ static run_stats_t run_count(const char *state, int interval, bool quiet)
             inflight++;
         }
         CK(cudaStreamSynchronize(G.st[cur]));
-        if (G.hres[cur]->ovf) {
+        if (G.hres[cur]->ovf) {                /* survivor buffer overflow: redo the chunk */
             const u64 n = fill_chunk(idxs[cur], G.hcls[cur]);
             CK(cudaMemcpy(G.dcls[cur], G.hcls[cur], sizeof(u64) * n, cudaMemcpyHostToDevice));
             redo_in_pieces(cur, n, G.hres[cur]);
@@ -1500,6 +1947,8 @@ static run_stats_t run_count(const char *state, int interval, bool quiet)
 /* Parameters and commands                                             */
 /* ------------------------------------------------------------------ */
 
+/* rho_wheel: fraction of all integers in the classes of wheel w,
+   1/210 * prod_{11 <= q <= w} (q - 6)/q. */
 static double rho_wheel(u32 w)
 {
     double r = 1.0 / 210;
@@ -1507,7 +1956,10 @@ static double rho_wheel(u32 w)
     return r;
 }
 
-/* GPU cost model, measured on GB10 (B = 2^16): ~1.1 us per class (phases of all sieving primes,
+/* auto_wheel: the wheel (largest prime w in 7..47) with the smallest estimated time for
+   [lo, hi); 7 if nothing is sieved.  Wheels whose classes would hold less than one term are
+   not considered.  die() if memory runs out.
+   GPU cost model, measured on GB10 (B = 2^16): ~1.1 us per class (phases of all sieving primes,
    block start) plus ~5.8 ps per candidate bit for B = 2^16 (scaled by the marks per bit). */
 static u32 auto_wheel(u128 lo, u128 hi, u32 B)
 {
@@ -1532,6 +1984,8 @@ static u32 auto_wheel(u128 lo, u128 hi, u32 B)
     return best;
 }
 
+/* auto_chunk: default classes per chunk, as in a350826.c: the largest power of two <= C/4096,
+   at most 16384 (so a chunk always fits the launch buffer of 65536 classes). */
 static u64 auto_chunk(u64 C)
 {
     u64 c = 1;
@@ -1539,16 +1993,18 @@ static u64 auto_chunk(u64 C)
     return c;
 }
 
+/* Command-line options (parse_opts); 0 means "default" or "not given" for most fields. */
 typedef struct {
-    u32 w, B, pmax, qw;
-    u64 chunk, nsample, cr0, cr1, part, nparts;
-    int interval, dev;
-    const char *state, *log;
-    bool quiet;
-    int nb;
-    u128 bnd[MAXBIN];
+    u32 w, B, pmax, qw;     /* -w (0 = auto), -B, -p, -Q */
+    u64 chunk, nsample, cr0, cr1, part, nparts;   /* -c (0 = auto), -n, -C C0:C1, -P I/N */
+    int interval, dev;      /* -i, -d */
+    const char *state, *log;  /* -S, -L */
+    bool quiet;             /* -q */
+    int nb;                 /* number of -b boundaries */
+    u128 bnd[MAXBIN];       /* -b boundaries (checked in configure) */
 } opts_t;
 
+/* usage: print the command summary to stderr and exit with status 2. */
 static void usage(void)
 {
     fputs("usage: a350826_cuda count LO HI [-b B1,B2,..] [-w W] [-B B] [-c CH] [-C C0:C1 | -P I/N] [-S FILE] [-i SECS]\n"
@@ -1558,6 +2014,15 @@ static void usage(void)
     exit(2);
 }
 
+/*
+ * parse_opts: parse the options and positional numbers of a command (as in a350826.c).
+ *   Out:    *o = defaults (B = 2^16, -p 256, -Q 4096, interval 60 s, 20000 bench samples)
+ *           overridden by the options; pos[0 .. npos) = the positional numbers.  -X sets the
+ *           global g_skip.
+ *   Errors: usage() (exit 2) for an unknown option, a missing value or the wrong number of
+ *           positional arguments; die() for an invalid or out-of-range value.  A -b list
+ *           longer than 16383 characters would be cut silently (255 boundaries fit easily).
+ */
 static void parse_opts(int argc, char **argv, int first, opts_t *o, int npos, u128 *pos)
 {
     memset(o, 0, sizeof *o);
@@ -1625,6 +2090,16 @@ static void parse_opts(int argc, char **argv, int first, opts_t *o, int npos, u1
     if (np != npos) usage();
 }
 
+/*
+ * configure: set up everything for counting [lo, hi): range and bins (R), wheel (given or
+ * auto_wheel), tables (tables_setup), sub-launch size G.sub, device tables and parameters
+ * (dev_upload), chunk size and class range (all, -C or -P), as in a350826.c.
+ *   In:     options o; lo < hi <= 2^80.  Needs dev_init() (G.bcap).
+ *   Errors: die() for an empty or too large range, a -w that is not prime, B not above the
+ *           wheel prime, bin boundaries that do not increase strictly inside (lo, hi), a class
+ *           longer than 2^62 terms, too many medium or large primes, a -C range beyond the
+ *           classes, an empty -P part, or a CUDA error.
+ */
 static void configure(opts_t *o, u128 lo, u128 hi)
 {
     if (hi <= lo) die("HI must be larger than LO");
@@ -1671,6 +2146,8 @@ static void configure(opts_t *o, u128 lo, u128 hi)
     }
 }
 
+/* decade_label: "A350826(n)" if [a, b) = [10^(n-1), 10^n) for some n <= 24, else NULL (static
+   buffer). */
 static const char *decade_label(u128 a, u128 b)
 {
     static char buf[32];
@@ -1682,6 +2159,9 @@ static const char *decade_label(u128 a, u128 b)
     return NULL;
 }
 
+/* print_results: the result lines on stdout, as in a350826.c: "TAG [a, b) count N cks H" per
+   bin (with the A350826(n) label for a decade), a total line for several bins, and the
+   statistics line; tag = RESULT, PART (class range only) or PARTIAL (stopped early). */
 static void print_results(const char *tag)
 {
     u64 total = 0, cks = 0;
@@ -1698,6 +2178,8 @@ static void print_results(const char *tag)
     fflush(stdout);
 }
 
+/* print_banner: description of the run on stderr (device, wheel, expected candidates, sizes of
+   the prime groups, chunks).  die() on a CUDA error. */
 static void print_banner(const opts_t *o)
 {
     cudaDeviceProp prop;
@@ -1710,6 +2192,12 @@ static void print_banner(const opts_t *o)
         fprintf(stderr, "classes [%" PRIu64 ", %" PRIu64 ") of %" PRIu64 " only (partial count)\n", D.c0, D.c1, W.C);
 }
 
+/*
+ * cmd_count: `a350826_cuda count LO HI [options]`.
+ *   Out:    RESULT or PART lines on stdout; returns 0 if all chunks were done, 1 if the run was
+ *           stopped (PARTIAL lines; with -S the checkpoint is saved).
+ *   Errors: die() for invalid arguments, a chunk log that cannot be opened or a CUDA error.
+ */
 static int cmd_count(int argc, char **argv)
 {
     opts_t o;
@@ -1733,6 +2221,14 @@ static int cmd_count(int argc, char **argv)
     return 0;
 }
 
+/*
+ * cmd_bench: `a350826_cuda bench LO HI [-n N] ...`: time N classes (default 20000) spread evenly
+ * over all classes, each over the whole range, in chunks of up to 4096 classes after one
+ * warm-up launch, and project the time of the full count.
+ *   Out:    BENCH lines (rate, per-class statistics, projection); returns 0.  -X MASK leaves out
+ *           parts of the work (see Usage in the header).
+ *   Errors: die() for invalid arguments, out of memory or a CUDA error.
+ */
 static int cmd_bench(int argc, char **argv)
 {
     opts_t o;
@@ -1776,9 +2272,20 @@ static int cmd_bench(int argc, char **argv)
 /* Selftest                                                            */
 /* ------------------------------------------------------------------ */
 
+/* rnd: deterministic pseudo-random numbers for the selftest (fixed seed, reproducible). */
 static u64 rng_state = 0x243F6A8885A308D3ULL;
 static u64 rnd(void) { return mix64(rng_state += GOLD); }
 
+/*
+ * test_arith_gpu: the GPU's base-2 and Lucas tests against the host reference, on 65536
+ * numbers: 12 base-2 strong pseudoprimes (A001262), 12 strong Lucas pseudoprimes (A217255),
+ * the 3 largest primes below 2^64, and random odd numbers of 20 to 80 bits prime to 105.
+ * The GPU base-2 test must agree with mr_ref(x, 2), the GPU Lucas test must accept every
+ * prime and the 12 Lucas pseudoprimes, and no composite may pass both.
+ *   Out:    number of failures, printed as FAIL lines (at most 10 of the comparisons).
+ *   Debug:  A350826_NTEST = n tests only the first n numbers, A350826_FROM = f those from
+ *           index f; not range-checked (n + f must not exceed 65536).
+ */
 static int test_arith_gpu(void)
 {
     /* random odd numbers up to 2^80 (no factor <= 7), known pseudoprimes; compare with the host */
@@ -1832,6 +2339,7 @@ static int test_arith_gpu(void)
     return bad;
 }
 
+/* A350826(1..17) as in the OEIS in 2022 (index 0 unused). */
 static const u64 A350826[] = {0, 1, 1, 0, 0, 3, 0, 13, 64, 235, 1296, 7013, 41782, 253420, 1607418, 10520883,
                               70785653, 488096844};
 
@@ -1848,6 +2356,8 @@ static const window_t WINDOWS[] = {
     {NULL, NULL, 0, 0}
 };
 
+/* run_quiet: selftest helper: count [lo, hi) quietly with wheel w (0 = auto), bound B, the
+   default -p 256 and -Q 4096, and class range [c0, c1) (c1 = 0: all); *count, *cks = totals. */
 static void run_quiet(u128 lo, u128 hi, u32 w, u32 B, u64 c0, u64 c1, u64 *count, u64 *cks)
 {
     opts_t o;
@@ -1860,6 +2370,17 @@ static void run_quiet(u128 lo, u128 hi, u32 w, u32 B, u64 c0, u64 c1, u64 *count
     for (int b = 0; b < R.nbins; b++) { *count += D.tot.cnt[b]; *cks += D.tot.cks[b]; }
 }
 
+/*
+ * cmd_selftest: `a350826_cuda selftest [N] [-d DEV]`: test_arith_gpu, A350826(1..N) against the
+ * OEIS data (N <= 17, default 14; the larger decades use several segments per class), and the
+ * windows of verify_a350826.py (members across 2^64 and up to 1e22: the 96- and 128-bit
+ * paths).  All three groups of sieving primes take part with the default -p and -Q.
+ *   Out:    one line per test; returns 0 if everything passed, else 1.
+ *   Not covered: the survivor-buffer overflow path (redo_in_pieces), other -p/-Q/-B values,
+ *           and survivor counts; those are compared with the CPU tool by `a350826 recheck` on
+ *           chunk logs.
+ *   Errors: die() for N outside 1..17 or a CUDA error.
+ */
 static int cmd_selftest(int argc, char **argv)
 {
     opts_t o;
@@ -1896,6 +2417,13 @@ static int cmd_selftest(int argc, char **argv)
     return bad ? 1 : 0;
 }
 
+/*
+ * cmd_mrbench: `a350826_cuda mrbench X [N]` (debug): time round_kernel (round 0) on N random odd
+ * numbers near X (default 2^24) with grids of 192 to 1536 blocks, on device 0.
+ *   Out:    one timing line per grid size; returns 0.
+ *   Errors: not checked: N must not exceed G.bcap = 2^25 (the device buffer would overflow), and
+ *           the host allocation is not tested.
+ */
 static int cmd_mrbench(int argc, char **argv)      /* round-kernel throughput on random odd numbers near X */
 {
     if (argc < 3) usage();
@@ -1926,6 +2454,13 @@ static int cmd_mrbench(int argc, char **argv)      /* round-kernel throughput on
     return 0;
 }
 
+/*
+ * cmd_num: `a350826_cuda num X [X ...]` (debug): GPU base-2 and Lucas tests of each X
+ * (test_kernel on device 0) next to the host's base-2 test and reference primality.
+ *   Out:    one line per number; returns 0.
+ *   Errors: die() for a malformed number, X >= 2^81 (is_prime_ref) or a CUDA error; X should
+ *           be odd and > 41 (test_kernel).
+ */
 static int cmd_num(int argc, char **argv)          /* debug: GPU tests of single numbers */
 {
     dev_init(0);
@@ -1947,6 +2482,8 @@ static int cmd_num(int argc, char **argv)          /* debug: GPU tests of single
     return 0;
 }
 
+/* main: dispatch on the command word (count, bench, selftest, num, mrbench); stdout is
+   line-buffered so results appear at once when redirected to a file. */
 int main(int argc, char **argv)
 {
     stderr_tty = isatty(2);

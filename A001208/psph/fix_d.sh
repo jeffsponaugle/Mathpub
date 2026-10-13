@@ -1,6 +1,9 @@
 #!/bin/sh
 # mathd: the depth-2 chunking of A001209(303) (10 items per chunk) can keep at most 10 of 96 threads busy
 # (load average fell to ~10). Stop it (wrapper first) and measure the depth-3 item count for a finer split.
+#
+# One-off on mathd, Oct 3 2026 ~07:45 PDT.  Order: wrapper jobs10.sh, then the h303k4 run_range.sh, then psph16.  The
+# depth-3 count printed at the end (4158140 items, 515 s to generate) led to mathd_jobs11.sh.  Linux only (free -g).
 cd ~/A0001208/psph
 for p in $(pgrep -f "sh [j]obs10.sh"); do kill $p; done
 sleep 1

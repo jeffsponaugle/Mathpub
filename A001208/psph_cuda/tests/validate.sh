@@ -1,6 +1,19 @@
 #!/bin/sh
 # Validation suite for the GPU leaf, run on orin1 from ~/A001208/psph_cuda.  Logs in logs/.
 # 1. selftest (GPU mode)   2. differential tests GPU vs CPU binary (same source)   3. -s2 0 exact-match tests
+#
+# Usage (on orin1):  cd ~/A001208/psph_cuda && make all psph_cpu psph_cpu16 && LOG=logs/validate_diff.log sh tests/validate.sh
+#   LOG must be given by the caller: the line LOG=${LOG:-$LOG} below supplies no default (with LOG unset every
+#   "> $LOG" redirection fails).  J = worker threads (default 6); SKIP_SELFTEST=1 skips step 1.  Uses GNU timeout.
+# Method: psph_cpu and psph_gpu are the SAME psph.c built without and with the CUDA leaf.  For each case both run the
+#   same search; the sorted SOLUTION lists must be identical, and so must the X-pass counts (stage 1 is replicated
+#   exactly on the GPU).  The GPU picks its deep holes per prefix instead of per candidate, so the later counters may
+#   differ; with -s2 0 (no deep holes) every counter must agree.  par_case additionally forces the 64-bit filter
+#   kernel and the PARANOID host re-check of every batch.
+# Output: one block per case in $LOG ("SOLUTIONS IDENTICAL ..." / "*** SOLUTION SETS DIFFER ***", X-pass verdict,
+#   leaf statistics, wall times, GPU time, any PARANOID/FATAL/INTERNAL lines); per-case .out/.err/.sorted in logs/.
+#   Result of the Oct 1 2026 run: every case that finished gave identical solution sets; two (9,8) cases hit the
+#   900 s limit on both binaries and were replaced by smaller item ranges (see psph_cuda/README.md, Validation).
 cd ~/A001208/psph_cuda || exit 1
 mkdir -p logs
 N="nice -n 10"
@@ -14,6 +27,7 @@ if [ -z "$SKIP_SELFTEST" ]; then
   echo "=== selftest quick (GPU) done $(date): $(grep -E 'selftest:' logs/selftest_gpu.log)" >> $LOG
 fi
 # ---- 2. differential tests
+# diff_case TAG CPU_BINARY GPU_BINARY ARGS...: run both binaries with ARGS (each limited to 900 s) and compare as above.
 diff_case() {   # tag binary_cpu binary_gpu args...
   tag=$1; bc=$2; bg=$3; shift 3
   echo "--- $tag: $*  start $(date)" >> $LOG
@@ -51,6 +65,8 @@ diff_case s2z_h12k6     psph_cpu   psph_gpu   -h 12 -k 6 -t 5118 -s2 0
 diff_case s2z_h9k8_i    psph_cpu   psph_gpu   -h 9 -k 8 -t 5600 -d 4 -i 10900:11003 -s2 0
 diff_case s2z_h9k5_16   psph_cpu16 psph_gpu16 -h 9 -k 5 -t 797 -s2 0
 # int64 kernel path forced + PARANOID host re-check (small cases: the host re-check is sequential and slow)
+# par_case TAG REF_SORTED ARGS...: run psph_gpu with PSPH_GPU_INT64=1 PSPH_GPU_PARANOID=1 and compare its sorted
+# solutions with a reference file produced earlier by the CPU binary (a PARANOID mismatch would also abort with exit 8).
 par_case() {  # tag ref_sorted args...
   tag=$1; ref=$2; shift 2
   echo "--- $tag (int64 + paranoid): $*  start $(date)" >> $LOG

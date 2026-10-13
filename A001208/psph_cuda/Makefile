@@ -8,6 +8,10 @@
 # (NEON on aarch64, AVX2 on x86) exactly like the CPU program.
 #
 # psph.c is taken from ../psph/psph.c unless a copy psph.c exists in this directory (deployment layout).
+#
+# The host part (psph.c) is compiled with gcc and linked by nvcc together with gpu_leaf.cu; both must be built with
+# the same -DWIDE setting because the table cell type is shared.  "make selftest" runs the quick selftest in GPU mode.
+# Validation and throughput scripts: tests/validate.sh, tests/throughput.sh.
 NVCC     ?= /usr/local/cuda/bin/nvcc
 ARCH     ?= -arch=sm_87
 CC       ?= gcc

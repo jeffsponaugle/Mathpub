@@ -1,28 +1,36 @@
 /*
- * a171775_2d.metal -- Metal kernel for the swapped 2D A171775 search (see ../a171775_2d.c).
+ * a171775_2d.metal -- Metal kernel for the swapped 2D A171775 search (see ../a171775_2d.c,
+ * whose block_B() this kernel runs, and a171775_metal.m, its host).  cuda/a171775_2d_cuda.cu
+ * contains a CUDA port of the same kernel.
  *
- * One threadgroup = one base pair (c, B) and up to 128 consecutive blocks; one thread =
- * one block.  The pair's lookup table (keys (v mod g) N' + v div g, sorted, bucketed) sits
- * in threadgroup memory.  All wide values are little-endian 32-bit limbs: the remainder
- * M1 mod P and the weights are 96-bit, M itself 128-bit.  A thread builds its start state
- * from the base-B digits of Mblock (sum of precomputed digit vectors of the block weights)
- * and walks x = 0..c-1 exactly like block_B() in the C tool.
+ * One threadgroup = one base pair (c, B) and up to 256 consecutive blocks of the search; one
+ * thread = one block.  The pair's lookup table (keys (v mod g) N' + v div g, sorted,
+ * bucketed) and digit-k tables are copied into threadgroup memory (c <= 1024).  All wide
+ * values are little-endian 32-bit limbs: the remainder rem = M1 mod P and the weights are
+ * 96-bit, M itself (for the range test) 128-bit.  A thread builds its start state from the
+ * base-B digits of Mblock (the sum of precomputed digit vectors of the block weights, so no
+ * wide division is needed) and walks x = 0..c-1 exactly like block_B() in the C tool.
  *
- * Divergence: a lookup match is not checked by the thread that found it.  It is pushed as
- * a self-contained record into a queue of its SIMD group (threadgroup memory); whenever a
- * queue holds 32 or more records the whole SIMD group checks them, one per lane.  The
- * check (region, range, next digit pair, full palindrome test) matches candidate() in the
- * C tool, so the statistics are identical.  Only full n-digit palindromes are emitted.
+ * Each lookup match is checked at once by the thread that found it (process_rec(): region,
+ * range, next digit pair, full palindrome test), with the same steps as block_B(), so the
+ * statistics are identical to the CPU tool's.  Only full n-digit palindromes are written out.
+ * (An earlier version queued the matches per SIMD group to reduce divergence; the queue
+ * overflowed too often and was removed.  Rec, QS and the fourth tgstat word are left from
+ * it.)
+ *
+ * Compile-time switches: ABLATE (set by the host from A171775_ABLATE) removes parts of the
+ * work for profiling and gives wrong statistics: 12 = process_rec() returns at once, >= 21 =
+ * matches are not processed at all, >= 23 = no lookups either.
  */
 #include <metal_stdlib>
 using namespace metal;
 
-#define MAXK 3
-#define MAXL 16
-#define TG 256
-#define NSG (TG / 32)
+#define MAXK 3                       /* largest k (digit pairs imposed by the lookup) */
+#define MAXL 16                      /* digit buffers: n + 2 <= MAXL */
+#define TG 256                       /* threads per threadgroup (the host uses the same) */
+#define NSG (TG / 32)                /* SIMD groups per threadgroup */
 #ifndef QS
-#define QS 128
+#define QS 128                       /* unused: the queue size of the removed match queue */
 #endif
 
 struct PairC {                       /* must match the host definition */
@@ -37,12 +45,19 @@ struct PairC {                       /* must match the host definition */
     uint gm, gs;                     /* W div g = mulhi(W, gm) >> gs for W < 2^31 */
 };
 
+/* Item -- one threadgroup's work: pair index, first block index j0, number of blocks,
+   pad bit 0 = range test needed.  Surv -- a survivor: q1, rem (r0..r2), B, c, x and the
+   block index j; the host rebuilds M = q1 P + rem.  Params -- [lo, hi] as 32-bit limbs,
+   the survivor buffer size and n. */
 struct Item { uint pair, j0, count, pad; };
 struct Surv { uint q, r0, r1, r2, B, c, x, j; };
 struct Params { uint lo[4], hi[4]; uint outcap, n, pad0, pad1; };
 /* a lookup match: state of the pushing thread at its x, and (y, z) */
 struct Rec { uint r0, r1, r2, q1, mklo, info, yz, xt; };   /* info = mk_hi | reg << 16, yz = y | z << 16, xt = x | tid << 16 */
 
+/* 96-bit arithmetic on three 32-bit limbs (a0 least significant), 32-bit operations only:
+   ge96 (a >= b), add96 (a += b, no overflow by construction), sub96 (a -= b, a >= b),
+   mul96 and div96 below. */
 static inline bool ge96(uint a0, uint a1, uint a2, uint b0, uint b1, uint b2)
 {
     if (a2 != b2) return a2 > b2;
@@ -96,7 +111,20 @@ struct PC {                          /* per-threadgroup copy of what process_rec
     float invPtop;
 };
 
-/* check one match; the same steps as candidate() in a171775_2d.c */
+/*
+ * process_rec -- check one lookup match: the same steps as the match code of block_B() in
+ * ../a171775_2d.c (candidate() in a171775.c).
+ *
+ * In:     rc (the thread's rem, q1, M1 mod B^(k+1) and region at this x, plus y, z, x and
+ *         the thread index); K (the pair, in threadgroup memory); prm; the digit-k tables;
+ *         the survivor buffer and counter; j0; need_range; the thread's hit and f1 counters.
+ * Out:    counts the hit if (y, z) lies in the region rc was made for, and f1 if it passes
+ *         the digit pair (k, n-1-k); a full n-digit palindrome is appended to outs[]
+ *         (dropped past prm.outcap; the host then stops with "survivor buffer overflow").
+ * Errors: none.  Digit n-1-k comes from a float32 quotient (relative error about 3e-7,
+ *         below 3.1e-4 for digits < 1024, inside the 0.00049 margin) and is corrected
+ *         exactly near a digit boundary.
+ */
 static inline void process_rec(Rec rc, threadgroup const PC &K, constant Params &prm, threadgroup const uint *tay_lo,
                                threadgroup const ushort *tay_hi, threadgroup const uint *taz_lo, threadgroup const ushort *taz_hi,
                                device Surv *outs, device atomic_uint *nout, uint j0, bool need_range,
@@ -177,6 +205,17 @@ static inline void process_rec(Rec rc, threadgroup const PC &K, constant Params 
     }
 }
 
+/*
+ * scan2 -- one threadgroup = one item: thread tid runs block_B() for block j0 + tid (if
+ * tid < count) of the item's pair (c, B).
+ *
+ * In:     the item list, the slot's pair constants and packed tables (key table tvals,
+ *         tys, tbst; digit-k tables tay_lo, tay_hi, taz_lo, taz_hi; at the pair's offsets
+ *         toff and boff), prm.
+ * Out:    survivors in outs[] (counter nout); tgstat[4 tg] = the item's lookups, hits, f1
+ *         and 0.
+ * Errors: none; a thread whose Mblock already has more than n base-B digits stays idle.
+ */
 kernel void scan2(device const Item *items [[buffer(0)]],
                   device const PairC *pairs [[buffer(1)]],
                   device const uint *tvals [[buffer(2)]],
@@ -196,6 +235,7 @@ kernel void scan2(device const Item *items [[buffer(0)]],
                   uint sg [[simdgroup_index_in_threadgroup]],
                   uint lane [[thread_index_in_simdgroup]])
 {
+    /* the pair's tables, copied from device memory once per threadgroup (c <= 1024) */
     threadgroup uint sval[1024];
     threadgroup ushort sys[1024];
     threadgroup ushort sbst[1032];
@@ -227,11 +267,12 @@ kernel void scan2(device const Item *items [[buffer(0)]],
     const uint Rc0 = K.Rc[0], Rc1 = K.Rc[1], Rc2 = K.Rc[2];
     const uint wx0 = K.wx[0], wx1 = K.wx[1], wx2 = K.wx[2];
 
-    ulong nlook = 0, nhits = 0, nf1 = 0, novf = 0;
+    ulong nlook = 0, nhits = 0, nf1 = 0, novf = 0;   /* novf: unused (removed queue) */
     bool active = tid < it.count;
     uint E[MAXK] = {0, 0, 0};
     uint q1 = 0, W = 0, r0 = 0, r1 = 0, r2 = 0, mk_lo = 0, mk_hi = 0, wnext = 0;
     bool last = false;
+    /* RECOMPUTE(): as in block_B(), wnext and last from the digits E[] of q1 */
 #define RECOMPUTE()                                                                          \
     {                                                                                        \
         int jj = (int)k - 1;                                                                 \
@@ -276,6 +317,7 @@ kernel void scan2(device const Item *items [[buffer(0)]],
         } else active = false;
     }
 
+    /* PUSH(z): check the match (y, z) of the current lookup at once (process_rec) */
 #if defined(ABLATE) && ABLATE >= 21
 #define PUSH(ZZ) { nhits += (ZZ) & 1; }
 #else
@@ -290,6 +332,8 @@ kernel void scan2(device const Item *items [[buffer(0)]],
     }
 #endif
 
+    /* the x loop of block_B(); inactive threads keep looping (idle) so that every thread
+       reaches the reduction below */
     for (uint x = 0; x < c; x++) {
         if (active) {
 #if defined(ABLATE) && ABLATE >= 23
@@ -377,6 +421,8 @@ kernel void scan2(device const Item *items [[buffer(0)]],
     }
 #undef RECOMPUTE
 #undef PUSH
+    /* per-item counts: SIMD-group sums (32-bit: at most 2c lookups per thread), then thread 0
+       adds the groups */
     uint snl = simd_sum((uint)nlook), snh = simd_sum((uint)nhits), snf = simd_sum((uint)nf1);
     if (lane == 0) { red[4 * sg] = snl; red[4 * sg + 1] = snh; red[4 * sg + 2] = snf; red[4 * sg + 3] = 0; }
     threadgroup_barrier(mem_flags::mem_threadgroup);

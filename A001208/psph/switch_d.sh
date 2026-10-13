@@ -1,4 +1,10 @@
 #!/bin/sh
+# One-off reconfiguration script (rebalance #6, Oct 3 2026 ~01:10 PDT, run on mathd in its psph directory): replace
+# jobs9.sh by jobs10.sh; chunk 13 (already started) stays with the h27k6d driver, chunk 14 moves to the new TGT-186943
+# range h27k6i.
+# Pattern: kill the old wrapper only (the running run_range.sh driver and psph keep going), touch .done SKIP markers
+# for chunks that move to another box (unless they had already started there), start the new wrapper with nohup,
+# log the switch in jobs.log and show the running wrappers / drivers.  Kept for the record of how the chunks moved.
 cd ~/A0001208/psph
 for p in $(pgrep -f "sh [j]obs9.sh"); do kill $p; done
 sleep 1

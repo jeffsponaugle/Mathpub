@@ -1,17 +1,71 @@
 /*
  * a171775_2d_cuda.cu -- CUDA (DGX Spark / GB10, sm_121) port of the swapped 2D A171775 search.
  *
- * Host logic comes from ../a171775_2d.c (included as a library): problem setup, units (c, e_0),
- * per-block ranges of check bases B, per-(c, B) constants and lookup tables, survivor
- * post-processing, state files.  The kernel is the one of ../metal/a171775_2d.metal: one block
- * of 256 threads = one base pair (c, B) and up to 256 consecutive blocks of the search, one
- * thread = one block; the pair's tables sit in shared memory; 96/128-bit values are 32-bit limbs.
- * So this tool, a171775_2d (CPU) and a171775_metal produce the same statistics and share
- * checkpoint files.
+ * Host logic comes from ../a171775_2d.c (included as a library, see below):
+ * problem setup, units (c, e_0), the per-block ranges of check bases B, the
+ * per-(c, B) constants and lookup tables, the survivor post-processing and
+ * the state files.  Read the theory of operations there first.  The kernel
+ * is a port of the one in ../metal/a171775_2d.metal.  So this tool, a171775_2d
+ * (CPU) and a171775_metal produce the same statistics and share checkpoint
+ * files.
+ *
+ * ========================================================================
+ * THEORY OF OPERATIONS (the GPU part)
+ * ========================================================================
+ *
+ * 1. Work.  A batch is a run of consecutive units of one base c (whole
+ *    units, sized so a launch takes about 0.25 s; g_target_steps adapts to
+ *    the measured rate).  Its blocks, each with its range of check bases B,
+ *    are listed (batch_blocks(), as do_block() does), and for every B the
+ *    consecutive blocks whose range contains B are cut into items of at most
+ *    256 blocks (make_items()).  One CUDA block of 256 threads processes one
+ *    item: one base pair (c, B), one thread per block of the search.
+ *
+ * 2. Tables.  The pair's lookup table (val, ys, bst) and digit-k tables
+ *    (ay/az) are built on the host by cctx_set() and copied to the GPU per
+ *    base c (slot_set_c()); each CUDA block copies its pair's tables into
+ *    shared memory (c <= 1024).  The pair's constants are converted to
+ *    PairC, with 96-bit values as three 32-bit limbs.
+ *
+ * 3. A thread's start state.  The host provides the base-B digits of each
+ *    block weight w_t (blkw); the thread adds e_t times them with carries to
+ *    get the base-B digits D[] of Mblock, so it never divides a 128-bit
+ *    number: q1 = the top k digits, rem = M1 mod P from the low n-k digits,
+ *    M1 mod B^k, digit k (mk_hi) and W = (T - M1) u mod N follow directly.
+ *    Then it walks x = 0..c-1 exactly as block_B(): one or two lookups per x
+ *    (W div g by a "magic" multiply: mulhi(W, gm) >> gs, exact for W < 2^31
+ *    and verified on the host), with rem kept in 96 bits.
+ *
+ * 4. A match (process_match()) gets the same steps as in block_B(): the
+ *    region test, the [LO, HI] test (only for items with blocks reaching
+ *    outside the range), the digit pair (k, n-1-k) -- digit n-1-k from a
+ *    float quotient, corrected exactly near a digit boundary -- and the full
+ *    n-digit palindrome test from the digits of rem and q.  A survivor goes
+ *    to the host as (q1, rem, B, c, x, j); the host rebuilds M, checks both
+ *    palindromes again (a mismatch stops the run) and calls survivor().
+ *    Each CUDA block sums its lookups, hits and f1 (warp shuffles) into
+ *    tgstat[].
+ *
+ * 5. Pipeline and checkpoints.  Two slots (streams) alternate: the host
+ *    prepares and launches one batch while the GPU runs the other, and
+ *    batches finish in issue order, so the statistics always cover exactly
+ *    the units below the oldest batch in flight; that frontier is what -S
+ *    saves, so every checkpoint is exact.
+ *
+ * 6. Limits.  n = 8..14 (n + 2 <= MAXL_G digits, 1..3 block digits);
+ *    c <= 1024 (MAXC, shared memory) with at most 1100 check bases;
+ *    P, Ptop and the weights must fit in 96 bits; N <= 2^31 when g > 1; at
+ *    most 2^15 items and 2^20 survivors per launch.  Every violation stops
+ *    the run with a message (exit status 1).
+ *
+ * The file is compiled as C++ by nvcc, so ../a171775_2d.c is included with
+ * A171775_2D_LIB (no main) and A171775_2D_NO_DRIVER (no C11 thread driver).
  *
  * Usage
  *   a171775_2d_cuda selftest              n = 8, 9, 10 full searches vs the CPU tool's statistics
  *   a171775_2d_cuda search n LO HI [-S state] [-i sec] [-E end_unit]
+ * Exit status: 0 = done, 3 = interrupted, 1 = usage or a fatal error (CUDA
+ * errors name the failing call).
  */
 #define A171775_2D_LIB
 #define A171775_2D_NO_DRIVER
@@ -27,11 +81,21 @@
         }                                                                                        \
     } while (0)
 
-#define TG 256
+#define TG 256                        /* threads per CUDA block = blocks of the search per item */
 #define NWARP (TG / 32)
-#define MAXK_G 3
-#define MAXL_G 16
+#define MAXK_G 3                      /* largest k (digit pairs imposed by the lookup) */
+#define MAXL_G 16                     /* digit buffer size: n + 2 <= MAXL_G */
 
+/*
+ * PairC -- the constants of one pair (c, B) in the GPU layout (identical to
+ * the Metal kernel's): the bconst_t fields of ../a171775_2d.c as 32-bit
+ * values (B, k, N, g, N', u, lim, R, Wx, Wc[]), 96-bit values as three
+ * limbs (P, Rc, Ptop, w_x, w_y, w_z, and N' w_z, the step between the z of
+ * one match), the table offsets toff/boff of this pair in the slot's arrays,
+ * Lc = n and Lk = n - k, the digit-k split (ox_lo, ox_hi, Bk), the base-B
+ * digits of the block weights (blkw, for the start state), 1/Ptop and 1/g
+ * as floats, and the magic multiplier gm, shift gs for W div g.
+ */
 struct PairC {                        /* identical to the Metal layout */
     uint32_t B, k, N, g, Np, u, lim, R;
     uint32_t Wx, sh, nb, toff, boff, Lc, Lk, c;
@@ -43,6 +107,13 @@ struct PairC {                        /* identical to the Metal layout */
     float invPtop, invg;
     uint32_t gm, gs;
 };
+/* GItem -- one CUDA block's work: the pair index (B - Bbase), the linear
+   index j0 of its first block of the search, the number of blocks (<= 256),
+   and pad bit 0 = some block reaches outside [lo, hi] (range test on).
+   Surv -- a survivor: q1 and rem = r0..r2 (M = q1 P + rem), B, c, x and the
+   block index j.  Params -- [lo, hi] as 32-bit limbs, the survivor buffer
+   size and n.  PC -- the part of PairC that process_match() reads, copied to
+   shared memory once per CUDA block. */
 struct GItem { uint32_t pair, j0, count, pad; };
 struct Surv { uint32_t q, r0, r1, r2, B, c, x, j; };
 struct Params { uint32_t lo[4], hi[4]; uint32_t outcap, n, pad0, pad1; };
@@ -52,6 +123,13 @@ struct PC { uint32_t B, k, Lc, Lk, Bk, toff, c, pad; uint32_t P[4], Ptop[4], wy[
 /* device code                                                          */
 /* ------------------------------------------------------------------ */
 
+/* 96-bit arithmetic on three 32-bit limbs (a0 least significant), in 32-bit
+   operations only:
+     ge96(a, b)       a >= b
+     add96(a, b)      a += b      (no overflow check: callers stay below 2^96)
+     sub96(a, b)      a -= b      (a >= b)
+     mul96(a, m)      a *= m      (m < 2^21 here, product < 2^96 by construction)
+     div96(a, d)      a /= d, returns a mod d (d < 2^16), in 16-bit chunks */
 __device__ __forceinline__ bool ge96(unsigned a0, unsigned a1, unsigned a2, unsigned b0, unsigned b1, unsigned b2)
 {
     if (a2 != b2) return a2 > b2;
@@ -97,7 +175,21 @@ __device__ __forceinline__ unsigned div96(unsigned &a0, unsigned &a1, unsigned &
     return r;
 }
 
-/* check one match; the same steps as the match code of block_B() in a171775_2d.c */
+/*
+ * process_match -- (device) one lookup match (y, z) of the thread's current
+ * x: the hit code of block_B() in ../a171775_2d.c.
+ *
+ * In:     r0..r2 = rem (M1 mod P), q1, mklo/mk_hi (M1 mod B^(k+1)), reg (the
+ *         region the lookup was for: 0 = q1, 1 = q1+1), y, z, x, tid; K (the
+ *         pair, in shared memory); prm; the digit-k tables; the survivor
+ *         buffer and its counter; j0 (first block index of the item);
+ *         need_range (test [lo, hi]); the thread's hit and f1 counters.
+ * Out:    counts the hit if (y, z) lies in region reg, and f1 if it passes
+ *         the digit-pair filter; a full n-digit palindrome is appended to
+ *         outs[] (dropped past prm.outcap; the host then stops with
+ *         "survivor buffer overflow").
+ * Errors: none.
+ */
 __device__ __forceinline__ void process_match(unsigned r0, unsigned r1, unsigned r2, unsigned q1, unsigned mklo,
                                               unsigned mk_hi, unsigned reg, unsigned y, unsigned z, unsigned x,
                                               unsigned tid, const PC &K, const Params &prm, const uint32_t *say_lo,
@@ -140,6 +232,8 @@ __device__ __forceinline__ void process_match(unsigned r0, unsigned r1, unsigned
     /* digit Lc-1-k of M = top digit of r (r = rf, or rf - P in the q1+1 region) */
     unsigned a0 = s0, a1 = s1, a2 = s2;
     if (reg) sub96(a0, a1, a2, P0, P1, P2);
+    /* float32 quotient: relative error about 3e-7, so below 3.1e-4 for digits
+       < 1024 (c <= 1024), inside the 0.00049 margin; otherwise corrected exactly */
     float qf = ((float)a2 * 18446744073709551616.0f + (float)a1 * 4294967296.0f + (float)a0) * K.invPtop;
     int dh = (int)qf;
     float fr = qf - (float)dh;
@@ -173,6 +267,20 @@ __device__ __forceinline__ void process_match(unsigned r0, unsigned r1, unsigned
     }
 }
 
+/*
+ * scan2 -- (device) one CUDA block = one item: TG threads, thread tid works
+ * on block j0 + tid of the search (if tid < count) for the item's pair
+ * (c, B), i.e. one call of block_B() per thread.
+ *
+ * In:     items, pairs (the slot's PairC array), the slot's table arrays
+ *         (tvals/tys/tbst = the key table, tay_*, taz_* = digit-k tables, at
+ *         the pair's offsets toff and boff), prm; outs/nout for survivors;
+ *         tgstat for the per-item counts.
+ * Out:    survivors in outs[] (via process_match()); tgstat[3 item] =
+ *         lookups, hits, f1 of the item.
+ * Errors: none; a thread whose Mblock already has more than n base-B digits
+ *         stays idle.
+ */
 __global__ void __launch_bounds__(TG) scan2(const GItem *__restrict__ items, const PairC *__restrict__ pairs,
                                             const uint32_t *__restrict__ tvals, const uint16_t *__restrict__ tys,
                                             const uint16_t *__restrict__ tbst, const uint32_t *__restrict__ tay_lo,
@@ -192,6 +300,7 @@ __global__ void __launch_bounds__(TG) scan2(const GItem *__restrict__ items, con
     const GItem it = items[tg];
     const PairC &K = pairs[it.pair];
     const unsigned c = K.c, B = K.B;
+    /* stage the pair's tables in shared memory (all threads), then sync */
     if (tid == 0) {
         pc.B = B; pc.k = K.k; pc.Lc = K.Lc; pc.Lk = K.Lk; pc.Bk = K.Bk; pc.toff = K.toff; pc.c = c;
         for (int i = 0; i < 4; i++) { pc.P[i] = K.P[i]; pc.Ptop[i] = K.Ptop[i]; pc.wy[i] = K.wy[i]; pc.wz[i] = K.wz[i]; }
@@ -214,9 +323,12 @@ __global__ void __launch_bounds__(TG) scan2(const GItem *__restrict__ items, con
 
     unsigned long long nlook = 0, nhits = 0, nf1 = 0;
     bool active = tid < it.count;
+    /* block_B()'s state: digits E[] and value q1 of floor(M1 / P), W, rem =
+       (r0, r1, r2), mk = M1 mod B^(k+1), wnext and last */
     unsigned E[MAXK_G] = {0, 0, 0};
     unsigned q1 = 0, W = 0, r0 = 0, r1 = 0, r2 = 0, mk_lo = 0, mk_hi = 0, wnext = 0;
     bool last = false;
+    /* RECOMPUTE(): as in block_B(), wnext and last from the digits E[] */
 #define RECOMPUTE()                                                                          \
     {                                                                                        \
         int jj = (int)k - 1;                                                                 \
@@ -229,7 +341,9 @@ __global__ void __launch_bounds__(TG) scan2(const GItem *__restrict__ items, con
         } else wnext = 0;                                                                    \
     }
     if (active) {
-        /* block digits (e_0 >= 1) and base-B digits of Mblock */
+        /* block digits (e_0 >= 1) and base-B digits of Mblock: Mblock = sum
+           e_t w_t, digit by digit from the base-B digits of the weights
+           (blkw), with carries; then q1, T, M1 mod B^k, rem and W from D[] */
         unsigned j = it.j0 + tid, e[3] = {0, 0, 0};
         {
             unsigned t = j;
@@ -261,10 +375,12 @@ __global__ void __launch_bounds__(TG) scan2(const GItem *__restrict__ items, con
         } else active = false;
     }
 
+    /* MATCH(z): hand the match (y, z) of the current lookup to process_match() */
 #define MATCH(ZZ)                                                                            \
     process_match(r0, r1, r2, q1, mk_lo, mk_hi, (unsigned)reg, y, (ZZ), x, tid, pc, prm, say_lo, say_hi, \
                   saz_lo, saz_hi, outs, nout, it.j0, need_range, nhits, nf1)
 
+    /* the x loop of block_B(): lookup(s), then advance x */
     for (unsigned x = 0; x < c && active; x++) {
         for (int reg = 0; reg < 2; reg++) {
             unsigned Wt;
@@ -297,7 +413,7 @@ __global__ void __launch_bounds__(TG) scan2(const GItem *__restrict__ items, con
                     unsigned m = v - base;
                     unsigned y = sys[i];
                     unsigned z0 = mW >= m ? mW - m : mW + Np - m;
-                    if (Np >= c) {
+                    if (Np >= c) {           /* only z0 < c: process_match() tests the region */
                         MATCH(z0);
                     } else {                 /* several z: walk them here with the region test */
                         unsigned d0 = K.wy[0], d1 = K.wy[1], d2 = K.wy[2];
@@ -346,6 +462,8 @@ __global__ void __launch_bounds__(TG) scan2(const GItem *__restrict__ items, con
     }
 #undef RECOMPUTE
 #undef MATCH
+    /* per-item counts: sum within each warp by shuffles (every thread gets
+       here, active or not), then thread 0 adds up the warps */
     for (int off = 16; off > 0; off >>= 1) {
         nlook += __shfl_down_sync(0xffffffffu, nlook, off);
         nhits += __shfl_down_sync(0xffffffffu, nhits, off);
@@ -366,6 +484,8 @@ __global__ void __launch_bounds__(TG) scan2(const GItem *__restrict__ items, con
 /* host side                                                            */
 /* ------------------------------------------------------------------ */
 
+/* put96 -- store v as three 32-bit limbs in d[0..2] (d[3] = 0); exits with
+   status 1 ("<what> does not fit in 96 bits") if v >= 2^96. */
 static void put96(uint32_t *d, u128 v, const char *what)
 {
     if (v >> 96) { fprintf(stderr, "%s does not fit in 96 bits\n", what); exit(1); }
@@ -373,10 +493,14 @@ static void put96(uint32_t *d, u128 v, const char *what)
 }
 
 #define MAXPAIRS 1100                  /* check bases per c (B < c <= 1024) */
-#define MAXC 1024
-#define MAXITEMS (1 << 15)
-#define OUTCAP (1u << 20)
+#define MAXC 1024                      /* largest c (shared-memory tables) */
+#define MAXITEMS (1 << 15)             /* items (CUDA blocks) per launch */
+#define OUTCAP (1u << 20)              /* survivors per launch */
 
+/* Slot -- one of the two pipeline slots: a stream, timing events, device and
+   pinned host buffers sized for the largest c, the host tables (cctx_t) of
+   the slot's current base c, and the batch in flight: its items, units
+   [u_begin, u_end), steps and whether it is busy. */
 struct Slot {
     cudaStream_t stream;
     cudaEvent_t ev0, ev1;
@@ -393,6 +517,9 @@ struct Slot {
     int busy;
 };
 
+/* slot_alloc -- create the slot's stream and events and allocate all its
+   buffers for the largest sizes (MAXPAIRS pairs of c = MAXC); about 30 MB per
+   slot on each side.  CUDA errors exit (CK). */
 static void slot_alloc(Slot *s)
 {
     memset(s, 0, sizeof *s);
@@ -418,7 +545,16 @@ static void slot_alloc(Slot *s)
     CK(cudaMallocHost(&s->h_tgstat, 3 * MAXITEMS * sizeof(unsigned long long)));
 }
 
-/* host tables of base c for this slot, converted to the GPU layout and uploaded (slot idle) */
+/*
+ * slot_set_c -- make the slot ready for base c (nothing to do if it already
+ * is): cctx_set() builds the host tables, every pair is converted to PairC
+ * (96-bit limbs, the digits of the block weights, the magic division for g,
+ * spot-checked on 4096 values) and the tables are packed and uploaded on the
+ * slot's stream.  Call only when the slot is idle.
+ * Errors: exits with status 1 if n or c exceed the kernel's limits, a value
+ * does not fit in 96 bits, N > 2^31 with g > 1, or the magic division fails
+ * its check.
+ */
 static void slot_set_c(Slot *s, const prob_t *pr, u64 c)
 {
     if (s->c == c) return;
@@ -491,9 +627,20 @@ static void slot_set_c(Slot *s, const prob_t *pr, u64 c)
     CK(cudaMemcpyAsync(s->d_tbst, s->h_tbst, boff * 2, cudaMemcpyHostToDevice, s->stream));
 }
 
-/* blocks of units [u0, u1) (all of base c): per valid block its linear index and B range, as in do_block() */
+/* BlkR -- one block of the search: its linear index j among the blocks of
+   base c ((e_0 - 1) c^(bd-1) + e_1 c^(bd-2) + ...), its range [Blo, Bhi] of
+   check bases, and whether it lies wholly inside [lo, hi]. */
 struct BlkR { u64 j; u64 Blo, Bhi; int inside; };
 
+/*
+ * batch_blocks -- the blocks of the units [u0, u1) of base c that do_unit()
+ * and do_block() would process, with their B ranges.
+ * In:     pr; cc (the context of c); u0, u1; out (room for cap entries).
+ * Out:    the number of blocks written to out[]; *steps = their x-steps
+ *         (c per block and B, the CPU tool's "steps").
+ * Errors: exits with status 1 if more than cap blocks ("block buffer
+ *         overflow").
+ */
 static size_t batch_blocks(const prob_t *pr, const cctx_t *cc, u64 u0, u64 u1, BlkR *out, size_t cap, u64 *steps)
 {
     size_t nb_ = 0;
@@ -535,6 +682,14 @@ static size_t batch_blocks(const prob_t *pr, const cctx_t *cc, u64 u0, u64 u1, B
     return nb_;
 }
 
+/*
+ * make_items -- cut the batch's blocks into items: for each check base B,
+ * the runs of consecutive blocks (consecutive j) whose range contains B, in
+ * pieces of at most TG blocks.
+ * In:     cc; bl[0..nbl-1] (in order of j); it (room for cap items).
+ * Out:    the number of items, or (size_t)-1 if more than cap are needed
+ *         (the caller stops with "item buffer overflow").
+ */
 static size_t make_items(const cctx_t *cc, const BlkR *bl, size_t nbl, GItem *it, size_t cap)
 {
     size_t ni = 0;
@@ -567,9 +722,19 @@ static size_t make_items(const cctx_t *cc, const BlkR *bl, size_t nbl, GItem *it
 }
 
 static u64 g_target_steps = 1ull << 26;    /* thread-steps per launch, adapted to ~0.25 s */
-static double g_gpu_rate, g_gpu_time, g_max_kernel;
+static double g_gpu_rate, g_gpu_time, g_max_kernel;   /* smoothed steps/s; kernel seconds: total, max */
 static u64 g_nlaunch;
 
+/*
+ * slot_finish -- wait for the slot's batch and account for it: adapt
+ * g_target_steps to the measured kernel rate, copy the survivors back,
+ * rebuild each M = q1 P + rem, re-check both palindromes on the host and
+ * call survivor(), add the items' lookups, hits and f1 and the batch's
+ * steps, and move done_units to the end of the batch.
+ * In:     s (busy); st (statistics); done_units; n.
+ * Errors: exits with status 1 on CUDA errors, a survivor buffer overflow, or
+ *         a GPU survivor that fails the host check (a kernel bug).
+ */
 static void slot_finish(Slot *s, wstat_t *st, u64 *done_units, int n)
 {
     CK(cudaStreamSynchronize(s->stream));
@@ -615,6 +780,25 @@ static void slot_finish(Slot *s, wstat_t *st, u64 *done_units, int n)
     s->busy = 0;
 }
 
+/*
+ * gpu_search -- the "search" command (and the selftest's searches); the
+ * counterpart of run_search() in ../a171775_2d.c.
+ *
+ * In:     n (8..14); lo, hi; state (checkpoint file or NULL); interval
+ *         (seconds between progress lines); quiet; result (may be NULL).
+ * Out:    SOLUTION lines, progress, summary and checkpoints as run_search();
+ *         returns 0 when complete (also without units), 3 if interrupted,
+ *         1 if n is not supported.
+ * How:    loop: finish the slot's previous batch; build a new batch of whole
+ *         units of one base c (at most g_target_steps steps and TG
+ *         MAXITEMS/2 threads), upload its items, launch scan2, queue the
+ *         copies back; switch slots.  When nothing is left to issue (or on
+ *         g_stop), finish both slots, oldest first.  Checkpoints use the
+ *         first unit of the oldest batch in flight, so they are exact.
+ * Errors: exits with status 1 on CUDA errors and the limits of slot_set_c(),
+ *         batch_blocks() and make_items(); load_state() refuses a state file
+ *         with a frontier beyond -E.
+ */
 static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interval, int quiet, wstat_t *result)
 {
     char a[48], b[48];
@@ -641,10 +825,10 @@ static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interva
     prm.outcap = OUTCAP;
     prm.n = (uint32_t)n;
 
-    static Slot sl[2];
+    static Slot sl[2];                     /* allocated once, reused by the selftest's searches */
     static int allocated = 0;
     if (!allocated) { slot_alloc(&sl[0]); slot_alloc(&sl[1]); allocated = 1; }
-    for (int i = 0; i < 2; i++) { sl[i].c = 0; sl[i].busy = 0; }
+    for (int i = 0; i < 2; i++) { sl[i].c = 0; sl[i].busy = 0; }   /* c = 0: tables must be rebuilt */
     size_t blkcap = 1 << 22;
     BlkR *blk = (BlkR *)malloc(blkcap * sizeof(BlkR));
     signal(SIGINT, on_sig);
@@ -654,9 +838,10 @@ static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interva
     int cur = 0;
     for (;;) {
         Slot *s = &sl[cur];
-        if (s->busy) slot_finish(s, &st, &done_units, n);
+        if (s->busy) slot_finish(s, &st, &done_units, n);   /* the older batch in flight */
         int issued = 0;
         if (unext < pr.nunits && !g_stop) {
+            /* a batch: whole units of one base c, until the step or thread budget is used */
             u64 pref[MAXN];
             u64 c = unit_decode(&pr, unext, pref);
             slot_set_c(s, &pr, c);
@@ -679,6 +864,8 @@ static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interva
             s->u_begin = ub;
             s->u_end = ue;
             s->steps = steps;
+            /* on the slot's stream: reset the survivor count, upload, launch,
+               copy the counts back (the events time the kernel) */
             *s->h_nout = 0;
             CK(cudaMemcpyAsync(s->d_nout, s->h_nout, sizeof(unsigned), cudaMemcpyHostToDevice, s->stream));
             CK(cudaEventRecord(s->ev0, s->stream));
@@ -715,9 +902,9 @@ static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interva
             tlast = t;
         }
         if (state && (t - tsave >= 60 || drained)) {
-            wstat_t all = st;
+            wstat_t all = st;                  /* the finished batches: exactly the units below fr */
             add_stats(&all, &base);
-            u64 fr = done_units;
+            u64 fr = done_units;               /* = the first unit of the oldest batch in flight */
             for (int i = 0; i < 2; i++) if (sl[i].busy && sl[i].u_begin < fr) fr = sl[i].u_begin;
             save_state(state, &pr, fr, &all);
             tsave = t;
@@ -738,6 +925,13 @@ static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interva
     return complete ? 0 : 3;
 }
 
+/*
+ * cuda_selftest -- complete searches over [1, a(n)] for n = 8, 9, 10 (the
+ * last takes a few minutes on the GB10): each must find exactly one solution,
+ * a(n), with all seven statistics of the CPU tool.
+ * Out: one line per n; returns 0 if all agree, 1 otherwise.  Errors: as
+ * gpu_search(); tmpfile() is not checked; -E must not be given.
+ */
 static int cuda_selftest(void)
 {
     /* statistics of a171775_2d (CPU) for the same searches */
@@ -786,6 +980,9 @@ static int cuda_selftest(void)
     return bad ? 1 : 0;
 }
 
+/* main -- parse -S, -i, -E and the command (search needs n = 8..14); the
+   blocking-sync flag lets the host sleep while it waits for the GPU.
+   Unknown commands print the usage and return 1. */
 int main(int argc, char **argv)
 {
     sol_out = stdout;
@@ -796,7 +993,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-S") && i + 1 < argc) state = argv[++i];
         else if (!strcmp(argv[i], "-i") && i + 1 < argc) interval = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-E") && i + 1 < argc) g_end_unit = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "-E") && i + 1 < argc) g_end_unit = strtoull(argv[++i], NULL, 10);   /* see ../a171775_2d.c */
         else if (npos < 8) pos[npos++] = argv[i];
     }
     CK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));

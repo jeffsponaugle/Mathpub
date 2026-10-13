@@ -1,6 +1,10 @@
 /*
  * gpu_leaf.cu -- CUDA leaf for psph.c (exhaustive search for extremal postage stamp bases)
  *
+ * =====================================================================================================
+ *  THEORY OF OPERATIONS
+ * =====================================================================================================
+ *
  * The CPU program (psph.c) enumerates admissible prefixes A_{k-1} = {1 = a_1 < ... < a_{k-1}}; for every
  * surviving prefix the "leaf" tests all candidates a = a_k in [lo, hi].  This file is that leaf on the GPU.
  *
@@ -40,6 +44,37 @@
  *   PSPH_GPU_INT64=1       force the 64-bit arithmetic filter kernel (default: 32-bit when provably safe)
  *   PSPH_GPU_PARANOID=1    re-run every batch on the host with the same (shared) code and compare
  *   PSPH_GPU_VERBOSE=1     per-batch log lines
+ *
+ * Batch life cycle (one tbatch per psph worker thread, each with its own CUDA stream):
+ *   1. gpu_submit_prefix copies the prefix's table T[0..E] (zero-padded by TABPAD bytes and rounded up to a
+ *      16-byte multiple), its metadata (gpu_prefix), deep holes, reach sequence and a copy of the prefix into
+ *      pinned host buffers, and sets cst[p] = number of the prefix's first candidate in the batch-wide
+ *      candidate numbering (candidate t of the batch belongs to the prefix p with cst[p] <= t < cst[p+1]).
+ *   2. When a limit is reached (prefixes, table bytes, candidates) or at gpu_flush / gpu_finish, run_batch
+ *      uploads everything and launches k_filter with one GPU thread per candidate (each thread finds its prefix
+ *      by binary search in cst).  Survivors' candidate numbers are appended with atomicAdd; if the survivor
+ *      list overflows, the filter is re-run with a larger list, so no survivor is ever lost.
+ *   3. The survivors are downloaded, sorted, and fully checked by k_full in chunks whose scratch (one block of
+ *      a_k cells per survivor) fits the scratch buffer: one thread per survivor, or one warp per survivor when
+ *      there are few survivors or a_k is large.
+ *   4. Every survivor without a gap up to TGT goes to the report callback; failures go to the histogram.
+ *   A worker waits for its own batch, but the threads' streams run concurrently, so the GPU sees many batches.
+ *
+ * Arithmetic: the filter kernel is instantiated for int and for i64.  32-bit arithmetic is used only when every
+ * intermediate value provably fits (TGT + max a_k and H * max a_{k-1} + TGT below 2^31 - 16); otherwise, or with
+ * PSPH_GPU_INT64=1, the 64-bit kernel runs.  TGT itself must be below 2^31 - 16 in GPU mode, because candidate
+ * numbers inside a batch are 32-bit (gpu_init refuses larger targets).
+ *
+ * Cell packing: the full-check kernel works on 32-bit words holding 4 cells (2 with -DWIDE) using the CUDA
+ * SIMD-in-a-word intrinsics; the host versions of the same helpers emulate them cell by cell, so host and device
+ * run literally the same core code (this is what PARANOID mode compares).  Little-endian layout is assumed:
+ * cell i of a word occupies bits 8*CS*i .. 8*CS*(i+1)-1 (true for NVIDIA GPUs and for x86 / ARM hosts).
+ *
+ * Errors: every CUDA call is checked; a failure prints "[gpu] FATAL ..." and exits with status 7.  A PARANOID
+ * mismatch exits with status 8.  gpu_init returns 1 (psph then exits 7) if TGT is too large.
+ *
+ * Build: nvcc -arch=sm_87 (Jetson Orin) or -arch=sm_121 (DGX Spark); see the Makefile.  The file is compiled
+ * twice, with and without -DWIDE, to match psph_gpu16 and psph_gpu.
  */
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -66,16 +101,24 @@ typedef unsigned long long u64;
 #define CMASK 0xFFu
 #define REPL(x) ((unsigned)(x) * 0x01010101u)
 #endif
-#define MAXA 32                           /* >= MAXK+1 of psph.c */
+#define MAXA 32                           /* >= MAXK+1 of psph.c: slots per prefix copy kept for reporting */
 #define TABPAD 32                         /* bytes of zero padding after every table (straddling word loads) */
 
+/* CUDA_CHECK(x): run a CUDA runtime call; on failure print file, line, call and error string, then exit(7). */
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "[gpu] FATAL %s:%d: %s -> %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(7); } } while (0)
 
+/* wall_s -- wall-clock seconds (gettimeofday), for the host-side pipeline timing.  Inputs: none.  Errors: none. */
 static double wall_s(void) { struct timeval tv; gettimeofday(&tv, NULL); return (double)tv.tv_sec + 1e-6 * (double)tv.tv_usec; }
 
 /* ===================================================================================== */
 /*  SIMD-in-a-word helpers, identical semantics on host and device                           */
+/*  A 32-bit word holds CPW cells of CS bytes.  On the device each helper is one CUDA intrinsic;  */
+/*  on the host it is a per-cell loop with the same result (used by PARANOID mode).              */
 /* ===================================================================================== */
+/*
+ * v_addus -- per-cell unsigned SATURATING add of two packed words (cells never wrap past CMASK).
+ * Inputs: a, b packed words.  Outputs: packed sums, each min(a_i + b_i, CMASK).  Errors: none.
+ */
 __host__ __device__ __forceinline__ unsigned v_addus(unsigned a, unsigned b)
 {
 #ifdef __CUDA_ARCH__
@@ -90,6 +133,10 @@ __host__ __device__ __forceinline__ unsigned v_addus(unsigned a, unsigned b)
     return r;
 #endif
 }
+/*
+ * v_minu -- per-cell unsigned minimum of two packed words.
+ * Inputs: a, b.  Outputs: packed min(a_i, b_i).  Errors: none.
+ */
 __host__ __device__ __forceinline__ unsigned v_minu(unsigned a, unsigned b)
 {
 #ifdef __CUDA_ARCH__
@@ -104,7 +151,10 @@ __host__ __device__ __forceinline__ unsigned v_minu(unsigned a, unsigned b)
     return r;
 #endif
 }
-/* per cell: CMASK where a > b, else 0 */
+/*
+ * v_cmpgtu -- per-cell unsigned comparison: each cell of the result is CMASK where a > b, else 0.
+ * Inputs: a, b.  Outputs: packed mask.  Errors: none.
+ */
 __host__ __device__ __forceinline__ unsigned v_cmpgtu(unsigned a, unsigned b)
 {
 #ifdef __CUDA_ARCH__
@@ -119,6 +169,11 @@ __host__ __device__ __forceinline__ unsigned v_cmpgtu(unsigned a, unsigned b)
     return r;
 #endif
 }
+/*
+ * fshift_r -- funnel shift: the 32 bits starting sh bits into the 64-bit value hi:lo.  Used to read a word of
+ *             table cells that starts at an unaligned byte offset (block starts are not word aligned).
+ * Inputs: lo, hi consecutive words; sh bit offset 0..31.  Outputs: the extracted word.  Errors: none.
+ */
 __host__ __device__ __forceinline__ unsigned fshift_r(unsigned lo, unsigned hi, unsigned sh)
 {   /* low 32 bits of ((hi:lo) >> sh), 0 <= sh < 32 */
 #ifdef __CUDA_ARCH__
@@ -127,6 +182,9 @@ __host__ __device__ __forceinline__ unsigned fshift_r(unsigned lo, unsigned hi, 
     return (unsigned)(((((u64)hi) << 32) | lo) >> (sh & 31));
 #endif
 }
+/*
+ * ffs_u -- 1-based index of the least significant set bit of x (0 if x == 0); finds the first gap cell in a mask.
+ */
 __host__ __device__ __forceinline__ int ffs_u(unsigned x)
 {
 #ifdef __CUDA_ARCH__
@@ -135,6 +193,10 @@ __host__ __device__ __forceinline__ int ffs_u(unsigned x)
     return __builtin_ffs((int)x);
 #endif
 }
+/*
+ * ld_ro -- read-only load of one element, widened to unsigned; on the device it goes through the read-only data
+ *          cache (__ldg), which suits the tables that every thread of a prefix reads but nobody writes.
+ */
 template<typename P> __host__ __device__ __forceinline__ unsigned ld_ro(const P *p)
 {
 #ifdef __CUDA_ARCH__
@@ -147,12 +209,15 @@ __host__ __device__ __forceinline__ unsigned lowmask(unsigned ncells)   /* mask 
 {
     return ncells >= CPW ? 0xFFFFFFFFu : ((1u << (ncells * CS * 8)) - 1u);
 }
+/* imin64, imax64 -- 64-bit minimum / maximum (host and device).  Errors: none. */
 __host__ __device__ __forceinline__ i64 imin64(i64 a, i64 b) { return a < b ? a : b; }
 __host__ __device__ __forceinline__ i64 imax64(i64 a, i64 b) { return a > b ? a : b; }
 
 /* ===================================================================================== */
 /*  Batch data layout (shared by host and device)                                           */
 /* ===================================================================================== */
+/* One submitted prefix inside a batch.  Its candidates are a_k = lo .. hi; they are numbered batch-wide from
+   cst[p] (separate array) so that one GPU thread can be assigned per candidate. */
 struct gpu_prefix {                       /* 64 bytes */
     u64 tab_off;                          /* offset (cells) of T[0] in the batch table buffer; 16-byte aligned */
     i64 E, lo, hi, ak1, Z;
@@ -160,12 +225,24 @@ struct gpu_prefix {                       /* 64 bytes */
     unsigned reach_off, pad0;             /* reach[reach_off .. +h+1) */
 };
 
+/* Device-side counters of one filter launch or one full-check chunk (zeroed before, summed on the host after). */
 struct gpu_dev_stats { u64 xpass, rpass, s2pass, direct, probes, fc_cells; };
 
 /* ===================================================================================== */
 /*  Filter (kernel 1) core: exact port of the candidate loop of leaf() / leaf_rep() in psph.c  */
 /*  Returns 0 = X fail, 1 = deep-hole (2a) fail, 2 = reach fail, 3 = top-block/TGT fail, 4 = survivor */
+/*  (so "res >= s" counts the candidates that passed stage s; the counters below rely on this order)       */
 /* ===================================================================================== */
+/*
+ * rep_probe -- is x a sum of at most H elements of the prefix plus copies of a?  (port of leaf_rep in psph.c)
+ *
+ * Purpose: tries c = min(m, H) down to cmin copies of a and checks T[x - c a] + c <= H.  Indices above E are
+ *          treated as unrepresentable, which is exact because T[y] >= y / a_{k-1} > H there.
+ * Inputs:  T  prefix table valid on 0..E;  E;  x  the number (<= TGT);  m  = x / a (max copies);  a  candidate a_k;
+ *          ak1  a_{k-1};  H;  probes  counter incremented per lookup.  I = int or i64 (see run_batch).
+ * Outputs: 1 if representable, else 0.
+ * Errors:  none.
+ */
 template<typename I>
 __host__ __device__ __forceinline__ int rep_probe(const cell_t *__restrict__ T, I E, I x, I m /* = x / a */, I a, I ak1, int H, unsigned &probes)
 {
@@ -180,6 +257,18 @@ __host__ __device__ __forceinline__ int rep_probe(const cell_t *__restrict__ T, 
     return 0;
 }
 
+/*
+ * filter_one -- run stages 1, 2a, 2b and 2c of psph.c's leaf for one candidate a = a_k.
+ *
+ * Purpose: the same exact rejection tests as the CPU leaf: Challis target X, deep holes y < a in blocks Ck-1 and
+ *          Ck-2, the reach point xs, deep holes in the top block (x <= TGT), and TGT itself.  Differences from the
+ *          CPU, none affecting exactness: the hole list is fixed per prefix (ascending; entries y >= a are
+ *          skipped), ma is recomputed per candidate, and table indices are bounds-checked against E.
+ * Inputs:  pm  prefix metadata;  T, dy, r  its table, deep holes and reach sequence;  a  candidate;  H, TGT;
+ *          probes, direct  counters (direct = 1 when the reach test proves coverage without a probe).
+ * Outputs: 0..4 as listed above.
+ * Errors:  none.
+ */
 template<typename I>
 __host__ __device__ __forceinline__ int filter_one(const gpu_prefix &pm, const cell_t *__restrict__ T, const unsigned *__restrict__ dy, const i64 *__restrict__ r,
                                                    I a, int H, I TGT, unsigned &probes, int &direct)
@@ -222,6 +311,17 @@ __host__ __device__ __forceinline__ int filter_one(const gpu_prefix &pm, const c
     return 4;
 }
 
+/*
+ * k_filter -- kernel 1: one thread per candidate of the batch; filter_one decides, survivors are collected.
+ *
+ * Inputs:  P, np  prefix metadata;  cst, total  candidate numbering (cst[np] = total);  tab, deep, reach  batch
+ *          buffers;  H, TGT;  surv, surv_cap  survivor list and its capacity;  nsurv  survivor counter (zeroed by
+ *          the host);  st  counters (zeroed by the host).
+ * Outputs: surv[0..min(*nsurv, surv_cap)) = candidate numbers of the survivors (unordered); *nsurv = the true
+ *          count, which may exceed surv_cap (the host then re-runs the filter with a larger list); st counters.
+ * Errors:  none in the kernel; launch errors are caught by the host.  Counters are warp-reduced with shuffles
+ *          (every lane reaches the reduction because blockDim is a multiple of 32 and nothing returns early).
+ */
 template<typename I>
 __global__ void __launch_bounds__(256) k_filter(const gpu_prefix *__restrict__ P, int np, const u64 *__restrict__ cst, u64 total,
                                                 const cell_t *__restrict__ tab, const unsigned *__restrict__ deep, const i64 *__restrict__ reach,
@@ -260,8 +360,21 @@ __global__ void __launch_bounds__(256) k_filter(const gpu_prefix *__restrict__ P
 /*  Full check (kernel 2) core: exact port of full_check() in psph.c                           */
 /*  NL = 1: one thread per survivor;  NL = 32: one warp per survivor (lanes stride over the words of a block).  */
 /*  u: word buffer of >= roundup(a*CS, 4) + 16 bytes (16-byte aligned) for this survivor.                 */
+/*  Unlike the CPU version this keeps ONE block buffer and updates it in place: the value at block offset i     */
+/*  depends only on offset i of the previous block (x - a), so each word can be overwritten in turn.  A final    */
+/*  partial block leaves the previous block's values above len in place, which is exactly what the closing   */
+/*  window (E-a, E] needs.                                                                                     */
 /*  Returns the first gap in [1, TGT], or 0 if there is none.                                            */
 /* ===================================================================================== */
+/*
+ * fullcheck_core -- exact first gap of prefix + a in [1, TGT] (0 if none); NL lanes cooperate on one survivor.
+ *
+ * Inputs:  Tc  prefix table (valid on 0..E, followed by TABPAD zero bytes);  a  candidate a_k;  E;  H;  TGT;
+ *          u  scratch for one block;  lane  0..NL-1;  cells  counter (lane 0 adds the cells processed).
+ * Outputs: the first gap, or 0.  In warp mode every lane returns the same value (shuffle reductions).
+ * Errors:  none.  Reads a table word that may straddle the end of the valid cells; the padding keeps it in bounds
+ *          and the last word's invalid cells are masked off with lowmask.
+ */
 template<int NL>
 __host__ __device__ i64 fullcheck_core(const cell_t *__restrict__ Tc, i64 a, i64 E, int H, i64 TGT, unsigned *__restrict__ u, int lane, u64 *cells)
 {
@@ -328,6 +441,14 @@ __host__ __device__ i64 fullcheck_core(const cell_t *__restrict__ Tc, i64 a, i64
     return best <= TGT ? best : 0;
 }
 
+/*
+ * k_full -- kernel 2: exact full check of a chunk of survivors (NL = 1: one thread each; NL = 32: one warp each).
+ *
+ * Inputs:  P, tab  batch metadata and tables;  sp[i], sj[i]  prefix index and candidate offset of survivor i;
+ *          off[i]  its scratch offset;  n  survivors in the chunk;  scratch;  H, TGT;  st  counters.
+ * Outputs: res[i] = first gap of survivor i in [1, TGT], or 0 if it covers 1..TGT; st->fc_cells.
+ * Errors:  none in the kernel.
+ */
 template<int NL>
 __global__ void __launch_bounds__(128) k_full(const gpu_prefix *__restrict__ P, const cell_t *__restrict__ tab,
                                               const unsigned *__restrict__ sp, const unsigned *__restrict__ sj, const u64 *__restrict__ off, int n,
@@ -348,6 +469,10 @@ __global__ void __launch_bounds__(128) k_full(const gpu_prefix *__restrict__ P, 
 /* ===================================================================================== */
 /*  Host side                                                                               */
 /* ===================================================================================== */
+/* Per-worker batch state: a CUDA stream and events, pinned host buffers (h_*) mirrored by device buffers (d_*)
+   for the tables, prefix metadata, candidate numbering (cst), deep holes and reach sequences, the prefix copies
+   for reporting (h_a, MAXA slots per prefix), the survivor list, the per-chunk full-check arrays (sp, sj, off,
+   res), the full-check scratch, device counters, and the accumulated statistics st.  Capacities grow on demand. */
 struct tbatch {
     int tid, inited;
     cudaStream_t stream; cudaEvent_t ev[4];
@@ -366,6 +491,8 @@ struct tbatch {
     gpu_stats_t st;
 };
 
+/* Search parameters of the current gpu_init (G_*), configuration from the environment (CFG_*, read once), and the
+   array of per-thread batches TB[0..NTB) (kept across searches, grown when more threads appear). */
 static int G_H, G_K, G_NDEEP_CAP, G_INITED = 0;
 static i64 G_TGT;
 static gpu_report_fn G_REPORT; static void *G_USER;
@@ -374,13 +501,24 @@ static int CFG_BATCH_PREFIXES = 8192; static u64 CFG_MAX_CAND = (u64)1 << 26;
 static int CFG_FULL = 0 /* 0 auto, 1 thread, 2 warp */, CFG_INT64 = 0, CFG_PARANOID = 0, CFG_VERBOSE = 0;
 static tbatch *TB = NULL; static int NTB = 0;
 
+/* env_size -- numeric environment knob: the value of variable name, or def if it is unset, empty or not positive. */
 static size_t env_size(const char *name, size_t def) { const char *s = getenv(name); if (!s || !*s) return def; double v = atof(s); return v <= 0 ? def : (size_t)v; }
 
+/* host_alloc / dev_alloc -- pinned host / device allocation of n elements (+64 bytes slack); exit(7) on failure.
+   host_free / dev_free -- release them (NULL is ignored); exit(7) if CUDA reports an error. */
 template<typename T> static void host_alloc(T **p, size_t n) { void *v = NULL; CUDA_CHECK(cudaMallocHost(&v, n * sizeof(T) + 64)); *p = (T *)v; }
 template<typename T> static void dev_alloc(T **p, size_t n) { void *v = NULL; CUDA_CHECK(cudaMalloc(&v, n * sizeof(T) + 64)); *p = (T *)v; }
 template<typename T> static void host_free(T *p) { if (p) CUDA_CHECK(cudaFreeHost(p)); }
 template<typename T> static void dev_free(T *p) { if (p) CUDA_CHECK(cudaFree(p)); }
 
+/*
+ * tb_init -- create the stream, events and initial buffers of one worker's batch.
+ *
+ * Inputs:  b  batch to initialise;  tid  worker index.
+ * Outputs: buffers sized from the CFG_* knobs: table bytes, prefixes, 16 deep holes and 16 reach entries per
+ *          prefix on average, 65536 survivors, 16384 full-check slots, the scratch.
+ * Errors:  exit(7) on any allocation or CUDA failure.
+ */
 static void tb_init(tbatch *b, int tid)
 {
     memset(b, 0, sizeof(*b));
@@ -407,6 +545,10 @@ static void tb_init(tbatch *b, int tid)
     if (!b->h_a) { fprintf(stderr, "[gpu] out of host memory\n"); exit(7); }
 }
 
+/*
+ * tb_free -- release one batch.  If the stream can no longer be synchronized (CUDA runtime already shut down at
+ *            process exit) the buffers are abandoned instead of freed.  Errors: exit(7) from the frees.
+ */
 static void tb_free(tbatch *b)
 {
     if (!b->inited) return;
@@ -421,6 +563,10 @@ static void tb_free(tbatch *b)
     b->inited = 0;
 }
 
+/*
+ * tb_grow_chunk -- make the per-chunk full-check arrays (sp, sj, off, res) hold at least need entries (+25 %).
+ *                  Waits for the stream first, because the old buffers may still be in use.  Errors: exit(7).
+ */
 static void tb_grow_chunk(tbatch *b, size_t need)
 {
     if (need <= b->chunk_cap) return;
@@ -433,9 +579,19 @@ static void tb_grow_chunk(tbatch *b, size_t need)
     host_alloc(&b->h_res, b->chunk_cap); dev_alloc(&b->d_res, b->chunk_cap);
 }
 
+/* scratch_need -- bytes of full-check scratch one survivor with a_k = a needs (see the comment on the line). */
 static inline size_t scratch_need(i64 a) { size_t r4 = ((size_t)a * CS + 3) & ~(size_t)3; return (r4 + 16 + 15) & ~(size_t)15; }   /* a cells rounded to a word, + straddle word + slack, 16-byte multiple */
 
 /* ---- host reference (paranoid mode): same code as the kernels, run sequentially on the CPU ---- */
+/*
+ * paranoid_check -- recompute a whole batch on the host and compare with the device (PSPH_GPU_PARANOID=1).
+ *
+ * Inputs:  b  the batch (host copies of all inputs);  use64  which filter instantiation the device used;
+ *          gsurv  device survivors (sorted);  gres  device full-check results;  dst  device filter counters.
+ * Outputs: nothing if host and device agree on every counter, the survivor list and every full-check result.
+ * Errors:  any mismatch prints "[gpu] PARANOID: ..." lines and exits with status 8; host allocation failure
+ *          exits 7.
+ */
 static void paranoid_check(tbatch *b, int use64, const std::vector<unsigned> &gsurv, const std::vector<i64> &gres, const gpu_dev_stats &dst)
 {
     gpu_dev_stats hs; memset(&hs, 0, sizeof hs);
@@ -473,6 +629,17 @@ static void paranoid_check(tbatch *b, int use64, const std::vector<unsigned> &gs
 }
 
 /* ---- the pipeline for one batch ---- */
+/*
+ * run_batch -- process every prefix collected in batch b: upload, filter, full checks, report, statistics.
+ *
+ * Purpose: steps 2-4 of the batch life cycle in the file header.  The int / i64 filter choice is made here; the
+ *          filter is re-run (up to 5 times) with a larger survivor list if it overflowed; full checks run in
+ *          scratch-sized chunks, growing the scratch if a single survivor needs more than it holds.
+ * Inputs:  b  a batch with np >= 0 prefixes (np == 0 returns at once).
+ * Outputs: callback calls for accepted bases; counters and timings in b->st; the batch is emptied.
+ * Errors:  exit(7) on CUDA errors, on a survivor list that keeps overflowing, or on a missing full-check result;
+ *          exit(8) from paranoid_check.
+ */
 static void run_batch(tbatch *b)
 {
     if (b->np == 0) return;
@@ -587,6 +754,7 @@ static void run_batch(tbatch *b)
 /* ===================================================================================== */
 /*  API                                                                                     */
 /* ===================================================================================== */
+/* gpu_init -- see gpu_leaf.h.  The first call reads the PSPH_GPU_* knobs, sets blocking sync and prints the device. */
 extern "C" int gpu_init(int h, int k, int64_t tgt, int nthreads, int ndeep_cap, gpu_report_fn report, void *user)
 {
     if (!G_INITED) {
@@ -619,6 +787,11 @@ extern "C" int gpu_init(int h, int k, int64_t tgt, int nthreads, int ndeep_cap, 
     return 0;
 }
 
+/*
+ * gpu_submit_prefix -- see gpu_leaf.h.  Order of operations: run the batch first if this prefix would overflow it;
+ * grow the table buffer if one table alone is larger than the buffer; split a candidate range above
+ * CFG_MAX_CAND into two recursive submissions; grow the deep-hole and reach arrays if needed; then append.
+ */
 extern "C" void gpu_submit_prefix(int tid, const gpu_cell_t *T, int64_t E, int64_t lo, int64_t hi, const int64_t *a, int64_t Z,
                                   const int64_t *reach, const int64_t *deep_y, int ndeep)
 {
@@ -672,6 +845,7 @@ extern "C" void gpu_submit_prefix(int tid, const gpu_cell_t *T, int64_t E, int64
     b->np++;
 }
 
+/* gpu_flush, gpu_thread_stats, gpu_finish, gpu_print_stats, gpu_shutdown -- see gpu_leaf.h. */
 extern "C" void gpu_flush(int tid) { if (tid >= 0 && tid < NTB && TB[tid].inited) run_batch(&TB[tid]); }
 
 extern "C" void gpu_thread_stats(int tid, gpu_stats_t *out)

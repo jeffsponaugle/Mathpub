@@ -18,6 +18,18 @@
 #
 # Output: logs/TAG/progress.log, logs/TAG/solutions.log (SOLUTION lines), per-chunk .out/.err/.done.
 # Result of the whole search = max n_h over ALL machines' solutions.log once every chunk everywhere is done.
+#
+# How it works: chunk i covers items [LO + i*CHUNK, min(LO + (i+1)*CHUNK, HI)).  Chunks that have a .done marker
+# are skipped, so the driver can be stopped (kill it BEFORE its psph process) and simply re-run; an interrupted chunk
+# is run again from its start (its partial .out/.err are overwritten).  A chunk is marked done only when psph printed
+# its final statistics line ("worker CPU split"), i.e. it ran to the end; psph's exit code is only logged.  A .done
+# marker can also be touched by hand to SKIP a chunk (used when a chunk was moved to another machine), which is why
+# the audit scripts (tools/collect_*.py) also require the statistics line.
+# Run it from the psph directory: the logs go to ./logs/TAG and BINARY is resolved relative to it.
+# progress.log lines: "=== chunk i items [lo,hi) h=H k=K TGT=T start DATE", "=== chunk i done rc=RC DATE: N solutions;
+# <leaf statistics>", and at the end "=== RANGE [LO,HI) COMPLETE DATE".  Standard output at the end: the sorted,
+# de-duplicated SOLUTION lines of this TAG.
+# Exit status: 1 for a usage error (fewer than 9 arguments), otherwise 0; failed chunks show up as chunks without .done.
 TAG=$1; H=$2; K=$3; TGT=$4; D=$5; LO=$6; HI=$7; C=$8; J=$9; P=${10:-./psph}
 [ -z "$J" ] && { echo "usage: run_range.sh TAG H K TGT D LO HI CHUNK THREADS [BINARY]"; exit 1; }
 L=logs/$TAG; mkdir -p $L

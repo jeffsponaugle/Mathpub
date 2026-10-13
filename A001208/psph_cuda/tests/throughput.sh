@@ -2,12 +2,18 @@
 # Throughput + full-check-flavour cross-checks for the GPU leaf (run on orin1 from ~/A001208/psph_cuda after validate.sh).
 # Logs in logs/throughput.log.  The CPU on orin1 is shared with the production run, so CPU-side numbers are pessimistic;
 # the "[gpu] GPU time" lines (CUDA events) are not affected by CPU contention.
+#
+# Usage (on orin1): sh tests/throughput.sh   (J = worker threads, default 6; uses GNU timeout, 900 s per run).
+# Measures CPU vs GPU leaf throughput on (9,8) and (27,6) item ranges, and cross-checks the two full-check kernel
+# flavours (PSPH_GPU_FULL=thread / warp, plus warp with PARANOID) against the CPU on k=4 h=60 and k=5 h=25, where
+# a_k is large and full checks are frequent: the sorted solution lists must be identical.
 cd ~/A001208/psph_cuda || exit 1
 mkdir -p logs
 N="nice -n 10"
 J=${J:-6}
 L=logs/throughput.log
 echo "=== throughput.sh start $(date) J=$J; load: $(cat /proc/loadavg)" > $L
+# run TAG BINARY ARGS...: one timed run (nice 10, at most 900 s) with its key statistics appended to $L.
 run() {  # tag binary args...   (env may be set by the caller)
   tag=$1; bin=$2; shift 2
   echo "--- $tag: $bin $*   start $(date)" >> $L

@@ -1,33 +1,71 @@
 /*
- * a171775_cuda.cu -- GPU version of the A171775 search (OEIS A171775:
- * smallest M that is a k-digit palindrome in some base for every k = 2..n).
+ * a171775_cuda.cu -- CUDA (NVIDIA GPU) version of the 1D A171775 search
+ * (OEIS A171775: smallest M that is a k-digit palindrome in some base for
+ * every k = 2..n).  Written for the DGX Spark (GB10, sm_121); see Makefile.
  *
- * Same method as ../a171775.c (read its header first): enumerate the n-digit
- * palindromes M = Mblock + x w_x + y w_y + z s in base B and, for every base c
- * that can give M exactly n-1 digits, impose "the k lowest base-c digits of M
- * mirror the k highest" by solving z s = T - M0 (mod c^k) for the innermost
- * digit z.  One GPU thread owns one (block, c) pair and walks its B^2 values
- * of (x, y) with additions only:
+ * Same method, work units, statistics and state files as ../a171775.c:
+ * read its theory of operations first.  This file keeps its own copies of
+ * the host helpers (it does not include a171775.c), so the two must be kept
+ * in step: the unit numbering, the per-(B, c) constants, the canonical-base
+ * rule, surv_hash() and the state-file format are what make the results
+ * comparable (the selftest checks it) and the checkpoints interchangeable.
  *
- *   rem  = M0 mod c^(h+1)            (u64)
- *   w    = (T - M0) u mod c^k         (u32 when c^k < 2^31, else u64)
- *   q    = floor(M0 / c^(h+1)), kept as k base-c digits (it grows by <= 1)
+ * ========================================================================
+ * THEORY OF OPERATIONS (the GPU part)
+ * ========================================================================
  *
- * Per step the coarse test is  w < g B  or  w - (c^k - wnext) < g B  (mod 2^32 or
- * 2^64), where wnext is the change of w when q grows; the update is
- * rem += w_y (-P on overflow) and w += D0 or D1 (mod c^k).  A hit is re-checked
- * exactly, the full (n-1)-digit palindrome test runs on the GPU, and the few
- * survivors go back to the host, which applies the canonical-base rule and
- * tests the lengths n-2 .. 3 with the same code as the CPU tool.
+ * 1. Work.  Units (B, d_0[, d_1]) are numbered base by base as in the CPU
+ *    tool.  The host turns a batch of consecutive units into an item list,
+ *    one item per (block, c) -- one call of block_c() in the CPU tool
+ *    (gen_unit()) -- and one GPU thread processes one item.  The constants
+ *    of every (B, c) of the whole search are built once (build_tables()) and
+ *    live in device memory; an item holds Mblock and the index of its (B, c).
  *
- * Work = units (B, d_0[, d_1]) in the same order as the CPU tool; a batch of
- * units becomes an item list (Mblock, c); two CUDA streams overlap item
- * generation, the kernel and host post-processing.  The checkpoint (-S) is
- * the first unit of the oldest unfinished batch.
+ * 2. The thread's state, all in registers (scan_kernel()):
+ *      rem  = M0 mod P   (u64)                 P = c^(h+1)
+ *      w    = (T(q) - M0) u mod N              N = c^k; type WT = u32 if every
+ *                                              N of the search is < 2^31, else u64
+ *      E[]  = the k base-c digits of q = floor(M0 / P)
+ *    The kernel is a template over K = k (2..5) and WT, so the digit loops
+ *    unroll and E[] stays in registers.
+ *
+ * 3. The step.  (x, y) runs over [0, B)^2 as in block_c().  The coarse test
+ *    is  w < gB  or  (w - a) mod 2^bits < gB,  with a = N - wnext: the
+ *    second term is w1 = w + wnext - N, the w of region 1, when w >= a; when
+ *    w < a, w1 = w + wnext >= w, so w1 < gB implies the first term.  So no
+ *    hit is missed, and rare_path() redoes both regions exactly in 64 bits
+ *    (divisibility by g, the region bounds) as block_c() does.  The update
+ *    is rem += w_y (dx at a y wrap) with a carry into q when rem >= P - w_y
+ *    (precomputed), and w += D0 or D1 (mod N): D0 = -w_y u, D1 = wnext - w_y u
+ *    (a step that also carries q).  cnt counts the increments of q left
+ *    until E[k-1] reaches c-1 (phase 0) or until the carry (phase 1), the
+ *    elast/trig logic of block_c(); RECOMPUTE() then refreshes wnext.
+ *
+ * 4. Survivors.  rare_path() counts every z (the "hits") and emit() checks
+ *    the range and the full (n-1)-digit palindrome in base c on the GPU; the
+ *    few that pass (st2) are written to an output buffer and go back to the
+ *    host, which applies the canonical-base rule and tests the lengths
+ *    n-2..3 with the CPU tool's code (post_process(), over host threads).
+ *
+ * 5. Pipeline and checkpoints.  Two slots (CUDA streams) alternate: the host
+ *    builds the next batch while the GPU runs the other one, and batches are
+ *    finished in the order they were issued.  So the statistics always cover
+ *    exactly the units below the oldest unfinished batch -- the frontier
+ *    saved with -S -- and every checkpoint is exact, whenever the run ends.
+ *
+ * 6. Limits.  n = 7..14 (k = n-2-h must be 2..5); c^(h+1) < 2^62 and
+ *    c^k < 2^42 as in the CPU tool; at most 2^20 survivors per batch (lower
+ *    -b if a batch overflows); the items of one unit must fit in a batch
+ *    (raise -b).  A range without n-digit numbers gives a note and an empty
+ *    summary.
  *
  * Usage
  *   a171775_cuda selftest            a(7), a(8), a(9) + CPU-tool statistics
  *   a171775_cuda search n LO HI [-S state] [-i sec] [-b items] [-t host threads]
+ * -b items per batch (default 2^20), -t host threads for post_process()
+ * (default: all cores).  Output and exit status as in a171775.c, except that
+ * an interrupted search exits with status 3; CUDA errors exit with status 1
+ * and name the failing call (CK()).
  */
 #include <algorithm>
 #include <atomic>
@@ -48,10 +86,12 @@ typedef unsigned __int128 u128;
 typedef uint64_t u64;
 typedef uint32_t u32;
 
-#define MAXN 24
-#define MAXK 6
-#define U128_MAX (~(u128)0)
+#define MAXN 24                     /* largest length n the arrays allow */
+#define MAXK 6                      /* size of CConst.Wc[]; the kernels handle k <= 5 */
+#define U128_MAX (~(u128)0)         /* also the saturation value of pow_sat() */
 
+/* CK(call) -- run a CUDA runtime call; on failure print the error with the
+   source line and exit with status 1. */
 #define CK(x)                                                                                    \
     do {                                                                                         \
         cudaError_t e_ = (x);                                                                    \
@@ -64,6 +104,18 @@ typedef uint32_t u32;
 /* ------------------------------------------------------------------ */
 /* host integer helpers (same as the CPU tool)                          */
 /* ------------------------------------------------------------------ */
+/* These are copies of the functions in ../a171775.c; see the comments there
+   for inputs, outputs and limits.  Briefly:
+     pow_sat(b, e)        b^e, saturating at U128_MAX
+     iroot(x, k)          floor(x^(1/k)), exact
+     u128s(x, buf)        decimal string (buf >= 40 bytes)
+     parse_term/_or_die   number expressions like 2^72-1 (exit 1 on bad input)
+     gcd64, modinv64      gcd; inverse mod m (0 if none)
+     mulmod64, mod128_64  a b mod m; 128-bit M mod 64-bit b
+     is_pal_base(M, b, L) M is an L-digit palindrome in base b
+     find_pal_base(M, L)  smallest such base (M-1 for L = 2), 0 if none
+     surv_hash(M)         survivor hash; the checksum is its sum mod 2^64
+     now_sec()            monotonic seconds */
 
 static u128 pow_sat(u64 b, int e)
 {
@@ -226,6 +278,9 @@ static double now_sec()
 /* problem, per-B and per-(B,c) constants                              */
 /* ------------------------------------------------------------------ */
 
+/* Prob -- the search: as prob_t in ../a171775.c (n, h = n/2 digit pairs,
+   D = ceil(n/2) free digits, k = n-2-h, bd block digits, ud unit digits,
+   [lo, hi], the bases B with n-digit numbers in it, the unit offsets). */
 struct Prob {
     int n, h, D, k, bd, ud;
     u128 lo, hi;
@@ -233,11 +288,18 @@ struct Prob {
     std::vector<u64> uoff;
 };
 
+/* CConst -- the constants of one pair (B, c), read by the kernel: the
+   cconst_t fields of ../a171775.c (N = c^k, P = c^(h+1), g, N', the inverse
+   u, limit = g B, Wy, Wx, Rcross, Wc[]) plus what a thread needs without a
+   per-B table: the weights s, w_y, dx and w_x (128-bit, as two halves). */
 struct CConst {                 /* per (B, c); read by the kernel */
     u64 B, c, N, P, g, Np, inv, limit, Wy, Wx, Rcross, s, wy, dx, wx_lo, wx_hi;
     u64 Wc[MAXK];
 };
 
+/* BInfo -- per base B (host only): the digit weights, the spans of a block
+   and of a unit, the range [cmin, cmax] of bases c, and the index of
+   (B, cmin) in the CConst table (the entries for one B are consecutive). */
 struct BInfo {
     u128 w[MAXN];
     u128 span_block, span_unit;
@@ -245,9 +307,15 @@ struct BInfo {
     u64 off;                    /* index of (B, cmin) in the table */
 };
 
+/* Item -- one GPU thread's work: Mblock (two halves) and the index cc of its
+   (B, c) in the CConst table.  Out -- one survivor for the host: M (two
+   halves), B and c. */
 struct Item { u64 Mlo, Mhi; u32 cc, pad; };
 struct Out { u64 Mlo, Mhi; u32 B, c; };
 
+/* prob_init -- as in ../a171775.c: fill pr for n and [lo, hi] (lo >= 1) and
+   number the units, (B-1) B^(ud-1) per base B.  No errors; nunits = 0 if no
+   base has n-digit numbers in the range. */
 static void prob_init(Prob &pr, int n, u128 lo, u128 hi)
 {
     pr.n = n;
@@ -275,6 +343,16 @@ static void prob_init(Prob &pr, int n, u128 lo, u128 hi)
     pr.nunits = tot;
 }
 
+/*
+ * build_tables -- the per-B data and the CConst of every (B, c) of the
+ * search, computed as in bctx_set() of ../a171775.c.
+ *
+ * In:     pr (with at least one base B).
+ * Out:    bi[B - Bmin] for every base; tab = all (B, c) constants, grouped by
+ *         B; maxN = the largest c^k (decides 32- or 64-bit w).
+ * Errors: exits with status 1 if c^(h+1) >= 2^62 or c^k >= 2^42, or if a
+ *         weight bound fails (as bctx_set()).
+ */
 static void build_tables(const Prob &pr, std::vector<BInfo> &bi, std::vector<CConst> &tab, u64 &maxN)
 {
     int n = pr.n, h = pr.h, D = pr.D, k = pr.k;
@@ -319,9 +397,9 @@ static void build_tables(const Prob &pr, std::vector<BInfo> &bi, std::vector<CCo
             K.c = c;
             K.N = N;
             K.P = P;
-            u64 sN = s % N, g = gcd64(sN, N), Np = N / g;
+            u64 sN = s % N, g = gcd64(sN, N), Np = N / g;   /* z s = t (mod N): see a171775.c, section 4 */
             u64 sp = Np > 1 ? (sN / g) % Np : 0, spp = sp;
-            while (gcd64(spp % N, N) != 1) spp += Np;
+            while (gcd64(spp % N, N) != 1) spp += Np;       /* a unit s'' = s/g (mod N') */
             K.g = g;
             K.Np = Np;
             K.inv = modinv64(spp % N, N);
@@ -342,8 +420,16 @@ static void build_tables(const Prob &pr, std::vector<BInfo> &bi, std::vector<CCo
     }
 }
 
+/* unit_decode -- as in ../a171775.c: unit u -> base B (returned) and the
+   unit's digits pref[0..ud-1].  u is not range-checked; without any base it
+   returns Bmin and 1, 0, ... */
 static u64 unit_decode(const Prob &pr, u64 u, u64 *pref)
 {
+    if (pr.Bmax < pr.Bmin) {              /* no bases at all: avoid the underflow below */
+        pref[0] = 1;
+        for (int i = 1; i < pr.ud; i++) pref[i] = 0;
+        return pr.Bmin;
+    }
     u64 lo = 0, hi = pr.Bmax - pr.Bmin;
     while (lo < hi) {
         u64 mid = (lo + hi + 1) / 2;
@@ -355,7 +441,14 @@ static u64 unit_decode(const Prob &pr, u64 u, u64 *pref)
     return B;
 }
 
-/* append the items of unit u; returns tuples */
+/*
+ * gen_unit -- the items of unit u: do_unit() and do_block() of ../a171775.c,
+ * but instead of running block_c() for each (block, c) it appends an Item.
+ *
+ * In:     pr; bi; the unit u; items (appended to).
+ * Out:    returns the unit's tuples (B^2 per item), the CPU tool's count.
+ * Errors: none.
+ */
 static u64 gen_unit(const Prob &pr, const std::vector<BInfo> &bi, u64 u, std::vector<Item> &items)
 {
     u64 pref[MAXN];
@@ -393,6 +486,8 @@ static u64 gen_unit(const Prob &pr, const std::vector<BInfo> &bi, u64 u, std::ve
 /* device code                                                         */
 /* ------------------------------------------------------------------ */
 
+/* is_pal_dev -- (device) is M an L-digit palindrome in base b?  As
+   is_pal_base(); digits are kept as u32 (b < 2^32 here) and L <= MAXN + 1. */
 __device__ bool is_pal_dev(u128 M, u64 b, int L)
 {
     u32 d[MAXN + 2];
@@ -408,6 +503,10 @@ __device__ bool is_pal_dev(u128 M, u64 b, int L)
     return true;
 }
 
+/* emit -- (device) the full check of one hit, as in candidate(): if M is in
+   [lo, hi] and an (n-1)-digit palindrome in base c, append (M, B, c) to out[]
+   (an atomic slot counter; entries beyond outcap are counted but dropped, and
+   the host stops with "output buffer overflow"). */
 __device__ __forceinline__ void emit(u128 M, u128 lo, u128 hi, u64 B, u64 c, int n, Out *out, u32 *nout, u32 outcap)
 {
     if (M < lo || M > hi) return;
@@ -421,6 +520,10 @@ __device__ __forceinline__ void emit(u128 M, u128 lo, u128 hi, u64 B, u64 c, int
     }
 }
 
+/* DevParams -- per search, the same for every launch, in constant memory:
+   [lo, hi] as 64-bit halves, the output capacity and n.  Set once before the
+   first launch (per-launch data such as output pointers are kernel arguments,
+   so two streams can run at once). */
 struct DevParams {                  /* per search (same for every launch), in constant memory */
     u64 lo_lo, lo_hi, hi_lo, hi_hi;
     u32 outcap;
@@ -428,7 +531,19 @@ struct DevParams {                  /* per search (same for every launch), in co
 };
 __constant__ DevParams dp;
 
-/* exact check of one (x, y) after the coarse test fired; reloads what it needs */
+/*
+ * rare_path -- (device) the exact check of one (x, y) after the coarse test
+ * fired: the hit code of block_c() in ../a171775.c, in 64/128-bit
+ * arithmetic.  Kept out of line (__noinline__) so the hot loop stays small.
+ *
+ * In:     items, i (this thread's item), tab; x, y; the state w, wnext,
+ *         last, rem of this step.
+ * Out:    returns the number of z found (the "hits"); each goes through
+ *         emit().  Region 0: z = w/g + i N' while rem + z s < P; region 1
+ *         (not if last): z = w1/g + i N' from the first z with
+ *         rem + z s >= P.
+ * Errors: none.
+ */
 __device__ __noinline__ u32 rare_path(const Item *__restrict__ items, u32 i, const CConst *__restrict__ tab, u32 x,
                                       u32 y, u64 w, u64 wnext, bool last, u64 rem, Out *out, u32 *nout)
 {
@@ -452,7 +567,7 @@ __device__ __noinline__ u32 rare_path(const Item *__restrict__ items, u32 i, con
     if (w1 >= N) w1 -= N;
     if (!last && rem >= Kc->Rcross && w1 < limit && (g == 1 || w1 % g == 0)) {   /* solutions with q+1 */
         u64 z = w1 / g;
-        u64 zs = (P - rem + s - 1) / s;
+        u64 zs = (P - rem + s - 1) / s;            /* first z in the q+1 range */
         if (z < zs) z += ((zs - z + Np - 1) / Np) * Np;
         for (; z < B; z += Np) {
             hits++;
@@ -462,6 +577,18 @@ __device__ __noinline__ u32 rare_path(const Item *__restrict__ items, u32 i, con
     return hits;
 }
 
+/*
+ * scan_kernel<K, WT> -- (device) one thread = one item (block, c): all B^2
+ * steps (x, y) of block_c() in ../a171775.c, with the state in registers
+ * (theory, sections 2-3).  K = k, WT = the type of w (u32 when every N of
+ * the search is below 2^31).
+ *
+ * In:     items[0..nitems-1]; tab (the CConst table); per launch, nhits (an
+ *         accumulator) and the output buffer out[] with its counter nout.
+ * Out:    adds the thread's hits to *nhits; survivors through emit().
+ *         A thread stops early once q passes c^k - 1 (M >= c^(n-1)).
+ * Errors: none.
+ */
 template <int K, typename WT>
 __global__ void __launch_bounds__(128) scan_kernel(const Item *__restrict__ items, u32 nitems,
                                                    const CConst *__restrict__ tab, unsigned long long *nhits,
@@ -472,10 +599,10 @@ __global__ void __launch_bounds__(128) scan_kernel(const Item *__restrict__ item
     const Item it = items[i];
     const CConst *Kc = tab + it.cc;
     const u32 B = (u32)Kc->B, c = (u32)Kc->c;
-    const u64 P = Kc->P, wy = Kc->wy, Pwy = P - wy, N64 = Kc->N;
+    const u64 P = Kc->P, wy = Kc->wy, Pwy = P - wy, N64 = Kc->N;   /* rem >= P - w_y <=> rem + w_y >= P */
     const WT N = (WT)N64, Wy = (WT)Kc->Wy, Wx = (WT)Kc->Wx;
     const WT limit = (WT)(Kc->limit < N64 ? Kc->limit : N64);   /* w < N always, so clamping is exact */
-    const WT D0y = N - Wy, D0x = N - Wx;
+    const WT D0y = N - Wy, D0x = N - Wx;   /* w steps by -W (mod N) without a carry of q */
     WT Wc[K];
 #pragma unroll
     for (int j = 0; j < K; j++) Wc[j] = (WT)Kc->Wc[j];
@@ -483,11 +610,11 @@ __global__ void __launch_bounds__(128) scan_kernel(const Item *__restrict__ item
     u64 rem;
     u32 E[K];
     WT w;
-    {
+    {   /* initial state for (x, y) = (0, 0), as in block_c(); the only 128-bit divisions */
         const u128 Mblock = ((u128)it.Mhi << 64) | it.Mlo;
         rem = (u64)(Mblock % P);
         const u128 q128 = Mblock / P;
-        if (q128 >= N64) return;
+        if (q128 >= N64) return;                   /* M >= c^(n-1) already */
         u64 q = (u64)q128, T = 0;
 #pragma unroll
         for (int j = K - 1; j >= 0; j--) { E[j] = (u32)(q % c); q /= c; }
@@ -497,11 +624,13 @@ __global__ void __launch_bounds__(128) scan_kernel(const Item *__restrict__ item
         w = (WT)(((u128)(T >= MN ? T - MN : T + N64 - MN) * Kc->inv) % N64);
     }
 
-    WT wnext, a, D1y;
-    bool last, phase;
-    u32 cnt;
+    WT wnext, a, D1y;       /* a = N - wnext; D1y = the w step of a y step that carries q */
+    bool last, phase;       /* last: q = c^k - 1; phase: false until E[k-1] = c-1 */
+    u32 cnt;                /* increments of q left until the next phase change */
     /* q -> q+1 with the carry stopping at digit m (the largest j with E[j] != c-1) changes T by
        c^(m+1) + c^m (mod c^k) for m < k-1 and by c^(k-1) for m = k-1; all in registers */
+    /* RECOMPUTE(): find m (jj), set last, wnext, a and D1y.  The loops have
+       constant bounds so E[] and Wc[] stay in registers (no dynamic indexing). */
 #define RECOMPUTE()                                                                          \
     do {                                                                                     \
         int jj = -1;                                                                         \
@@ -526,6 +655,10 @@ __global__ void __launch_bounds__(128) scan_kernel(const Item *__restrict__ item
     else { phase = true; cnt = 1; }
     u32 hits = 0;
 
+    /* CHECK(x, y): the coarse test of theory section 3 (branch-free), with
+       the exact check out of line.  STEP(D0, D1, DR, PDR): M0 += DR (w_y or
+       dx), with a carry into q when rem >= PDR = P - DR; w += D0, or D1 when
+       q carries; then the phase bookkeeping of E[k-1] (block_c()'s slow path). */
 #define CHECK(X, Y)                                                                          \
     if (__builtin_expect((w < limit) | ((WT)(w - a) < limit), 0))                            \
         hits += rare_path(items, i, tab, (X), (Y), (u64)w, (u64)wnext, last, rem, out, nout);
@@ -562,12 +695,12 @@ __global__ void __launch_bounds__(128) scan_kernel(const Item *__restrict__ item
     } while (0)
 
     for (u32 x = 0; x < B; x++) {
-        for (u32 y = 0; y + 1 < B; y++) {
+        for (u32 y = 0; y + 1 < B; y++) {          /* y steps: M0 += w_y */
             CHECK(x, y);
             STEP(D0y, D1y, wy, Pwy);
         }
         CHECK(x, B - 1);
-        {
+        {                                          /* y wraps, x steps: M0 += dx */
             const u64 dx = Kc->dx;
             const WT D1x = wnext >= Wx ? wnext - Wx : wnext + (N - Wx);
             STEP(D0x, D1x, dx, P - dx);
@@ -580,6 +713,9 @@ done:
     if (hits) atomicAdd(nhits, (unsigned long long)hits);
 }
 
+/* kern_t, pick_kernel -- the kernel instance for k (2..5) and the w width
+   (narrow = 32-bit w, possible when every N of the search is < 2^31).
+   Exits with status 1 for any other k. */
 typedef void (*kern_t)(const Item *, u32, const CConst *, unsigned long long *, Out *, u32 *);
 
 static kern_t pick_kernel(int k, bool narrow)
@@ -598,15 +734,32 @@ static kern_t pick_kernel(int k, bool narrow)
 /* host side: survivors                                                */
 /* ------------------------------------------------------------------ */
 
+/* Stats -- the statistics of ../a171775.c, section 8 (tuples, hits, st2,
+   canon, csum, sol, fail[]); add_stats() adds two of them. */
 struct Stats {
     u64 tuples = 0, hits = 0, st2 = 0, canon = 0, csum = 0, sol = 0;
     u64 fail[MAXN + 1] = {0};
 };
 
-static std::mutex out_mtx;
-static FILE *sol_out = stdout;
+static void add_stats(Stats &t, const Stats &s)
+{
+    t.tuples += s.tuples; t.hits += s.hits; t.st2 += s.st2; t.canon += s.canon; t.csum += s.csum; t.sol += s.sol;
+    for (int L = 0; L <= MAXN; L++) t.fail[L] += s.fail[L];
+}
 
-/* canonical-base rule + lengths n-2..3, parallel over host threads */
+static std::mutex out_mtx;              /* one SOLUTION line at a time */
+static FILE *sol_out = stdout;          /* a temporary file during the selftest */
+
+/*
+ * post_process -- the host part of the survivor check (candidate() in
+ * ../a171775.c after the palindrome test): the canonical-base rule, the
+ * checksum and the lengths n-2..3, with SOLUTION lines for the survivors
+ * that pass them all.  The survivors are shared out over nthreads threads.
+ *
+ * In:     pr; o[0..no-1], the batch's survivors; st; nthreads.
+ * Out:    st.st2 += no; canon, csum, sol and fail[] updated.
+ * Errors: none.
+ */
 static void post_process(const Prob &pr, const Out *o, size_t no, Stats &st, int nthreads)
 {
     std::atomic<size_t> next(0);
@@ -653,9 +806,21 @@ static void post_process(const Prob &pr, const Out *o, size_t no, Stats &st, int
 /* search driver                                                       */
 /* ------------------------------------------------------------------ */
 
+/* g_stop -- set by SIGINT/SIGTERM: run_search() stops issuing batches,
+   finishes the ones in flight, saves the state and prints the summary. */
 static volatile sig_atomic_t g_stop;
 static void on_sig(int) { g_stop = 1; }
 
+/*
+ * load_state -- read a checkpoint (same format as ../a171775.c, so either
+ * tool can resume the other's runs).
+ *
+ * In:     path; pr.
+ * Out:    0 if the file cannot be opened (a fresh start); otherwise 1, the
+ *         frontier and the saved totals (csum and failL= are optional).
+ * Errors: exits with status 1 if the file cannot be parsed, is for another
+ *         n, LO or HI, or has a frontier beyond the last unit.
+ */
 static int load_state(const char *path, const Prob &pr, u64 &frontier, Stats &st)
 {
     FILE *f = fopen(path, "r");
@@ -666,31 +831,83 @@ static int load_state(const char *path, const Prob &pr, u64 &frontier, Stats &st
     int ok = fscanf(f, "n=%d lo=%63s hi=%63s frontier=%llu tuples=%llu hits=%llu st2=%llu canon=%llu sol=%llu",
                     &n, lo, hi, &fr, &tu, &hi_, &s2, &ca, &so) == 9;
     if (ok && fscanf(f, " csum=%llu", &cs) != 1) cs = 0;
+    unsigned long long fl[MAXN + 1] = {0};
+    if (ok) {                          /* optional " failL=count" fields */
+        for (int i = 0; i <= MAXN; i++) {
+            int LL;
+            unsigned long long v;
+            if (fscanf(f, " fail%d=%llu", &LL, &v) != 2) break;
+            if (LL >= 0 && LL <= MAXN) fl[LL] = v;
+        }
+    }
     fclose(f);
     if (!ok) { fprintf(stderr, "cannot parse %s\n", path); exit(1); }
     if (n != pr.n || parse_or_die(lo) != pr.lo || parse_or_die(hi) != pr.hi) {
         fprintf(stderr, "state file %s is for a different search\n", path);
         exit(1);
     }
+    if (fr > pr.nunits) {
+        fprintf(stderr, "state file %s: frontier %llu is beyond the last unit (%llu units)\n", path, fr,
+                (unsigned long long)pr.nunits);
+        exit(1);
+    }
     frontier = fr;
     st.tuples = tu; st.hits = hi_; st.st2 = s2; st.canon = ca; st.sol = so; st.csum = cs;
+    for (int L = 0; L <= MAXN; L++) st.fail[L] = fl[L];
     return 1;
 }
 
+/*
+ * save_state -- write a checkpoint line "n=.. lo=.. hi=.. frontier=..
+ * tuples=.. hits=.. st2=.. canon=.. sol=.. csum=.. failL=.." to path.tmp and
+ * rename it over path.
+ * In:     path; pr; the frontier; t (exactly the units below the frontier,
+ *         including a resumed state's totals).
+ * Errors: if path.tmp cannot be written completely, prints the reason,
+ *         removes it and keeps the previous checkpoint.
+ */
 static void save_state(const char *path, const Prob &pr, u64 frontier, const Stats &t)
 {
     char tmp[4096], a[48], b[48];
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (!f) { perror(tmp); return; }
-    fprintf(f, "n=%d lo=%s hi=%s frontier=%llu tuples=%llu hits=%llu st2=%llu canon=%llu sol=%llu csum=%llu\n",
+    fprintf(f, "n=%d lo=%s hi=%s frontier=%llu tuples=%llu hits=%llu st2=%llu canon=%llu sol=%llu csum=%llu",
             pr.n, u128s(pr.lo, a), u128s(pr.hi, b), (unsigned long long)frontier, (unsigned long long)t.tuples,
             (unsigned long long)t.hits, (unsigned long long)t.st2, (unsigned long long)t.canon,
             (unsigned long long)t.sol, (unsigned long long)t.csum);
-    fclose(f);
+    for (int L = pr.n - 2; L >= 3; L--) fprintf(f, " fail%d=%llu", L, (unsigned long long)t.fail[L]);
+    fprintf(f, "\n");
+    int bad = ferror(f);
+    if (fclose(f) != 0) bad = 1;
+    if (bad) {                         /* keep the old checkpoint rather than a truncated one */
+        fprintf(stderr, "cannot write %s; checkpoint not updated\n", tmp);
+        remove(tmp);
+        return;
+    }
     rename(tmp, path);
 }
 
+/* print_summary -- the two final lines, in the format of ../a171775.c:
+   "# n=.. [LO, HI] complete|INTERRUPTED: ..." and "# failed at length: ...". */
+static void print_summary(const Prob &pr, const Stats &t, bool complete, double el)
+{
+    char a[48], b[48];
+    printf("# n=%d [%s, %s] %s: %.1fs, tuples %llu, hits %llu, (n-1)-palindromes %llu, canonical %llu, "
+           "checksum %016llx, solutions %llu\n",
+           pr.n, u128s(pr.lo, a), u128s(pr.hi, b), complete ? "complete" : "INTERRUPTED", el,
+           (unsigned long long)t.tuples, (unsigned long long)t.hits, (unsigned long long)t.st2,
+           (unsigned long long)t.canon, (unsigned long long)t.csum, (unsigned long long)t.sol);
+    printf("# failed at length:");
+    for (int L = pr.n - 2; L >= 3; L--) printf(" L=%d:%llu", L, (unsigned long long)t.fail[L]);
+    printf("\n");
+    fflush(stdout);
+}
+
+/* Slot -- one of the two pipeline slots: a CUDA stream with pinned host and
+   device buffers for one batch (items, survivors, their count, the hit
+   count), the batch's units [u_begin, u_end) and tuples, and whether it is
+   in flight (busy). */
 struct Slot {
     cudaStream_t stream;
     Item *h_items, *d_items;
@@ -702,6 +919,28 @@ struct Slot {
     bool busy;
 };
 
+/*
+ * run_search -- the "search" command (and the selftest's searches).
+ *
+ * In:     n; lo, hi; state (checkpoint file or NULL); interval (seconds
+ *         between progress lines); batch (items per batch, -b); hthreads
+ *         (host threads for post_process); result (may be NULL); quiet (no
+ *         progress or summary).
+ * Out:    SOLUTION lines on sol_out, progress on stderr and the summary on
+ *         stdout unless quiet; the checkpoint if requested; *result = the
+ *         totals including a resumed state's.  Returns 0 when complete (also
+ *         for a range without units), 3 if interrupted, 1 if n < 7.
+ * How:    build all (B, c) constants and copy them to the GPU; then loop:
+ *         build the next batch (whole units, up to `batch` items), finish the
+ *         slot's previous batch (wait, copy the survivors back,
+ *         post_process), launch the new batch in that slot, and switch slots;
+ *         when everything is issued or g_stop is set, finish both slots,
+ *         oldest first.  Batches finish in issue order, so done_units is a
+ *         frontier with exactly known statistics.
+ * Errors: exits with status 1 on CUDA errors (CK), table limits
+ *         (build_tables), a unit with more items than a batch holds ("raise
+ *         -b"), or more than 2^20 survivors in a batch ("lower -b").
+ */
 static int run_search(int n, u128 lo, u128 hi, const char *state, double interval, size_t batch, int hthreads,
                       Stats *result, int quiet)
 {
@@ -709,11 +948,21 @@ static int run_search(int n, u128 lo, u128 hi, const char *state, double interva
     Prob pr;
     prob_init(pr, n, lo, hi);
     if (pr.D < 4) { fprintf(stderr, "n = %d: use the CPU tool (n >= 7 here)\n", n); return 1; }
+    if (pr.nunits == 0) {              /* e.g. HI < 2^(n-1), or LO > HI */
+        Stats none;
+        if (!quiet) {
+            fprintf(stderr, "gpu search n=%d [%s, %s]: no base has %d-digit numbers in this range, nothing to search\n",
+                    n, u128s(lo, a), u128s(hi, b), n);
+            print_summary(pr, none, true, 0.0);
+        }
+        if (result) *result = none;
+        return 0;
+    }
     std::vector<BInfo> bi;
     std::vector<CConst> tab;
     u64 maxN;
     build_tables(pr, bi, tab, maxN);
-    bool narrow = maxN < ((u64)1 << 31);
+    bool narrow = maxN < ((u64)1 << 31);   /* 32-bit w is enough for every (B, c) */
     kern_t kern = pick_kernel(pr.k, narrow);
     CConst *d_tab;
     CK(cudaMalloc(&d_tab, tab.size() * sizeof(CConst)));
@@ -728,7 +977,7 @@ static int run_search(int n, u128 lo, u128 hi, const char *state, double interva
                 u128s(lo, a), u128s(hi, b), (unsigned long long)pr.Bmin, (unsigned long long)pr.Bmax,
                 (unsigned long long)pr.nunits, pr.k, tab.size(), narrow ? "32-bit" : "64-bit");
 
-    const u32 outcap = 1u << 20;
+    const u32 outcap = 1u << 20;           /* survivors per batch */
     {
         DevParams h;
         h.lo_lo = (u64)pr.lo; h.lo_hi = (u64)(pr.lo >> 64);
@@ -758,6 +1007,8 @@ static int run_search(int n, u128 lo, u128 hi, const char *state, double interva
     std::vector<Item> items;
     items.reserve(batch + 4096);
     int cur = 0;
+    /* finish(s): wait for slot s, copy its survivors back and post-process
+       them, add its counts; the frontier moves to the end of its batch */
     auto finish = [&](Slot &s) {
         CK(cudaStreamSynchronize(s.stream));
         u32 no = *s.h_nout;
@@ -795,8 +1046,8 @@ static int run_search(int n, u128 lo, u128 hi, const char *state, double interva
             unext++;
         }
         Slot &s = sl[cur];
-        if (s.busy) finish(s);
-        if (ub < unext) {
+        if (s.busy) finish(s);                  /* the older of the two batches in flight */
+        if (ub < unext) {                       /* launch the new batch in this slot */
             memcpy(s.h_items, items.data(), items.size() * sizeof(Item));
             s.nitems = items.size();
             s.u_begin = ub;
@@ -833,10 +1084,9 @@ static int run_search(int n, u128 lo, u128 hi, const char *state, double interva
             tlast = t;
         }
         if (state && (t - tsave >= 60 || fin || g_stop)) {
-            Stats all = st;
-            all.tuples += base.tuples; all.hits += base.hits; all.st2 += base.st2;
-            all.canon += base.canon; all.sol += base.sol; all.csum += base.csum;
-            u64 fr = done_units;
+            Stats all = st;                /* the finished batches: exactly the units below fr */
+            add_stats(all, base);
+            u64 fr = done_units;           /* = the first unit of the oldest batch in flight */
             for (auto &x : sl) if (x.busy && x.u_begin < fr) fr = x.u_begin;
             save_state(state, pr, fr, all);
             tsave = t;
@@ -845,20 +1095,9 @@ static int run_search(int n, u128 lo, u128 hi, const char *state, double interva
     }
     double el = now_sec() - t0;
     Stats all = st;
-    all.tuples += base.tuples; all.hits += base.hits; all.st2 += base.st2;
-    all.canon += base.canon; all.sol += base.sol; all.csum += base.csum;
+    add_stats(all, base);
     bool complete = done_units >= pr.nunits;
-    if (!quiet) {
-        printf("# n=%d [%s, %s] %s: %.1fs, tuples %llu, hits %llu, (n-1)-palindromes %llu, canonical %llu, "
-               "checksum %016llx, solutions %llu\n",
-               n, u128s(lo, a), u128s(hi, b), complete ? "complete" : "INTERRUPTED", el,
-               (unsigned long long)all.tuples, (unsigned long long)all.hits, (unsigned long long)all.st2,
-               (unsigned long long)all.canon, (unsigned long long)all.csum, (unsigned long long)all.sol);
-        printf("# failed at length:");
-        for (int L = n - 2; L >= 3; L--) printf(" L=%d:%llu", L, (unsigned long long)st.fail[L]);
-        printf("\n");
-        fflush(stdout);
-    }
+    if (!quiet) print_summary(pr, all, complete, el);
     for (auto &s : sl) {
         cudaStreamDestroy(s.stream);
         cudaFreeHost(s.h_items); cudaFree(s.d_items); cudaFreeHost(s.h_out); cudaFree(s.d_out);
@@ -871,6 +1110,13 @@ static int run_search(int n, u128 lo, u128 hi, const char *state, double interva
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * cmd_selftest -- complete searches over [1, a(n)] for n = 7, 8, 9: each
+ * must find exactly one solution, a(n), with the CPU tool's tuples, hits,
+ * st2, canonical count and checksum.
+ * In: batch, hthreads (as for search).  Out: one line per n; returns 0 if all
+ * agree, 1 otherwise.  Errors: as run_search(); tmpfile() is not checked.
+ */
 static int cmd_selftest(size_t batch, int hthreads)
 {
     /* expected statistics from the CPU tool (a171775 search n 1 a(n)) */
@@ -916,6 +1162,9 @@ static int cmd_selftest(size_t batch, int hthreads)
     return bad ? 1 : 0;
 }
 
+/* main -- parse -S, -i, -b, -t and the command; set the blocking-sync device
+   flag (the host sleeps while waiting for the GPU).  Unknown commands print
+   the usage and return 1; bad numbers exit with status 1. */
 int main(int argc, char **argv)
 {
     const char *state = NULL;
@@ -932,6 +1181,7 @@ int main(int argc, char **argv)
         else if (npos < 8) pos[npos++] = argv[i];
     }
     if (hthreads < 1) hthreads = 1;
+    if (batch < 1) batch = 1;              /* -b 0 would never issue a batch */
     CK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));

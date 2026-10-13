@@ -7,6 +7,35 @@ C h-range checker (tools/hrange) before it is written out.
 Output: bfiles/bA001209.txt (h=1..302), bA001210.txt (h=1..90), bA001211.txt (h=1..27),
         bA053346.txt (h=1..14), bA084192.txt, bA084193.txt, bA196416.txt (extended arrays),
         and bfiles/SUMMARY.txt
+
+THEORY OF OPERATIONS
+--------------------
+N[(h, k)] collects every PROVEN extremal value n(h, k) (largest N such that some k-element basis covers 1..N
+with at most h stamps):
+  k = 1: h;  k = 2: floor((h^2 + 6h + 1)/4);  h = 1: k.
+  k = 3: OEIS A001208 data for h <= 48, then the Challis-Robinson closed form (valid for h >= 23; the two are
+         cross-checked on 23..48 by an assert).
+  k = 4: the explicit table h = 1..54 (with bases), then the three formula families of the 2013 addendum for
+         h = 55..302.  Every one of the 302 bases is re-verified by running `tools/hrange -f` on a temporary
+         file; disagreements are recorded as MISMATCH lines in SUMMARY.txt (not raised).
+  k = 5: the paper's h = 1..67 plus the addendum's h = 68..90;  k = 6: h = 1..26 plus n(27,6) = 186942, proved
+         by this project's exhaustive search (Oct 3 2026);  k = 7: h = 1..14;  k = 8: h = 1..8.
+  rows h = 2..6: the proven values for larger k (h = 2 to k = 24, h = 3 to 15, h = 4 to 12, h = 5 to 10,
+         h = 6 to 9).
+Column b-files are written straight from N.  The arrays are read by antidiagonals (A084192: T(n,k) with n
+stamps; A084193: the transpose; A196416: Lunnon's table V(n,m) = n(m,n) + 1 with a row and column of 1s) and
+stop at the first antidiagonal that contains an unknown entry, after appending the leading known terms of that
+partial antidiagonal (as the OEIS data does).  Finally each array is compared with the data section currently
+on OEIS (pasted below) and the result is written to SUMMARY.txt.
+
+The b-files for A053348 and A005344 (n(9,8) = 6082) are NOT produced here; they were written by hand.
+
+Usage:  python3 tools/make_bfiles.py      (needs the compiled checker tools/hrange; run from anywhere)
+Side effects: overwrites the b-files listed above and bfiles/SUMMARY.txt; the temporary bfiles/_k4_check.txt
+is deleted at the end.  Prints the summary to stdout.
+Errors: an AssertionError if the k = 3 closed form disagrees with the table or k = 5 has the wrong length;
+FileNotFoundError / ValueError if tools/hrange is missing or prints something unexpected.  Verification
+problems are reported as WARNING / ERROR / MISMATCH lines in the summary rather than raised.
 """
 import subprocess, os, sys, re
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -15,16 +44,22 @@ HR = os.path.join(HERE, 'hrange')
 
 # ---------------- known proven values N(h,k) ----------------
 N = {}  # (h,k) -> n
-def n2(h): return (h*h + 6*h + 1)//4
+def n2(h):
+    """n(h, 2) = floor((h^2 + 6h + 1) / 4), the closed form for two denominations (A014616)."""
+    return (h*h + 6*h + 1)//4
 for h in range(1, 400): N[(h,1)] = h
 for h in range(1, 400): N[(h,2)] = n2(h)
 for k in range(1, 400): N[(1,k)] = k
 
 # k=3: Challis recursion (valid h>=23) + explicit table (OEIS A001208 data)
 A001208 = [3,8,15,26,35,52,69,89,112,146,172,212,259,302,354,418,476,548,633,714,805,902,1012,1127,1254,1382,1524,1678,1841,2010,2188,2382,2584,2801,3020,3256,3508,3772,4043,4326,4628,4941,5272,5606,5960,6334,6723,7120]
+# coefficient rows of the k=3 closed form, indexed by r = h mod 9 (same table as k3_formula in psph.c)
 c2=[3,3,5,5,7,6,8,8,10]; c3=[[1,1],[1,1],[2,1],[2,1],[3,1],[2,2],[3,2],[3,2],[4,2]]
 c4=[[0,0,0],[0,0,1],[1,0,1],[1,0,2],[2,0,2],[2,1,2],[3,1,2],[3,1,3],[4,1,3]]
 def k3(h):
+    """n(h, 3): the OEIS A001208 data for h <= 48, else the Challis-Robinson closed form with h = 9t + r:
+    a2 = 6t + c2[r], a3 = (2t + c3[r][0]) + (2t + c3[r][1]) a2, n = 4t + c4[r][0] + (2t + c4[r][1]) a2 + (3t + c4[r][2]) a3.
+    Input h >= 1.  Output n(h,3).  No error handling (h < 1 would index the list from the end)."""
     if h <= 48: return A001208[h-1]
     r,t = h%9, h//9
     a2 = 6*t+c2[r]; a3=(2*t+c3[r][0])+(2*t+c3[r][1])*a2
@@ -123,6 +158,11 @@ k4_rows = [
  (11,'B', 12,5,1, 12,1,0, 3,0,-1,10, 24,24),
 ]
 def k4_formula(h):
+    """Evaluate every k=4 formula row that covers h (h = 12t + r, row r with tmin <= t <= tmax).
+
+    Returns a list of (n, [1, a2, a3, a4], type) tuples, one per applicable row (empty if none applies).
+    Types A and C share the a3 form, type B differs; n uses a type-specific linear form.  Same coefficients as
+    k4_formula in psph/psph.c.  No errors raised."""
     t, r = divmod(h, 12)
     res = []
     for row in k4_rows:
@@ -156,7 +196,7 @@ for h in range(1, 303):
         n, A, typ = max(f)
         k4_ext[h] = n
         tocheck.append((h, n, A, 'formula-'+typ))
-# verify with hrange -f
+# verify with hrange -f: input lines "h a1 .. ak", output lines "h k n a1 .. ak" (n = third field)
 tmp = os.path.join(OUT, '_k4_check.txt')
 with open(tmp,'w') as fo:
     for h,n,A,src in tocheck: fo.write(f"{h} {' '.join(map(str,A))}\n")
@@ -196,11 +236,15 @@ row5 = [5,14,35,71,126,211,336,524,726,1016]  # k=1..10
 for k,v in enumerate(row5,1): N[(5,k)] = v
 row6 = [6,18,52,114,216,388,638,1007,1545]  # k=1..9
 for k,v in enumerate(row6,1): N[(6,k)] = v
-# consistency between rows and columns
+# consistency between rows and columns (placeholder: no check is performed here; psph -selftest does it)
 for (h,k),v in list(N.items()):
     pass
 
 def write_bfile(name, pairs, header):
+    """Write bfiles/b<name>.txt: one '# header' line, then 'index value' lines from pairs.
+
+    Inputs: name (e.g. 'A001209'), pairs [(index, value), ...], header text.  Returns the path written.
+    Errors: OSError if the file cannot be written.  Existing files are overwritten."""
     p = os.path.join(OUT, f'b{name}.txt')
     with open(p,'w') as fo:
         fo.write(f"# {header}\n")
@@ -214,6 +258,10 @@ write_bfile('A053346', [(h,N[(h,7)]) for h in range(1,15)], "A053346: n=1..14. n
 
 # arrays
 def antidiag_A084192():
+    """A084192 by antidiagonals s = n + k: entries T(n,k) = N[(n,k)], n = 1..s-1 (n stamps, k denominations).
+
+    Returns (pairs, stop): pairs = [(index, value)] for every complete antidiagonal, stop = (n, k, s) of the
+    first unknown entry (None if the loop limit s < 60 is reached first)."""
     out=[]; idx=0
     for s in range(2, 60):
         row=[]
@@ -224,6 +272,8 @@ def antidiag_A084192():
         for v in row: out.append((idx,v)); idx+=1
     return out, None
 def antidiag_A084193():
+    """A084193, the transpose of A084192: on antidiagonal s the denominations k run 1..s-1, n = s - k.
+    Returns (pairs, stop) as antidiag_A084192."""
     out=[]; idx=0
     for s in range(2, 60):
         row=[]
@@ -234,6 +284,8 @@ def antidiag_A084193():
         for v in row: out.append((idx,v)); idx+=1
     return out, None
 def antidiag_A196416():
+    """A196416 (Lunnon's table V(n,m), n denominations, m stamps): V = 1 when n = 0 or m = 0, else n(m,n) + 1.
+    Antidiagonal s lists n = 0..s.  Returns (pairs, stop) with stop = (m, n, s) of the first unknown entry."""
     out=[]; idx=0
     for s in range(0, 60):
         row=[]
@@ -246,6 +298,7 @@ def antidiag_A196416():
     return out, None
 # the arrays must stop before an antidiagonal with an unknown entry; but we may include the leading known terms of the partial antidiagonal (as the existing OEIS data does)
 def partial(fn):
+    """Unused helper (kept from an earlier version): returns fn() unchanged."""
     full, stop = fn()
     return full, stop
 for name, fn in [('A084192',antidiag_A084192),('A084193',antidiag_A084193),('A196416',antidiag_A196416)]:
@@ -267,7 +320,7 @@ for name, fn in [('A084192',antidiag_A084192),('A084193',antidiag_A084193),('A19
     write_bfile(name, pairs, f"{name}: extended using only proven values; stops at first unknown entry {stop}")
     summary.append(f"{name}: {len(pairs)} terms (was 71/71/66 in OEIS); first unknown entry (h,k or m,n, antidiagonal) = {stop}")
 
-# verify the existing OEIS data prefixes match our generated arrays
+# verify the existing OEIS data prefixes match our generated arrays (data copied from the OEIS entries, Sep 2026)
 oeis = {'A084192': "1,2,2,3,4,3,4,8,7,4,5,12,15,10,5,6,16,24,26,14,6,7,20,36,44,35,18,7,8,26,52,70,71,52,23,8,9,32,70,108,126,114,69,28,9,10,40,93,162,211,216,165,89,34,10,11,46,121,228,336,388,345,234,112,40,11,12,54,154,310,524",
         'A084193': "1,2,2,3,4,3,4,7,8,4,5,10,15,12,5,6,14,26,24,16,6,7,18,35,44,36,20,7,8,23,52,71,70,52,26,8,9,28,69,114,126,108,70,32,9,10,34,89,165,216,211,162,93,40,10,11,40,112,234,345,388,336,228,121,46,11,12,47,146,326,512",
         'A196416': "1,1,1,1,2,1,1,3,3,1,1,4,5,4,1,1,5,8,9,5,1,1,6,11,16,13,6,1,1,7,15,27,25,17,7,1,1,8,19,36,45,37,21,8,1,1,9,24,53,72,71,53,27,9,1,1,10,29,70,115,127,109,71,33,10,1"}

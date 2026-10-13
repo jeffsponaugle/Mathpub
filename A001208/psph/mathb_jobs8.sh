@@ -1,6 +1,12 @@
 #!/bin/sh
 # mathb overnight v3 (Oct 3 05:40 PDT): finish chunk 24 under the h27k6h driver, then chunks 25 and 29 (taken from mathd's
 # queue so that the search ends ~09:00 instead of ~11:30), then A001210(91) items [10000,100000) in 1000-item chunks.
+#
+# Job-chain wrapper: each stage is one run_range.sh call (resumable through .done markers); "=== ... start/done" lines
+# in jobs.log mark the stages, and a wrapper only starts a stage after the previous run_range.sh has returned.  Stop a
+# wrapper BEFORE its run_range.sh driver, otherwise it advances to its next stage.
+# Deployed as ~/A001208/psph/jobs8.sh on mathb (switch_b2.sh).  Killed by winddown_b.sh after chunk 29 started,
+# so the A001210(91) stage never ran.
 cd ~/A001208/psph
 while pgrep -f "run_range.sh h27k6h" > /dev/null; do sleep 60; done
 echo "=== JOB3h done $(date)" >> jobs.log

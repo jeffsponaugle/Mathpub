@@ -1,5 +1,9 @@
 #!/bin/sh
 # quick A/B: wall time for the same 100-item window in the a_2~25 region at TGT 177915 vs 186943 (3 threads each, concurrent)
+#
+# Ran on mathg, Oct 3 2026 ~01:00 PDT, after the 186942 basis appeared: 385 s at 177915 vs 253 s at 186943 (full checks
+# 28.8M vs 12.2M), which is why the remaining A001211(27) chunks were switched to TGT 186943.  Output: logs/bench_tgt/
+# and one timing line per target on stdout.
 cd ~/A001208/psph
 L=logs/bench_tgt; mkdir -p $L
 for t in 177915 186943; do

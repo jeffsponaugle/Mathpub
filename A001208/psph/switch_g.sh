@@ -1,4 +1,10 @@
 #!/bin/sh
+# One-off reconfiguration script (rebalance #6, Oct 3 2026 ~01:10 PDT, run on mathg in its psph directory): replace
+# jobs5.sh by jobs7.sh (chunk 26 at TGT 186943, then A001210(91)), and queue the wider boundary windows bnd2_h27k6.sh
+# behind bnd_h27k6.sh.
+# Pattern: kill the old wrapper only (the running run_range.sh driver and psph keep going), touch .done SKIP markers
+# for chunks that move to another box (unless they had already started there), start the new wrapper with nohup,
+# log the switch in jobs.log and show the running wrappers / drivers.  Kept for the record of how the chunks moved.
 cd ~/A001208/psph
 for p in $(pgrep -f "sh [j]obs5.sh"); do kill $p; done
 sleep 1

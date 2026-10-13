@@ -1,4 +1,18 @@
 /*
+ * HISTORICAL SNAPSHOT -- psph_orig.c is the first version of psph.c (Sep 30 2026), kept for reference only.  No
+ * Makefile builds it and it was not used for the n(9,8) or n(27,6) searches.  The maintained program is psph.c, whose
+ * header contains the full theory of operations; it applies to this file as well, except that this snapshot has
+ *   - no -i lo:hi option: every run processes the whole work-item list (no partitioning across machines);
+ *   - SIMD only on ARM (NEON); on x86 every DP loop is scalar (no AVX2 path and no -DNO_SIMD switch);
+ *   - no GPU leaf (no GPU_LEAF hooks, -gpu / -cpu or PSPH_GPU* variables), and report_solution builds and verifies
+ *     the basis itself (psph.c split it into report_solution_basis plus a wrapper for the GPU callback);
+ *   - 512 deep-hole slots per thread (psph.c: 4096, needed by the GPU strata);
+ *   - no clamp of "-selftest -j N" to 1..256.
+ * The function comments below were transferred from the documented psph.c and adjusted where the code differs.
+ * Exit status: 0 success, 1 bad arguments or failed selftest, 2 out of memory, 3 bound violated, 4 and 5 internal
+ * errors (see psph.c).
+ */
+/*
  * psph.c -- exhaustive search for extremal h-bases A_k
  *           (the "global postage stamp problem"; OEIS A001208..A001216, A053346, A053348, ...)
  *
@@ -68,6 +82,8 @@
 #include <unistd.h>
 #include <math.h>
 #include <sys/resource.h>
+/* SIMD selection (this snapshot): NEON on ARM targets (Apple Silicon, Jetson); every other target uses scalar code.
+   Only the inner DP loops (dp_chunk, dp_inplace, vec_max_c, vec_find_c) use vectors. */
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #define HAVE_NEON 1
@@ -76,7 +92,18 @@
 typedef uint8_t  u8;
 typedef int64_t  i64;
 typedef uint64_t u64;
-/* stamp-count cell: 8-bit by default (h <= 254); compile with -DWIDE for 16-bit cells (h <= 65534, 2x memory) */
+/* stamp-count cell: 8-bit by default (h <= 254); compile with -DWIDE for 16-bit cells (h <= 65534, 2x memory)
+
+   A cell holds a minimum number of stamps, saturated at CNT_MAX; CNT_MAX itself means "more than HMAX", so every
+   comparison "cell > H" stays exact as long as H <= HMAX = CNT_MAX - 1.  The vector abstraction used by the DP:
+     cnt_t / vcnt_t   scalar cell type / vector of VL cells
+     vld_c, vst_c     unaligned vector load / store of VL cells
+     vdup_c(x)        broadcast x to all lanes
+     vqadd_c          lane-wise SATURATING add (CNT_MAX + 1 stays CNT_MAX, so "infinity" never wraps to 0)
+     vmin_c, vmax_c   lane-wise unsigned min / max
+     vmaxv_c(v)       horizontal max over all lanes (returns an unsigned scalar)
+     vceq_c           lane-wise equality mask (NEON only)
+     (psph.c adds vanyeq_c and an AVX2 implementation of all of these) */
 #ifdef WIDE
 typedef uint16_t cnt_t;
 #define CNT_MAX 65535u
@@ -111,13 +138,27 @@ typedef uint8x16_t vcnt_t;
 #endif
 #endif
 
-#define MAXK    24
-#define PAD     64
-#define CHUNK   2048          /* max bytes per DP step while hunting for the first gap */
-#define INF_I64 ((i64)1 << 60)
+#define MAXK    24            /* largest k supported (per-level arrays have MAXK+1 or MAXK+2 entries) */
+#define PAD     64            /* slack cells allocated after every table and buffer (safety margin) */
+#define CHUNK   2048          /* max cells per DP step while hunting for the first gap (bounds overshoot past it) */
+#define INF_I64 ((i64)1 << 60)  /* "infinity" for 64-bit ranges (currently unused) */
 
+/*
+ * imin, imax -- minimum / maximum of two 64-bit integers.
+ *
+ * Inputs:  a, b.   Outputs: the smaller (imin) or larger (imax) of the two.   Errors: none.
+ */
 static inline i64 imin(i64 a, i64 b) { return a < b ? a : b; }
 static inline i64 imax(i64 a, i64 b) { return a > b ? a : b; }
+/*
+ * now_s, cpu_s, proc_cpu_s -- clocks used for progress lines and statistics.
+ *
+ * Purpose: now_s = monotonic wall-clock time; cpu_s = CPU time of the CALLING THREAD (per-thread busy and
+ *          stage timings); proc_cpu_s = user + system CPU time of the whole process (all threads).
+ * Inputs:  none.
+ * Outputs: seconds as a double (arbitrary origin; only differences are meaningful).
+ * Errors:  none checked (clock_gettime / getrusage failures would give garbage timings, never wrong results).
+ */
 static double now_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec; }
 static double cpu_s(void) { struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec; }
 static double proc_cpu_s(void) { struct rusage ru; getrusage(RUSAGE_SELF, &ru); return (double)ru.ru_utime.tv_sec + 1e-6 * (double)ru.ru_utime.tv_usec + (double)ru.ru_stime.tv_sec + 1e-6 * (double)ru.ru_stime.tv_usec; }
@@ -125,6 +166,14 @@ static double proc_cpu_s(void) { struct rusage ru; getrusage(RUSAGE_SELF, &ru); 
 /* ===================================================================================== */
 /*  Known extremal values n_h(k)  (Challis 1993; Challis & Robinson, JIS 13 (2010) 10.2.3;   */
 /*  Challis addendum 2013).  Used ONLY as upper bounds a_{j+1} <= n_h(j)+1 and as table caps. */
+/*  Layout: Kk_TAB[h] = n_h(k) for one column k (index 0 is a placeholder 0); Hh_TAB[k] = n_h(k) for one row h.
+    Besides the search bounds, the tables give the default TGT when -t is omitted, the "known" value printed by
+    -r and -table, and the reference values of the selftest (which also cross-checks rows against columns).
+    Only PROVEN values belong here: a value that is too small makes a correct run stop with fatal_bound().
+    Not in the tables (proved later with psph.c): n_27(6) = 186942 (Oct 3 2026) and n_9(8) = 6082
+    (Oct 2 2026).  The search never needs a table value for exactness (the admissibility bound uses each
+    prefix's actual first gap); the values serve as a safety check and as a buffer-size cap, so pass them
+    with -b (e.g. -b 6:186942 for h = 27, k >= 7) to keep the check and the smaller buffers. */
 /* ===================================================================================== */
 static const i64 K3_TAB[] = {0, 3,8,15,26,35,52,69,89,112,146,172,212,259,302,354,418,476,548,633,
     714,805,902,1012,1127,1254,1382,1524,1678,1841,2010,2188,2382,2584,2801,3020,3256,3508,3772,
@@ -157,7 +206,17 @@ static const i64 H6_TAB[]  = {0, 6,18,52,114,216,388,638,1007,1545};
 static const i64 H7_TAB[]  = {0, 7,23,69,165,345,664,1137,1911};
 #define NEL(t) ((int)(sizeof(t)/sizeof((t)[0])) - 1)
 
-/* k=3, h >= 23 (Challis-Robinson Appendix; k=3 is completely solved) */
+/*
+ * k3_formula -- closed form for n_h(3) and its extremal basis, h >= 23 (Challis-Robinson Appendix).
+ *
+ * Purpose: k = 3 is completely solved: with h = 9t + r the extremal basis is {1, a2, a3} with
+ *          a2 = 6t + c0, a3 = (2t + c1) + (2t + c2) a2 and n = (4t + c3) + (2t + c4) a2 + (3t + c5) a3,
+ *          where (c0..c5) is the row c[r] of the coefficient table below.
+ * Inputs:  h  number of stamps (the formula is only claimed for h >= 23; the table K3_TAB covers h <= 48).
+ *          A  optional output array of 3 entries (may be NULL).
+ * Outputs: returns n_h(3); if A != NULL stores the basis {1, a2, a3} in A[0..2].
+ * Errors:  none; for h < 23 the value is not meaningful (callers use K3_TAB there).
+ */
 static i64 k3_formula(int h, i64 *A)
 {
     static const int c[9][6] = {{3,1,1,0,0,0},{3,1,1,0,0,1},{5,2,1,1,0,1},{5,2,1,1,0,2},{7,3,1,2,0,2},
@@ -170,7 +229,18 @@ static i64 k3_formula(int h, i64 *A)
     return n;
 }
 
-/* k=4, 55 <= h <= 302 (Challis addendum 2013, types A/B/C), h = 12t + r */
+/*
+ * k4_formula -- n_h(4) and its extremal basis from the three formula families of the Challis 2013 addendum.
+ *
+ * Purpose: with h = 12t + r, each table row (r, type, c[0..9], t0..t1) gives, for t0 <= t <= t1,
+ *          a2 = 9t + c0, a3 = (4t + c1) + (3t + c2) a2 (type B: (2t + c1) + (3t + c2) a2),
+ *          a4 = (7t + c3) + (2t + c4) a2 + (2t + c5) a3, and n by the type-specific linear form below.
+ *          The families cover 55 <= h <= 302 (some rows also apply to smaller h; the selftest checks every
+ *          h in 15..302 for which a row exists against an independent DP and against K4_TAB).
+ * Inputs:  h  number of stamps;  A  optional output array of 4 entries (may be NULL).
+ * Outputs: returns n_h(4), or -1 if no row covers h; if a row applies and A != NULL, stores the basis in A[0..3].
+ * Errors:  none (returns -1 outside the tabulated range).
+ */
 static i64 k4_formula(int h, i64 *A)
 {
     struct row { int r; char ty; int c[10]; int t0, t1; };
@@ -209,7 +279,16 @@ static i64 k4_formula(int h, i64 *A)
     return -1;
 }
 
-/* n_h(k) if known (proven), else -1 */
+/*
+ * known_n -- the proven extremal value n_h(k) if it is built in, else -1.
+ *
+ * Purpose: single lookup used for the search bounds NB[j], the default target, and reporting.
+ *          k = 1: h;  k = 2: floor((h^2 + 6h + 1)/4) (A014616);  k = 3: K3_TAB, then k3_formula for h > 48;
+ *          k = 4: K4_TAB to h = 54, k4_formula to h = 302;  k = 5..8: column tables;  h = 2..7: row tables.
+ * Inputs:  h >= 1 stamps, k >= 1 denominations.
+ * Outputs: n_h(k), or -1 when unknown (or h < 1, k < 1).
+ * Errors:  none.
+ */
 static i64 known_n(int h, int k)
 {
     if (h < 1 || k < 1) return -1;
@@ -232,7 +311,22 @@ static i64 known_n(int h, int k)
 
 /* ===================================================================================== */
 /*  Exact h-range of a basis (independent, simple in-place DP; used for -r and for solutions) */
+/*  This code path is deliberately independent of the search tables: it starts from scratch for every call, so  */
+/*  every reported basis is re-verified by a second DP before it is printed.                                  */
 /* ===================================================================================== */
+/*
+ * dp_inplace -- add denomination a to an 8-bit min-stamps table:  T[x] = min(T[x], T[x-a] + 1), x = a..lim.
+ *
+ * Purpose: one pass of the unbounded-knapsack recurrence, used only by hrange_exact.  The pass walks upward in
+ *          blocks of at most a cells: the source window [x-a, x-a+len) then ends at or before the destination
+ *          window [x, x+len), so all sources are already final for this pass and a block can be vectorised
+ *          (ascending order within the pass is what allows several copies of a).
+ * Inputs:  T    table with valid entries 0..lim (lim+1+PAD bytes allocated); 255 means "too many".
+ *          a    the denomination being added (1 <= a).
+ *          lim  last index to update.
+ * Outputs: T[a..lim] updated in place.
+ * Errors:  none; values saturate at 255, so the table is exact only for comparisons with h <= 254.
+ */
 static void dp_inplace(u8 *T, i64 a, i64 lim)
 {   /* T[x] = min(T[x], T[x-a]+1) for x = a..lim, ascending (unbounded knapsack) */
     i64 x = a;
@@ -249,6 +343,19 @@ static void dp_inplace(u8 *T, i64 a, i64 lim)
     }
 }
 
+/*
+ * hrange_exact -- exact h-range n_h(A) of the basis a[0..k-1] (a[0] must be 1), by a full DP.
+ *
+ * Purpose: independent verifier (used by -r, by report_solution_basis for every basis found, and by the
+ *          selftest).  The table starts as the table of {1} (T[x] = x), every further denomination is added
+ *          with one DP pass, and the answer is the last n with T[1..n] <= h.  n_h(A) <= h * a_k, so a gap
+ *          always exists at or below lim = h * a[k-1] + 1 and the scan terminates.
+ * Inputs:  a  strictly increasing basis with a[0] = 1;  k  its size (>= 1);  h  stamps (1..65534).
+ * Outputs: n_h(A).
+ * Errors:  exits with status 2 if the (h * a_k + 2)-cell table cannot be allocated.  h >= 255 uses 16-bit
+ *          counts (8-bit counts cannot express "more than h" there); h > 65534 would give a wrong result
+ *          (counts saturate at 65535) and is not checked here.  a[0] != 1 is not checked either.
+ */
 static i64 hrange_exact(const i64 *a, int k, int h)
 {
     i64 lim = (i64)h * a[k-1] + 1;
@@ -264,10 +371,10 @@ static i64 hrange_exact(const i64 *a, int k, int h)
     }
     u8 *T = (u8 *)malloc((size_t)lim + 1 + PAD);
     if (!T) { fprintf(stderr, "out of memory\n"); exit(2); }
-    for (i64 x = 0; x <= lim; x++) T[x] = (u8)(x < 255 ? x : 255);
+    for (i64 x = 0; x <= lim; x++) T[x] = (u8)(x < 255 ? x : 255);   /* table of {1}: x stamps of value 1 */
     for (int j = 1; j < k; j++) dp_inplace(T, a[j], lim);
     i64 n = 0;
-    while (n + 1 <= lim && T[n+1] <= h) n++;
+    while (n + 1 <= lim && T[n+1] <= h) n++;                         /* n = (first x with T[x] > h) - 1 */
     free(T);
     return n;
 }
@@ -275,6 +382,15 @@ static i64 hrange_exact(const i64 *a, int k, int h)
 /* ===================================================================================== */
 /*  Search state (one search at a time)                                                    */
 /* ===================================================================================== */
+/* Search parameters and options (written by main / run_search before the workers start, read-only afterwards):
+     H, K       stamps h and denominations k of the current search
+     D          split depth: a work item is an admissible prefix (a_2, ..., a_D)
+     VERB       -v verbosity (degenerate prefixes, per-thread times, full-check failure histogram)
+     PROG       progress interval in seconds (-p; 0 = off)
+     S2N        -s2: number of stage-2 deep holes (-1 = automatic, 0 = stages 2a/2c off)
+     NOFULL     -nofull: skip the full check (profiling only; nothing is ever reported)
+     S2CAP      -s2cap: upper limit of the automatic deep-hole count
+     (psph.c adds ITEM_LO / ITEM_HI / ITEM_END for its -i lo:hi option) */
 static int H, K, D, VERB = 0, PROG = 30, S2N = -1, NOFULL = 0, S2CAP = 64;
 static i64 TGT;
 static i64 LOW[MAXK + 2];           /* LOW[j]: a_j >= LOW[j]                                  */
@@ -283,25 +399,40 @@ static i64 NB_USER[MAXK + 2];       /* -b overrides                             
 static cnt_t *T1;                   /* shared table for A_1 = {1}: T1[x] = min(x,CNT_MAX)      */
 static int QUIET_SOL = 0;           /* selftest: do not print solutions                        */
 
+/* Work items: item.a[1..D] is an admissible prefix (a[1] = 1, entries beyond D are 0), 200 bytes each.
+   ITEMS[0..NITEMS) is filled once by gen_items in deterministic DFS order; workers claim indices with an atomic
+   fetch-add on NEXT_ITEM and count finished items in DONE_ITEMS (read by the progress loop). */
 typedef struct { i64 a[MAXK + 1]; } item_t;
 static item_t *ITEMS; static i64 NITEMS, ITEMCAP;
 static atomic_llong NEXT_ITEM, DONE_ITEMS;
 
+/* A reported basis: k entries a[0..k-1] (0-based here, a[0] = 1) and its exact h-range n.  SOLS grows by doubling;
+   all access goes through SOL_MX because any worker can report at any time. */
 typedef struct { int k; i64 n; i64 a[MAXK + 1]; } sol_t;
 static sol_t *SOLS; static int NSOLS, SOLCAP;
 static pthread_mutex_t SOL_MX = PTHREAD_MUTEX_INITIALIZER;
 
+/* Per-thread search context.  Every worker owns one, so the DFS needs no locking: the prefix being built, one
+   min-stamps table per level, the leaf scratch buffers, and statistics that are summed after the run.
+   Invariant while a node at level j is current: a[1..j] is the prefix, T[i] is the table of A_i and is valid
+   (exact, saturated) on 0..P[i] for i <= j, gap[i] is the first gap of A_i (0 = not yet known), and
+   valid[i] = 1 for i <= j; deeper levels (i > j) are stale (valid = 0) until node_enter fills them. */
 typedef struct {
     int id;
     cnt_t *T[MAXK + 1];             /* T[j]: min-stamps table of prefix A_j (T[1] shared)     */
     i64  P[MAXK + 1];               /* T[j] is valid for indices 0..P[j]                      */
     i64  a[MAXK + 1];
     i64  gap[MAXK + 1];             /* first gap of A_j = n_h(A_j)+1                          */
-    int  valid[MAXK + 1];
+    int  valid[MAXK + 1];           /* level j holds a current node (lets setup_item reuse shared levels)  */
     cnt_t *U0, *U1;                 /* block buffers for the full check                       */
-    i64 *hard; int *hardT; int nhard; /* stage-2 deep holes: y < a with the largest T[y]       */
+    i64 *hard; int *hardT; int nhard; /* stage-2 deep holes: y < a with the largest T[y] (512 slots; nhard unused) */
     i64 *reach;                     /* r[m] = n_m(A_{k-1}), m = 0..H                            */
-    /* statistics */
+    /* statistics: visited/nodes/pruned/degen per level = values a_j tried / admissible and kept / dropped by
+       LOW[j+1] / prefix already reaching TGT; cand = leaf candidates a_k; xpass = passed stage 1 (X test);
+       rpass = passed stage 2a (printed as "deephole-pass"); s2pass = passed stage 2c = full checks run;
+       fullfail = full checks that found a gap; direct = reach test proved coverage without a probe;
+       probes = table lookups in representability tests; fc_bytes / tab_bytes = cells (not bytes) processed by
+       full checks / added to leaf tables; fhist[d] = full-check failures d blocks of a_k below the top block. */
     u64 visited[MAXK + 1], nodes[MAXK + 1], pruned[MAXK + 1], degen[MAXK + 1];
     u64 cand, rpass, xpass, s2pass, fullfail, sols, direct, probes, fc_bytes, tab_bytes;
     u64 fhist[18];
@@ -310,7 +441,20 @@ typedef struct {
 
 static ctx_t *CTX;
 
-/* ----- DP kernel: out[i] = min(prev[i], sat(back[i]+1)), i < len; if check, return first i with out[i] > h */
+/*
+ * dp_chunk -- DP kernel: out[i] = min(prev[i], sat(back[i] + 1)) for 0 <= i < len.
+ *
+ * Purpose: one block of the recurrence "table of A_j = min(table of A_{j-1}, table of A_j shifted by a_j, + 1)".
+ *          In extend/find_gap prev points at T_{j-1} and back at T_j a_j positions earlier; in full_check prev
+ *          is the prefix table T_{k-1} and back is the previous block of u.  Callers keep len <= a_j (resp. a_k),
+ *          so back never overlaps out (restrict is valid) and every lane is independent; NEON handles VL
+ *          cells per step, a scalar loop handles the tail (and everything on non-ARM targets).
+ * Inputs:  out, prev, back  cell arrays of at least len entries (back must be final, i.e. computed earlier);
+ *          len  block length (>= 0);  h  the stamp limit;  check  nonzero to look for a gap.
+ * Outputs: writes out[0..len); returns the first i with out[i] > h if check is set and such an i exists,
+ *          else -1 (without check always -1).
+ * Errors:  none.  The gap search tracks a running vector max and rescans the block only when it exceeds h.
+ */
 static inline i64 dp_chunk(cnt_t *restrict out, const cnt_t *restrict prev, const cnt_t *restrict back, i64 len, int h, int check)
 {
     i64 i = 0; int any = 0;
@@ -339,7 +483,18 @@ static inline i64 dp_chunk(cnt_t *restrict out, const cnt_t *restrict prev, cons
     return -1;
 }
 
-/* extend T_j (no gap checking) so that indices 0..upto are valid */
+/*
+ * extend -- make the table T_j of the current prefix valid on 0..min(upto, TGT), without looking for gaps.
+ *
+ * Purpose: lazy table extension.  Level j is extended only as far as some descendant needs it (find_gap of
+ *          level j+1, or the leaf, which needs T_{k-1} up to E, past its first gap).  T_{j-1} is extended first
+ *          (recursively), then T_j[x] = T_{j-1}[x] for x < a_j, and blocks of a_j cells via dp_chunk above that.
+ *          Values beyond the first gap are still exact (saturated) stamp counts.
+ * Inputs:  c  worker context with level j current (a[j] set, T_j valid on 0..P[j]);  j  level (1..K-1);
+ *          upto  last index needed (clamped to TGT; the tables have TGT+1 cells).
+ * Outputs: T_j (and lower levels as needed) extended; P[j] updated.
+ * Errors:  none.  Level 1 is the shared table of {1}, precomputed to TGT, so it is never written.
+ */
 static void extend(ctx_t *c, int j, i64 upto)
 {
     if (upto > TGT) upto = TGT;
@@ -362,7 +517,18 @@ static void extend(ctx_t *c, int j, i64 upto)
     c->P[j] = upto;
 }
 
-/* extend T_j chunk by chunk up to `limit`; return the first x in (P_old, limit] with T_j[x] > H, or 0 */
+/*
+ * find_gap -- extend T_j chunk by chunk until its first gap; return the first x in (P_old, limit] with
+ *             T_j[x] > H, or 0 if there is none up to min(limit, TGT).
+ *
+ * Purpose: computes g_j = n_h(A_j) + 1 for a freshly entered node (P_old = 0, so the scan starts at x = 1).
+ *          Chunks are at most min(a_j, CHUNK) cells, so the work stops shortly after the gap instead of filling
+ *          the table to the limit.  Below a_j the table is a copy of T_{j-1} (and has no gap there when a_j is
+ *          admissible).
+ * Inputs:  c  context with level j just entered;  j  level (2..K-1);  limit  gap_limit(j, a_j).
+ * Outputs: returns the first gap, or 0 (no gap up to the limit); T_j and lower levels extended, P[j] updated.
+ * Errors:  none here; the caller turns 0 into "degenerate prefix" (limit reached TGT) or fatal_bound().
+ */
 static i64 find_gap(ctx_t *c, int j, i64 limit)
 {
     const i64 a = c->a[j];
@@ -388,13 +554,28 @@ static i64 find_gap(ctx_t *c, int j, i64 limit)
     return 0;
 }
 
+/*
+ * node_enter -- make value a the current a_j: reset level j's table to "valid on 0..0" and invalidate deeper levels.
+ *
+ * Inputs:  c  context;  j  level (2..K-1);  a  the new value of a_j.
+ * Outputs: c->a[j] = a, P[j] = 0, T_j[0] = 0, gap[j] = 0 (unknown), valid[j] = 1, valid[j+1..K] = 0.
+ * Errors:  none.
+ */
 static void node_enter(ctx_t *c, int j, i64 a)
 {
     c->a[j] = a; c->P[j] = 0; c->T[j][0] = 0; c->gap[j] = 0; c->valid[j] = 1;
     for (int t = j + 1; t <= K; t++) c->valid[t] = 0;
 }
 
-/* limit below which the first gap of A_j must lie */
+/*
+ * gap_limit -- the largest x at which the first gap of A_j (with a_j = a) can lie.
+ *
+ * Purpose: n_h(A_j) <= h * a_j always, and n_h(A_j) <= n_h(j) when the bound NB[j] is known, so the first gap is
+ *          at most min(h * a, NB[j]) + 1; capped at TGT because the tables stop there.
+ * Inputs:  j  level;  a  value of a_j.
+ * Outputs: the limit for find_gap.
+ * Errors:  none.
+ */
 static inline i64 gap_limit(int j, i64 a)
 {
     i64 lim = (i64)H * a;
@@ -404,6 +585,14 @@ static inline i64 gap_limit(int j, i64 a)
     return lim;
 }
 
+/*
+ * fatal_bound -- abort because a prefix has no gap below its bound, i.e. a "known" value n_h(j) is wrong.
+ *
+ * Inputs:  c  context holding the offending prefix a[1..j];  j  its level.
+ * Outputs: prints the prefix, the limit and the bound to stderr.
+ * Errors:  always exits with status 3 (never returns).  This keeps a wrong table value from silently
+ *          losing bases; rerun with -b j:<larger value> if the table is at fault.
+ */
 static void fatal_bound(ctx_t *c, int j)
 {
     fprintf(stderr, "\nFATAL: prefix A_%d = {", j);
@@ -414,6 +603,18 @@ static void fatal_bound(ctx_t *c, int j)
     exit(3);
 }
 
+/*
+ * report_solution -- record and print the basis "current prefix c->a[1..K-1] plus a_k = ak" (it passed the full check).
+ *
+ * Purpose: assembles the basis, recomputes its h-range from scratch with hrange_exact (independent of the search
+ *          tables), stores it in SOLS and prints a SOLUTION line.
+ * Inputs:  c  reporting worker's context (prefix and solution counter);  ak  the last element a_k.
+ * Outputs: appends to SOLS (under SOL_MX); prints "SOLUTION h=H k=K n_h=N : a1 ... ak" to stdout and flushes
+ *          (unless QUIET_SOL, used by the selftest); increments c->sols.
+ * Errors:  exits with status 4 if the independent DP gives n_h < TGT (the search and the verifier disagree,
+ *          which would mean a bug); exits 2 via hrange_exact on out of memory; a failed realloc of SOLS is not
+ *          checked.
+ */
 static void report_solution(ctx_t *c, i64 ak)
 {
     i64 A[MAXK + 1];
@@ -435,7 +636,13 @@ static void report_solution(ctx_t *c, i64 ak)
     if (n < TGT) { fprintf(stderr, "INTERNAL ERROR: reported basis has n_h=%lld < TGT=%lld\n", (long long)n, (long long)TGT); exit(4); }
 }
 
-/* max of n cells; first index of value v (v must occur) */
+/*
+ * vec_max_c -- maximum of the n cells p[0..n).
+ *
+ * Inputs:  p  cells;  n  count (n <= 0 gives 0).
+ * Outputs: the largest value (0 if n <= 0).
+ * Errors:  none.
+ */
 static inline int vec_max_c(const cnt_t *p, i64 n)
 {
     i64 i = 0; int m = 0;
@@ -447,6 +654,13 @@ static inline int vec_max_c(const cnt_t *p, i64 n)
     for (; i < n; i++) if (p[i] > m) m = p[i];
     return m;
 }
+/*
+ * vec_find_c -- index of the first cell equal to v in p[0..n).
+ *
+ * Inputs:  p  cells;  n  count;  v  value to find (callers pass the maximum found by vec_max_c, so it occurs).
+ * Outputs: the first index i with p[i] == v, or n if v does not occur.
+ * Errors:  none.
+ */
 static inline i64 vec_find_c(const cnt_t *p, i64 n, cnt_t v)
 {
     i64 i = 0;
@@ -458,17 +672,30 @@ static inline i64 vec_find_c(const cnt_t *p, i64 n, cnt_t v)
     return n;
 }
 
-/* Full check of 1..TGT for a_k = a.  Streaming block DP  u[x] = min(T[x], u[x-a]+1)  over the range
-   [0, E], E = min(TGT, h*a_{k-1}), with early exit at the first gap.  Beyond E every prefix value exceeds
-   h, so u[x] = u[x-a] + 1 there, i.e. u[x] = u[z] + j for the unique z in (E-a, E] with x = z + j*a; the
-   first gap above E is therefore  min_{z in (E-a, E]} ( z + (h+1-u[z])*a ),  computed in O(a).
-   Returns the first gap in [1, TGT], or 0 if there is none. */
+/*
+ * full_check -- exact test of 1..TGT for the full basis (current (k-1)-prefix plus a_k = a).
+ *
+ * Purpose: Streaming block DP  u[x] = min(T[x], u[x-a]+1)  over the range [0, E], E = min(TGT, h*a_{k-1}),
+ *          with early exit at the first gap.  Beyond E every prefix value exceeds h, so u[x] = u[x-a] + 1
+ *          there, i.e. u[x] = u[z] + j for the unique z in (E-a, E] with x = z + j*a; the first gap above E
+ *          is therefore  min_{z in (E-a, E]} ( z + (h+1-u[z])*a ),  computed in O(a).
+ *          Block 0 (x < a) is the prefix table itself (no copy of a fits there).  Each later block of length
+ *          a is computed from the prefix cells of the same positions and from the block before it, and is
+ *          written alternately into the per-thread buffers U0 / U1, so memory is O(a) rather than O(TGT).
+ * Inputs:  c  context whose level K-1 table T is valid on 0..E;  a  candidate a_k (a_{k-1} < a <= g_{k-1});
+ *          E  min(TGT, H * a_{k-1}).
+ * Outputs: Returns the first gap in [1, TGT], or 0 if there is none (then n_h(A_k) >= TGT); adds the number
+ *          of cells processed to c->fc_bytes.
+ * Errors:  none.  Needs a <= the U0/U1 length from ctx_init, which holds because a <= g_{k-1} <= n_h(k-1) + 1.
+ */
 static i64 full_check(ctx_t *c, i64 a, i64 E)
 {
     const cnt_t *T = c->T[K-1];
     const cnt_t *last = T; i64 start_last = 0, len_last = imin(a, E + 1);   /* block 0 = T[0..a) */
     const cnt_t *prev = NULL;
     cnt_t *cur = c->U0, *other = c->U1;
+    /* block [start, start+len): cur = min(prefix cells T[start..], last + 1); prev keeps the block before last,
+       because the closing window (E-a, E] can reach back into it */
     for (i64 start = a; start <= E; start += a) {
         i64 len = imin(a, E + 1 - start);
         i64 r = dp_chunk(cur, T + start, last, len, H, 1);
@@ -500,7 +727,19 @@ static i64 full_check(ctx_t *c, i64 a, i64 E)
     return best <= TGT ? best : 0;
 }
 
-/* representable(x) for the full basis with a_k = a, using the prefix table */
+/*
+ * leaf_rep -- is x a sum of at most H elements of the full basis (prefix plus a_k = a)?
+ *
+ * Purpose: x is representable iff for some number c of copies of a the prefix covers the remainder with at
+ *          most H - c stamps: T[x - c a] + c <= H.  c runs from min(x / a, H) down to
+ *          cmin = ceil((x - H a_{k-1}) / (a - a_{k-1})); smaller c cannot work because T[y] >= y / a_{k-1},
+ *          and every c >= cmin keeps the index x - c a <= H a_{k-1}, i.e. inside the valid table.
+ *          Trying many copies first tends to find a representation fastest.
+ * Inputs:  T  prefix table T_{k-1}, valid on 0..E;  x  number to test (1 <= x <= TGT);  a  candidate a_k;
+ *          ak1  a_{k-1};  probes  counter, incremented once per table lookup.
+ * Outputs: 1 if x is representable, else 0.
+ * Errors:  none (x <= TGT and c >= cmin keep every index within 0..E).
+ */
 static inline int leaf_rep(const cnt_t *T, i64 x, i64 a, i64 ak1, u64 *probes)
 {
     i64 Cx = x / a;                                   /* max copies of a */
@@ -514,8 +753,20 @@ static inline int leaf_rep(const cnt_t *T, i64 x, i64 a, i64 ak1, u64 *probes)
     return 0;
 }
 
-/* stage-2 deep-hole list: keep the NDH positions y (< current a) with the largest T[y], at most one per
-   residue class mod a_{k-1} (positions in the same class share their rescue structure) */
+/*
+ * deep_insert -- offer position y, with prefix cost t = T[y], to the stage-2 deep-hole list.
+ *
+ * Purpose: stage-2 deep-hole list: keep the NDH positions y (< current a) with the largest T[y], at most one per
+ *          residue class mod a_{k-1} (positions in the same class share their rescue structure).  Remainders that
+ *          are expensive for the prefix make x = (multiple of a) + y the numbers most likely to be unreachable,
+ *          so probing them rejects bad candidates cheaply.  Which holes are kept never affects exactness.
+ * Inputs:  dy, dT  positions and costs (capacity >= NDH);  nd  current size;  dmin  index of the cheapest entry;
+ *          NDH  capacity;  y, t  offered position and its cost;  ak1  a_{k-1}.
+ * Outputs: the list is updated: an entry of the same residue class is replaced if t is larger (otherwise y is
+ *          dropped); a new class is appended while there is room, else it replaces the cheapest entry if t is
+ *          larger; dmin is recomputed after a change.
+ * Errors:  none.  Cost O(nd) per call.
+ */
 static inline void deep_insert(i64 *dy, int *dT, int *nd, int *dmin, int NDH, i64 y, int t, i64 ak1)
 {
     i64 res = y % ak1;
@@ -530,12 +781,24 @@ static inline void deep_insert(i64 *dy, int *dT, int *nd, int *dmin, int NDH, i6
     *dmin = 0; for (int j = 1; j < *nd; j++) if (dT[j] < dT[*dmin]) *dmin = j;
 }
 
+/*
+ * leaf -- test every candidate a_k for the current (k-1)-prefix and report each basis with n_h >= TGT.
+ *
+ * Purpose: the inner loop of the search (file header, step 3).  Once per prefix: extend T_{k-1} to E, seed the
+ *          deep-hole list with the deepest remainders below lo, build the reach sequence r[m] = n_m(A_{k-1})
+ *          and the prefix part Z of the difficult target.  Then for each a in [lo, hi]: add y = a - 1 to the
+ *          hole list, and run stage 1 (X), stage 2a (holes in blocks C_k - 1 and C_k - 2), stage 2b (reach
+ *          point), stage 2c (holes in the top block, and TGT), the full check, and report.
+ * Inputs:  c  context holding a complete admissible prefix a[1..K-1] with gap[K-1] = g_{k-1}.
+ * Outputs: bases via report_solution; statistics and timings in c.
+ * Errors:  none of its own; report_solution can exit as documented there.
+ */
 static void leaf(ctx_t *c)
 {
     const int km1 = K - 1;
     const i64 ak1 = c->a[km1];
-    i64 lo = imax(ak1 + 1, LOW[K]);
-    i64 hi = imin(c->gap[km1], TGT);
+    i64 lo = imax(ak1 + 1, LOW[K]);                   /* a_k > a_{k-1} and a_k >= ceil(TGT/H) */
+    i64 hi = imin(c->gap[km1], TGT);                  /* admissibility: a_k <= g_{k-1} */
     if (lo > hi) return;
     double t0 = cpu_s();
     /* probes only ever touch y <= (h-c)*a_{k-1} <= h*a_{k-1}: the table is needed only up to E */
@@ -567,7 +830,8 @@ static void leaf(ctx_t *c)
         while (m <= H) { r[m] = g - 1; m++; }
     }
     double t1 = cpu_s(); c->t_tab += t1 - t0;
-    /* prefix part of the Challis difficult target */
+    /* prefix part of the Challis difficult target: Z = (a_2 - 1) + sum_{i=3..k-1} (floor(a_i/a_{i-1}) - 1) a_{i-1}.
+       By induction Z <= a_{k-1} - 1, which is what makes X < C_k a_k <= TGT below. */
     i64 Z = (K >= 3) ? c->a[2] - 1 : 0;
     for (int i = 3; i <= km1; i++) Z += (c->a[i] / c->a[i-1] - 1) * c->a[i-1];
     u64 probes = 0;
@@ -581,7 +845,7 @@ static void leaf(ctx_t *c)
         i64 Ck  = TGT / a;
         /* Stage 1: Challis difficult target X (c copies of a, c <= Ck-1 since X < Ck*a) */
         i64 Ck1 = a / ak1;
-        i64 X = (Ck - 1) * a + (Ck1 - 1) * ak1 + Z;
+        i64 X = (Ck - 1) * a + (Ck1 - 1) * ak1 + Z;  /* X <= Ck*a - 1 <= TGT - 1: unreachable X proves n_h < TGT */
         {
             i64 num = X - (i64)H * ak1, den = a - ak1;
             i64 cmin = num <= 0 ? 0 : (num + den - 1) / den;
@@ -593,7 +857,7 @@ static void leaf(ctx_t *c)
             if (!rep) continue;
         }
         c->xpass++;
-        /* Stage 2a: deep holes in the two blocks just below the top block */
+        /* Stage 2a: deep holes in the two blocks just below the top block (x < Ck*a <= TGT, so a miss is a proof) */
         {
             int ok = 1;
             for (int i = 0; i < nd && ok; i++) if (!leaf_rep(T, (Ck - 1) * a + dy[i], a, ak1, &probes)) ok = 0;
@@ -623,10 +887,10 @@ static void leaf(ctx_t *c)
         }
         c->s2pass++;
         if (NOFULL) continue;                         /* profiling only: never report */
-        i64 g = full_check(c, a, E);
+        i64 g = full_check(c, a, E);                  /* exact: first gap <= TGT, or 0 */
         if (g) {
             c->fullfail++;
-            i64 dist = Ck - g / a; if (dist > 17) dist = 17; if (dist < 0) dist = 0;
+            i64 dist = Ck - g / a; if (dist > 17) dist = 17; if (dist < 0) dist = 0;   /* blocks below the top block */
             c->fhist[dist]++;
             continue;
         }
@@ -636,7 +900,17 @@ static void leaf(ctx_t *c)
     c->t_cand += cpu_s() - t1;
 }
 
-/* enumerate a_j (j <= K-1) given valid A_{j-1} with gap[j-1]; recurse / leaf */
+/*
+ * dfs -- enumerate every admissible a_j below the current prefix A_{j-1}, then recurse (or run the leaf).
+ *
+ * Purpose: a_j runs over [max(a_{j-1} + 1, LOW[j]), g_{j-1}]: increasing elements, the TGT lower bound, and
+ *          admissibility.  For each value the first gap g_j is computed.  A prefix with no gap up to TGT reaches
+ *          TGT by itself (degenerate: counted and skipped); no gap below a smaller limit means a bound violation
+ *          (fatal_bound); g_j < LOW[j+1] means no admissible a_{j+1} can meet its lower bound (pruned).
+ * Inputs:  c  context with a valid prefix A_{j-1} (gap[j-1] known);  j  level to fill (D+1 .. K-1).
+ * Outputs: recursion; bases via leaf(); per-level statistics in c.
+ * Errors:  exits with status 3 via fatal_bound.
+ */
 static void dfs(ctx_t *c, int j)
 {
     i64 lo = imax(c->a[j-1] + 1, LOW[j]);
@@ -661,7 +935,18 @@ static void dfs(ctx_t *c, int j)
     }
 }
 
-/* ----- work items ----- */
+/* ----- work items -----
+   The tree is cut at depth D: gen_items enumerates the admissible prefixes (a_2..a_D) once, in the same order as
+   dfs would visit them, and workers then run dfs/leaf below each item.  The item list depends on H, K, D and TGT
+   (through LOW and the TGT caps); psph.c's -i option relies on this order, this snapshot always runs the whole list. */
+
+/*
+ * push_item -- append the current prefix a[1..D] of context c to the work list.
+ *
+ * Inputs:  c  context holding the prefix (used by gen_items on context 0).
+ * Outputs: ITEMS[NITEMS] = prefix, NITEMS++ (the array doubles when full).
+ * Errors:  exits with status 2 if the list cannot be grown.
+ */
 static void push_item(ctx_t *c)
 {
     if (NITEMS == ITEMCAP) { ITEMCAP = ITEMCAP ? 2*ITEMCAP : 1024; ITEMS = (item_t *)realloc(ITEMS, (size_t)ITEMCAP * sizeof(item_t)); if (!ITEMS) { fprintf(stderr, "out of memory\n"); exit(2); } }
@@ -669,6 +954,15 @@ static void push_item(ctx_t *c)
     NITEMS++;
 }
 
+/*
+ * gen_items -- enumerate the admissible prefixes down to depth D and push them as work items.
+ *
+ * Purpose: identical enumeration and pruning to dfs, but stops at level D.  Runs single-threaded at start-up on
+ *          context 0, so the item order is deterministic and reproducible across machines.
+ * Inputs:  c  context 0;  j  level to fill (starts at 2).
+ * Outputs: ITEMS / NITEMS; statistics of the levels <= D in c.
+ * Errors:  exits with status 3 via fatal_bound, status 2 via push_item.
+ */
 static void gen_items(ctx_t *c, int j)
 {
     i64 lo = imax(c->a[j-1] + 1, LOW[j]);
@@ -686,6 +980,17 @@ static void gen_items(ctx_t *c, int j)
     }
 }
 
+/*
+ * setup_item -- rebuild the context's prefix tables for work item it.
+ *
+ * Purpose: consecutive items usually share their first levels, so a level is re-entered only if it differs
+ *          from the value the context already holds (re-entering a level invalidates all deeper levels, so the
+ *          reuse test is safe in this top-down order); the first gap of each re-entered level is recomputed.
+ * Inputs:  c  worker context;  it  the item (a[2..D]).
+ * Outputs: c holds the prefix a[1..D] with valid tables and gaps.
+ * Errors:  exits with status 5 if the item does not reproduce (no gap, or gap < LOW[j+1]); impossible unless
+ *          the item list and this run disagree in H, K, TGT or bounds, or memory is corrupted.
+ */
 static void setup_item(ctx_t *c, const item_t *it)
 {
     for (int j = 2; j <= D; j++) {
@@ -697,6 +1002,14 @@ static void setup_item(ctx_t *c, const item_t *it)
     }
 }
 
+/*
+ * worker -- thread main: claim work items with an atomic counter and search below each of them.
+ *
+ * Inputs:  arg  this thread's ctx_t.
+ * Outputs: processes items until NEXT_ITEM passes NITEMS; updates DONE_ITEMS and the context statistics.
+ *          Returns NULL.
+ * Errors:  as setup_item / dfs / leaf.
+ */
 static void *worker(void *arg)
 {
     ctx_t *c = (ctx_t *)arg;
@@ -713,6 +1026,16 @@ static void *worker(void *arg)
     return NULL;
 }
 
+/*
+ * ctx_init -- allocate and initialise one worker context.
+ *
+ * Purpose: level 1 uses the shared table T1 of {1} (valid to TGT, first gap H + 1); levels 2..K-1 get their own
+ *          tables of TGT+1+PAD cells; the full-check buffers U0/U1 hold one block of length a_k, and a_k is at most
+ *          min(n_h(k-1) + 1, TGT) (TGT when n_h(k-1) is unknown); 512 deep-hole slots; H+2 reach entries.
+ * Inputs:  c  context to fill;  id  thread index.
+ * Outputs: initialised context.
+ * Errors:  exits with status 2 if any allocation fails.
+ */
 static void ctx_init(ctx_t *c, int id)
 {
     memset(c, 0, sizeof(*c));
@@ -733,12 +1056,24 @@ static void ctx_init(ctx_t *c, int id)
     if (!c->U0 || !c->U1 || !c->hard || !c->hardT || !c->reach) { fprintf(stderr, "out of memory (buffers)\n"); exit(2); }
 }
 
+/*
+ * ctx_free -- release the buffers of one context (T1, shared, is freed by run_search).
+ *
+ * Inputs: c.   Outputs: none.   Errors: none.
+ */
 static void ctx_free(ctx_t *c)
 {
     for (int j = 2; j <= K - 1; j++) free(c->T[j]);
     free(c->U0); free(c->U1); free(c->hard); free(c->hardT); free(c->reach);
 }
 
+/*
+ * fmt_time -- format a duration for progress lines: "12.3s" below 2 minutes, "45.6m" below 2 hours, else "3.21h".
+ *
+ * Inputs:  s  seconds;  buf, n  output buffer and its size.
+ * Outputs: NUL-terminated text in buf (truncated to n-1 characters by snprintf).
+ * Errors:  none.
+ */
 static void fmt_time(double s, char *buf, size_t n)
 {
     if (s < 120) snprintf(buf, n, "%.1fs", s);
@@ -749,6 +1084,7 @@ static void fmt_time(double s, char *buf, size_t n)
 /* ===================================================================================== */
 /*  Driver                                                                                  */
 /* ===================================================================================== */
+/* Statistics of the last run_search, summed over all threads; printed by print_stats. */
 typedef struct {
     double wall; u64 visited[MAXK + 1], nodes[MAXK + 1], pruned[MAXK + 1], degen[MAXK + 1];
     u64 cand, rpass, xpass, s2pass, fullfail, direct, probes, fc_bytes, tab_bytes; i64 nitems; int split;
@@ -756,6 +1092,23 @@ typedef struct {
 } stats_t;
 static stats_t ST;
 
+/*
+ * run_search -- run one complete search for all bases A_k with n_h(A_k) >= tgt.
+ *
+ * Purpose: validates the parameters, sets the bounds NB[j] (built-in or -b) and the lower bounds LOW[j],
+ *          prints the header lines, builds the shared table T1 of {1} and one context per thread, generates the
+ *          work items (automatic depth: the smallest D in 2..K-1 with >= 64 * nthr items, regenerating the list
+ *          for each D tried), runs nthr workers over ALL items while the calling thread prints progress, then sums
+ *          the statistics into ST and frees the tables and contexts (the solution and item arrays persist and are
+ *          reused by the next call).
+ * Inputs:  h, k, tgt  the search;  nthr  worker threads (1..256);  split  split depth D (0 = automatic,
+ *          otherwise clamped to 2..K-1).  Globals: NB_USER, PROG, S2N, S2CAP, NOFULL.
+ * Outputs: SOLS[0..NSOLS) = every basis found (also printed as SOLUTION lines); ST = statistics; stderr lines.
+ * Errors:  exits 1 if k is not in 2..MAXK, h not in 1..HMAX or tgt < 1; 2 on out of memory; 3 on a bound
+ *          violation.  calloc of the contexts and pthread_create
+ *          results are not checked.  Prints a WARNING (and continues) when tgt <= n_h(k-1), where the
+ *          admissibility prune is not exact.
+ */
 static void run_search(int h, int k, i64 tgt, int nthr, int split)
 {
     if (k < 2 || k > MAXK) { fprintf(stderr, "k must be in 2..%d\n", MAXK); exit(1); }
@@ -767,8 +1120,8 @@ static void run_search(int h, int k, i64 tgt, int nthr, int split)
     NSOLS = 0; NITEMS = 0;
 
     for (int j = 1; j <= K; j++) NB[j] = (NB_USER[j] >= 0) ? NB_USER[j] : known_n(H, j);
-    LOW[K] = (TGT + H - 1) / H;
-    for (int j = K - 1; j >= 2; j--) LOW[j] = imax(2, (LOW[j+1] - 1 + H - 1) / H);
+    LOW[K] = (TGT + H - 1) / H;                                         /* a_k >= ceil(TGT/H) */
+    for (int j = K - 1; j >= 2; j--) LOW[j] = imax(2, (LOW[j+1] - 1 + H - 1) / H);   /* a_j >= ceil((LOW[j+1]-1)/H) */
     LOW[1] = 1;
     if (K >= 3 && NB[K-1] >= 0 && TGT <= NB[K-1])
         fprintf(stderr, "WARNING: TGT=%lld <= n_%d(%d)=%lld: the admissibility prune is not exact in this degenerate regime\n",
@@ -791,7 +1144,8 @@ static void run_search(int h, int k, i64 tgt, int nthr, int split)
     CTX = (ctx_t *)calloc((size_t)nthr, sizeof(ctx_t));
     for (int i = 0; i < nthr; i++) ctx_init(&CTX[i], i);
 
-    /* work items */
+    /* work items (generated on context 0).  k = 2: the only prefix is {1}, so there is a single item at depth 1
+       and the leaf does all the work. */
     if (K == 2) { D = 1; NITEMS = 0; ctx_t *c = &CTX[0]; push_item(c); }
     else {
         int dmin = 2, dmax = K - 1;
@@ -805,7 +1159,7 @@ static void run_search(int h, int k, i64 tgt, int nthr, int split)
                 if (NITEMS >= (i64)64 * nthr || D >= dmax) break;
             }
         }
-        for (int j = 2; j <= K; j++) CTX[0].valid[j] = 0;
+        for (int j = 2; j <= K; j++) CTX[0].valid[j] = 0;   /* generation left levels in ctx 0: mark them stale */
     }
     double t_gen = now_s() - t_start; ST.t_gen = t_gen;
     fprintf(stderr, "[psph] split depth %d: %lld work items (generated in %.2fs)\n", D, (long long)NITEMS, t_gen);
@@ -814,7 +1168,9 @@ static void run_search(int h, int k, i64 tgt, int nthr, int split)
     pthread_t *th = (pthread_t *)malloc(sizeof(pthread_t) * (size_t)nthr);
     for (int i = 0; i < nthr; i++) pthread_create(&th[i], NULL, worker, &CTX[i]);
 
-    /* progress */
+    /* progress: the calling thread only polls (every 20 ms) and prints a line every PROG seconds; it leaves the loop
+       when every item has been finished.  "full checks" in the line counts candidates that reached the full check
+       (s2pass). */
     double last = now_s();
     for (;;) {
         long long done = atomic_load(&DONE_ITEMS);
@@ -848,6 +1204,17 @@ static void run_search(int h, int k, i64 tgt, int nthr, int split)
     free(T1); T1 = NULL;
 }
 
+/*
+ * print_stats -- print the statistics of the last run_search (ST) to stderr.
+ *
+ * Purpose: per-level node counts, leaf funnel (candidates, X-pass, deep-hole pass, full checks, failures, direct
+ *          coverage, solutions), probes, table/full-check cell counts, wall and CPU time, and the CPU split.
+ *          The line "worker CPU split: ..." only appears at the end of a finished run, so run_range.sh uses it
+ *          to mark a chunk complete.
+ * Inputs:  globals ST, H, K, TGT, NSOLS, VERB.
+ * Outputs: stderr only.
+ * Errors:  none.
+ */
 static void print_stats(void)
 {
     fprintf(stderr, "[psph] ---- statistics h=%d k=%d TGT=%lld ----\n", H, K, (long long)TGT);
@@ -875,6 +1242,9 @@ static void print_stats(void)
 
 /* ===================================================================================== */
 /*  Selftest                                                                                */
+/*  Each case "h k n : basis ; basis ..." lists the known extremal value n = n_h(k) and ALL its extremal bases.   */
+/*  The selftest runs every case twice: with TGT = n the search must report exactly the listed bases (as a set),  */
+/*  and with TGT = n + 1 it must report nothing.  "quick" runs SELFTEST_QUICK, "full" also SELFTEST_FULL.        */
 /* ===================================================================================== */
 static const char *SELFTEST_QUICK[] = {
     /* "h k n : basis ; basis ..."  -- all extremal bases from Challis-Robinson 2010 App. A */
@@ -923,6 +1293,13 @@ static const char *SELFTEST_FULL[] = {   /* slower cases (minutes each) */
     "7 8 1911 : 1 4 17 31 117 209 513 550 ; 1 6 20 41 109 228 509 580",
 };
 
+/*
+ * parse_case -- parse a selftest case string "h k n : b1 b2 ... bk ; b1 ... bk ; ...".
+ *
+ * Inputs:  s  the case string;  h, k, n, bases, nb  outputs (bases has room for 16 bases of MAXK entries).
+ * Outputs: returns 1 and fills h, k, n, bases[0..nb) on success; 0 if the string is malformed.
+ * Errors:  no check that a case lists at most 16 bases (the built-in cases list at most 5).
+ */
 static int parse_case(const char *s, int *h, int *k, i64 *n, i64 bases[][MAXK], int *nb)
 {
     const char *p = s; char *e;
@@ -939,6 +1316,14 @@ static int parse_case(const char *s, int *h, int *k, i64 *n, i64 bases[][MAXK], 
     }
 }
 
+/*
+ * cmp_sol, cmp_basis -- qsort comparators: lexicographic order of the basis elements.
+ *
+ * Inputs:  x, y  two sol_t (cmp_sol, compares the first k elements) or two rows of i64[MAXK] (cmp_basis, compares
+ *          all MAXK entries; unused entries are 0).
+ * Outputs: -1, 0 or 1.
+ * Errors:  none.
+ */
 static int cmp_sol(const void *x, const void *y)
 {
     const sol_t *a = (const sol_t *)x, *b = (const sol_t *)y;
@@ -952,6 +1337,19 @@ static int cmp_basis(const void *x, const void *y)
     return 0;
 }
 
+/*
+ * selftest -- verify the program against the published tables and formulas.
+ *
+ * Purpose: 1. formula checks: the k = 3 formula for h = 23..60 and the k = 4 formula families for h = 15..302
+ *             against hrange_exact and the column tables (a missing k = 4 row for h >= 55 is a failure);
+ *          2. table consistency: row tables against column tables for h = 2..7, k = 3..8;
+ *          3. search cases: each listed basis is first checked with hrange_exact; then the search with TGT = n
+ *             must return exactly the listed bases with n_h = n, and the search with TGT = n + 1 must return none.
+ * Inputs:  full  nonzero to add the slow cases (minutes each);  nthr  worker threads.
+ * Outputs: PASS/FAIL lines and a summary on stdout (solution lines and progress are suppressed meanwhile);
+ *          returns the number of failures (main exits 1 if it is not 0).
+ * Errors:  none of its own; a search inside can exit as documented for run_search.
+ */
 static int selftest(int full, int nthr)
 {
     int fails = 0, total = 0;
@@ -1024,6 +1422,11 @@ static int selftest(int full, int nthr)
 }
 
 /* ===================================================================================== */
+/*
+ * usage -- print the command-line summary to stderr.
+ *
+ * Inputs: none.   Outputs: stderr text.   Errors: none.
+ */
 static void usage(void)
 {
     fprintf(stderr,
@@ -1041,6 +1444,19 @@ static void usage(void)
         "  psph -table H K               print built-in bounds n_H(j), j < K\n");
 }
 
+/*
+ * main -- command-line entry point.
+ *
+ * Purpose: selects the mode from argv[1]: "-r" (exact h-range of one basis, with the known extremal value for
+ *          comparison), "-selftest" (optionally "full" and "-j N"), "-table" (built-in bounds), otherwise a search
+ *          with the options listed in usage().  Without -t the target defaults to the known value n_h(k) (listing mode).
+ * Inputs:  argc, argv.
+ * Outputs: exit status 0 on success (other codes: see the snapshot note at the top); results on stdout, the rest on
+ *          stderr.
+ * Errors:  returns 1 for unknown options, a missing h or k, a missing -t when no known value exists, a bad -b
+ *          argument, and (for -r) a basis that is too long, not increasing, or does not start with 1.  -r does not
+ *          check h (h > 65534 would be wrong, see hrange_exact).
+ */
 int main(int argc, char **argv)
 {
     int h = 0, k = 0, nthr = 10, split = 0;

@@ -3,6 +3,9 @@
 # 2964430 at 177915, 2964418 at 186943 -> index shift <= 19 between any two). Windows [B-24,B+24) at TGT 176381
 # (the largest enumeration) for every chunk boundary B = 100000*i cover every item that could fall through a
 # boundary whose lower chunk ran at a lower target than its upper chunk. See tools/collect_h27k6.py.
+#
+# Ran on mathg on Oct 3 2026 (started by switch_g.sh after bnd_h27k6.sh), 4 threads, 29/29 windows completed.
+# Resumable via w_i.done markers.  Output: logs/h27k6_bnd2/{progress.log, solutions.log, w_i.out, w_i.err, w_i.done}.
 cd ~/A001208/psph
 L=logs/h27k6_bnd2; mkdir -p $L
 for i in $(seq 1 29); do

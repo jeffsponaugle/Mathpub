@@ -5,24 +5,65 @@
  * setup, work units (c, e_0), per-block ranges of check bases B, the per-(c, B) constants and
  * lookup tables, the survivor post-processing (canonical bases, lengths n-2..3, checksum) and
  * the state-file format.  So a run of this tool and of a171775_2d are directly comparable
- * (identical statistics, same checkpoint files).
+ * (identical statistics, same checkpoint files).  Read the theory of operations there first;
+ * the kernel is a171775_2d.metal, and cuda/a171775_2d_cuda.cu is a port of this tool.
  *
- * A batch = consecutive units of one base c.  For each check base B the blocks of the batch
- * whose B-range contains B form one contiguous run; runs are cut into threadgroups of 256
- * blocks.  Two batch slots alternate: the host prepares one while the GPU runs the other.
+ * ========================================================================
+ * THEORY OF OPERATIONS (the GPU part)
+ * ========================================================================
+ *
+ * 1. Work.  A batch = consecutive units of one base c.  For each check base B the blocks of
+ *    the batch whose B-range contains B form contiguous runs (batch_blocks(), make_items());
+ *    runs are cut into threadgroups of 256 blocks.  One threadgroup = one base pair (c, B),
+ *    one thread = one block of the search, walked exactly like block_B() (see the kernel).
+ *
+ * 2. Tables.  Per base c the host builds the pairs' tables with cctx_set() and converts them
+ *    to the kernel's layout (slot_set_c(): PairC with 96-bit values as 32-bit limbs, the
+ *    base-B digits of the block weights, the magic multiplier for W div g); the kernel copies
+ *    its pair's tables into threadgroup memory (c <= 1024).
+ *
+ * 3. Pipeline.  Two batch slots alternate: the host prepares one while the GPU runs the
+ *    other, and batches finish in issue order.  So the statistics always cover exactly the
+ *    units below the oldest batch in flight, which is the frontier saved with -S: every
+ *    checkpoint is exact.
+ *
+ * 4. The display watchdog.  On a Mac the GPU also drives the display, and macOS kills a
+ *    command buffer that runs too long.  Batches are therefore sized for about 50 ms of GPU
+ *    time (g_target_steps adapts to the measured rate and shrinks quickly).  A failed
+ *    command buffer is redone with smaller batches (slot_retry(): nothing of it was
+ *    counted).  If macOS reports the process as "Ignored (for causing prior/excessive GPU
+ *    errors)", or after 8 failures in a row, the tool stops cleanly and saves its state; a
+ *    new process gets a new GPU context, so rerunning the same command resumes.
+ *
+ * 5. The kernel source is compiled at run time by the OS Metal compiler (no Xcode Metal
+ *    toolchain needed), from a171775_2d.metal next to the executable or the file given with
+ *    -L (a .metallib is loaded as is).  A171775_ABLATE=n compiles the kernel with ABLATE=n
+ *    (profiling switches that skip parts of the work); A171775_TIMING prints pipeline and
+ *    timing details.
+ *
+ * Limits: n = 8..14 (n + 2 <= MAXL_G digits, 1..3 block digits); c <= 1024; P, Ptop and the
+ * weights must fit in 96 bits; N <= 2^31 when g > 1; at most -b threadgroups per batch and
+ * 2^20 survivors.  Every violation stops the run with a message (exit status 1).
  *
  * Usage
  *   a171775_metal selftest                 n = 8, 9, 10 full searches vs a171775_2d statistics
- *   a171775_metal search n LO HI [-S state] [-i sec] [-L metallib]
+ *   a171775_metal search n LO HI [-S state] [-i sec] [-L metallib] [-b threadgroups] [-E end_unit]
+ * Exit status: 0 = done, 3 = interrupted (also when stopped by the GPU errors above), 1 =
+ * usage or a fatal error.
  */
 #define A171775_2D_LIB
 #include "../a171775_2d.c"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
-#define TGSIZE 256
-#define MAXL_G 16
+#define TGSIZE 256                     /* threads per threadgroup = blocks of the search per item */
+#define MAXL_G 16                      /* digit buffer size in the kernel: n + 2 <= MAXL_G */
+#define MAXC_G 1024                    /* largest c: the kernel's threadgroup tables hold 1024 entries */
 
+/* PairC, GItem, Surv, Params -- the kernel's structures (see a171775_2d.metal and the
+   identical ones in cuda/a171775_2d_cuda.cu): one pair's constants with 96-bit values as
+   32-bit limbs; one threadgroup's work (pair, first block index j0, block count, range-test
+   flag); one survivor (q1, rem, B, c, x, j); [lo, hi] as limbs, survivor capacity and n. */
 typedef struct {                       /* must match PairC in a171775_2d.metal */
     uint32_t B, k, N, g, Np, u, lim, R;
     uint32_t Wx, sh, nb, toff, boff, Lc, Lk, c;
@@ -39,6 +80,8 @@ typedef struct { uint32_t pair, j0, count, pad; } GItem;
 typedef struct { uint32_t q, r0, r1, r2, B, c, x, j; } Surv;
 typedef struct { uint32_t lo[4], hi[4]; uint32_t outcap, n, pad0, pad1; } Params;
 
+/* put96 -- v as three 32-bit limbs in d[0..2] (d[3] = 0); exits with status 1 if
+   v >= 2^96.  put64 -- v as two limbs (currently unused). */
 static void put96(uint32_t *d, u128 v, const char *what)
 {
     if (v >> 96) { fprintf(stderr, "%s does not fit in 96 bits\n", what); exit(1); }
@@ -47,6 +90,10 @@ static void put96(uint32_t *d, u128 v, const char *what)
 
 static void put64(uint32_t *d, u64 v) { d[0] = (uint32_t)v; d[1] = (uint32_t)(v >> 32); }
 
+/* Slot -- one of the two batch slots: its Metal buffers (items, the pair constants and
+   tables of its base c, survivors and their count, per-threadgroup statistics), the
+   command buffer in flight, the host tables (cctx_t) of base c, and the batch: items,
+   units [u_begin, u_end), steps, busy.  The buffers are shared CPU/GPU memory. */
 typedef struct {
     id<MTLBuffer> items, pairs, tvals, tys, tbst, outs, nout, tgstat, tay_lo, tay_hi, taz_lo, taz_hi;
     id<MTLCommandBuffer> cmd;
@@ -57,12 +104,22 @@ typedef struct {
     int busy;
 } Slot;
 
-static size_t MAXITEMS = 1 << 14;      /* threadgroups per batch */
-#define OUTCAP (1u << 20)
+static size_t MAXITEMS = 1 << 14;      /* threadgroups per batch (-b) */
+#define OUTCAP (1u << 20)              /* survivors per batch */
 
+/*
+ * slot_set_c -- make the slot ready for base c (nothing to do if it already is): build the
+ * host tables (cctx_set), allocate the slot's table buffers for this c, and convert every
+ * pair (c, B) to the kernel layout: PairC (96-bit limbs, the base-B digits of the block
+ * weights, the magic multiplier for W div g, spot-checked) and the packed lookup, bucket and
+ * digit-k tables.  Call only when the slot is idle.
+ * Errors: exits with status 1 if c > 1024 or n is too large for the kernel, a value does not
+ * fit in 96 bits, N > 2^31 with g > 1, or the magic division fails its check.
+ */
 static void slot_set_c(Slot *s, const prob_t *pr, id<MTLDevice> dev, u64 c)
 {
     if (s->c == c) return;
+    if (c > MAXC_G) { fprintf(stderr, "c = %llu too large for the GPU kernel (c <= %d)\n", (unsigned long long)c, MAXC_G); exit(1); }
     cctx_set(&s->cc, pr, c);
     s->c = c;
     const cctx_t *cc = &s->cc;
@@ -136,9 +193,16 @@ static void slot_set_c(Slot *s, const prob_t *pr, id<MTLDevice> dev, u64 c)
     }
 }
 
-/* blocks of units [u0, u1) (all of base c): per valid block its linear index and B range, as in do_block() */
+/* BlkR -- one block: linear index j among the blocks of base c, its check-base range
+   [Blo, Bhi], and whether it lies wholly inside [lo, hi]. */
 typedef struct { u64 j; u64 Blo, Bhi; int inside; } BlkR;
 
+/*
+ * batch_blocks -- the blocks of the units [u0, u1) of base c that do_unit()/do_block()
+ * would process, with their B ranges.
+ * Out:    the number written to out[]; *steps = their x-steps (the CPU tool's "steps").
+ * Errors: exits with status 1 if more than cap blocks ("block buffer overflow").
+ */
 static size_t batch_blocks(const prob_t *pr, const cctx_t *cc, u64 u0, u64 u1, BlkR *out, size_t cap, u64 *steps)
 {
     size_t nb_ = 0;
@@ -181,7 +245,8 @@ static size_t batch_blocks(const prob_t *pr, const cctx_t *cc, u64 u0, u64 u1, B
     return nb_;
 }
 
-/* runs of consecutive j with B in range, cut into threadgroups */
+/* make_items -- for each B, the runs of consecutive blocks whose range contains B, in
+   pieces of at most TGSIZE; returns the number of items, or (size_t)-1 if more than cap. */
 static size_t make_items(const cctx_t *cc, const BlkR *bl, size_t nbl, GItem *it, size_t cap)
 {
     size_t ni = 0;
@@ -213,15 +278,26 @@ static size_t make_items(const cctx_t *cc, const BlkR *bl, size_t nbl, GItem *it
     return ni;
 }
 
-static u64 g_target_steps = 1ull << 24;   /* thread-steps per command buffer, adapted to ~0.15 s */
+static u64 g_target_steps = 1ull << 24;   /* thread-steps per command buffer, adapted to ~50 ms */
 static double g_gpu_rate = 0;             /* measured thread-steps per GPU second */
-static double g_gpu_time, g_wait_time, g_prep_time, g_post_time, g_max_cmd;
+static double g_gpu_time, g_wait_time, g_prep_time, g_post_time, g_max_cmd;   /* A171775_TIMING */
 static u64 g_ncmd, g_nthreads, g_ntg;
 
-static u64 g_retries, g_overflow, g_consec_fail;
+static u64 g_retries, g_overflow, g_consec_fail;   /* g_overflow: left from the old queue design, always 0 */
 static int g_gpu_banned;                  /* macOS stopped accepting our command buffers */
 
 /* returns 0 if the GPU refused the command buffer (display watchdog); nothing is counted then */
+/*
+ * slot_finish -- wait for the slot's command buffer and account for its batch: adapt
+ * g_target_steps, rebuild each survivor M = q1 P + rem, re-check both palindromes on the
+ * host and call survivor(), add the threadgroups' lookups, hits and f1 and the batch's steps,
+ * and move done_units to the end of the batch.
+ * In:     s (busy); st; done_units; n.
+ * Out:    1 if the batch was accounted for; 0 if the command buffer failed: nothing is
+ *         counted, and g_gpu_banned is set if retrying cannot help (see the header).
+ * Errors: exits with status 1 on a survivor buffer overflow or a GPU survivor that fails
+ *         the host check (a kernel bug).
+ */
 static int slot_finish(Slot *s, wstat_t *st, u64 *done_units, int n)
 {
     double tw = now_sec();
@@ -279,6 +355,9 @@ static int slot_finish(Slot *s, wstat_t *st, u64 *done_units, int n)
 }
 
 /* the older slot failed: drop the newer slot's batch too, rewind, and shrink the batches */
+/* slot_retry -- In: the failed slot, the other slot, &unext.  Out: the other slot's batch is
+   waited for and dropped uncounted, unext rewinds to the failed batch's first unit, and the
+   batch size target drops by a factor 8 (at least 100000 steps).  No errors. */
 static void slot_retry(Slot *failed, Slot *other, u64 *unext)
 {
     if (other->busy) {
@@ -292,6 +371,23 @@ static void slot_retry(Slot *failed, Slot *other, u64 *unext)
 }
 
 
+/*
+ * gpu_search -- the "search" command (and the selftest's searches); the counterpart of
+ * run_search() in ../a171775_2d.c.
+ *
+ * In:     n (8..14); lo, hi; state (checkpoint file or NULL); interval (seconds between
+ *         progress lines); libpath (kernel source or .metallib); quiet; result (may be NULL).
+ * Out:    SOLUTION lines, progress, summary and checkpoints as run_search(); returns 0 when
+ *         complete (also without units), 3 if interrupted or stopped by GPU errors, 1 if
+ *         there is no Metal device, the kernel cannot be loaded, or n is not supported.
+ * How:    load and compile the kernel; then loop: finish the slot's previous batch (on a
+ *         failure: slot_retry and try again); build a batch of whole units of one base c
+ *         (at most g_target_steps steps and 4e6 threads); encode and commit it; switch
+ *         slots.  When nothing is left to issue, finish both slots, oldest first.
+ *         Checkpoints use the first unit of the oldest batch in flight, so they are exact.
+ * Errors: exits with status 1 on the limits of slot_set_c(), batch_blocks() and
+ *         make_items(); load_state() refuses a state file with a frontier beyond -E.
+ */
 static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interval, const char *libpath, int quiet,
                       wstat_t *result)
 {
@@ -370,7 +466,7 @@ static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interva
         int cur = 0;
         for (;;) {
             Slot *s = &sl[cur];
-            if (s->busy && !slot_finish(s, &st, &done_units, n)) {
+            if (s->busy && !slot_finish(s, &st, &done_units, n)) {   /* the older batch failed */
                 slot_retry(s, &sl[cur ^ 1], &unext);
                 continue;
             }
@@ -438,7 +534,7 @@ static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interva
                     slot_retry(&sl[cur], &sl[cur ^ 1], &unext);
                     ok = 0;
                 } else if (sl[cur ^ 1].busy && !slot_finish(&sl[cur ^ 1], &st, &done_units, n)) {
-                    unext = sl[cur ^ 1].u_begin;
+                    unext = sl[cur ^ 1].u_begin;   /* the newer one failed: redo it, smaller */
                     g_target_steps = g_target_steps / 8 > 100000 ? g_target_steps / 8 : 100000;
                     g_gpu_rate /= 8;
                     g_retries++;
@@ -458,9 +554,9 @@ static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interva
                 tlast = t;
             }
             if (state && (t - tsave >= 60 || drained)) {
-                wstat_t all = st;
+                wstat_t all = st;              /* the finished batches: exactly the units below fr */
                 add_stats(&all, &base);
-                u64 fr = done_units;
+                u64 fr = done_units;           /* = the first unit of the oldest batch in flight */
                 for (int i = 0; i < 2; i++) if (sl[i].busy && sl[i].u_begin < fr) fr = sl[i].u_begin;
                 save_state(state, &pr, fr, &all);
                 tsave = t;
@@ -486,6 +582,11 @@ static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interva
     }
 }
 
+/*
+ * metal_selftest -- complete searches over [1, a(n)] for n = 8, 9, 10 with the kernel from
+ * libpath: each must find exactly one solution, a(n), with all seven statistics of the CPU
+ * tool.  Returns 0 if all agree, 1 otherwise.  -E must not be given.
+ */
 static int metal_selftest(const char *libpath)
 {
     /* statistics of a171775_2d (CPU) for the same searches */
@@ -533,6 +634,9 @@ static int metal_selftest(const char *libpath)
     return bad ? 1 : 0;
 }
 
+/* main -- parse -S, -i, -L, -b, -E and the command (search needs n = 8..14).  The kernel
+   defaults to a171775_2d.metal in the executable's directory.  Unknown commands print the
+   usage and return 1. */
 int main(int argc, char **argv)
 {
     sol_out = stdout;
@@ -548,8 +652,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-E") && i + 1 < argc) g_end_unit = strtoull(argv[++i], NULL, 10);
         else if (npos < 8) pos[npos++] = argv[i];
     }
+    if (MAXITEMS < 1) MAXITEMS = 1;      /* -b 0 would allocate empty buffers */
     char deflib[4096];
-    if (!lib) {                          /* default: a171775_2d.metallib next to the executable */
+    if (!lib) {                          /* default: the kernel source a171775_2d.metal next to the executable */
         snprintf(deflib, sizeof deflib, "%s", argv[0]);
         char *slash = strrchr(deflib, '/');
         if (slash) snprintf(slash + 1, sizeof deflib - (size_t)(slash + 1 - deflib), "a171775_2d.metal");
