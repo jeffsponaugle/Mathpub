@@ -19,10 +19,13 @@
  *    pure-Python check of the same definition is tools/wilson_verify.py.
  *
  *    Arithmetic: for n < 2^32, n^2 < 2^64, so every residue fits in 64 bits and each step needs
- *    one 64x64->128-bit product and one remainder.  The cost is about n gcd computations plus
- *    phi(n) multiplications, i.e. linear in n: about 5 s for n = 3.4*10^8 on 8 threads of an
- *    M1 Pro.  (wilsonnum.c needs a few minutes for every n <= 2^32 together; this program is
- *    for checking individual numbers, or for scanning small ranges with -all.)
+ *    one 64x64->128-bit product and one remainder.  The final test of P(n) + e(n) == 0 (mod n^2)
+ *    compares the residue r = P(n) mod n^2 with n^2 - 1 (when e(n) = +1) or with 1 (when
+ *    e(n) = -1), so it involves no further arithmetic that could overflow.  The cost is about
+ *    n gcd computations plus phi(n) multiplications, i.e. linear in n: about 5 s for
+ *    n = 3.4*10^8 on 8 threads of an M1 Pro.  (wilsonnum.c needs a few minutes for every
+ *    n <= 2^32 together; this program is for checking individual numbers, or for scanning small
+ *    ranges with -all.)
  *
  *    Modes:
  *      single numbers   the range [1, n] is split into nt contiguous pieces; each thread
@@ -45,13 +48,6 @@
  *    - Not checked: n = 0 (division by zero); a thread count outside 1..256 (0 threads silently
  *      gives a wrong verdict, more than 256 overflows the thread arrays); -all with N >= 2^32
  *      (n^2 overflows) or without a value.
- *    - Verdict overflow for n > 3.04*10^9 (n^2 > 2^63): the verdict adds e(n) = -1 as n^2 - 1,
- *      and r + n^2 - 1 can then exceed 2^64 and wrap.  A true Wilson number is never affected
- *      (it has r = 1 when e(n) = -1, and r = n^2 - 1 when e(n) = +1, and neither sum wraps), but
- *      a non-Wilson n with P(n) == 1 + 2^64 (mod n^2), probability about 1/n^2, would be
- *      labelled "WILSON NUMBER".  The printed residue r is always exact (128-bit products), so
- *      for such n read the criterion from r directly: r = 1 with e(n) = -1, or r = n^2 - 1 with
- *      e(n) = +1.  All 17 new terms of 2026-10-04 printed r = 1 with e(n) = -1.
  *    - Numbers are read with strtoull, which stops at the first non-digit: "1e8" is read as 1,
  *      and a single argument "5 13" is read as 5 alone.  Pass each n as a separate plain decimal
  *      argument (in zsh an unquoted $VAR is not split into words; use ${=VAR}).
@@ -60,6 +56,15 @@
  * BUILD
  *
  *    cc -O2 -o wilsonnum_brute wilsonnum_brute.c -lpthread
+ *
+ * HISTORY
+ *
+ *    2026-10-04  First version; used to verify the 17 new terms of A157250 from the definition.
+ *    2026-10-12  Documentation.  The verdict now compares r with n^2 - 1 or 1 directly.  The old
+ *                test, (r + n^2 - 1) mod n^2 == 0 for e(n) = -1, could wrap past 2^64 once
+ *                n > 3.04*10^9 (n^2 > 2^63) and then report a false "WILSON NUMBER" with probability
+ *                about 1/n^2.  It could never reject a true Wilson number, and every term verified
+ *                on 2026-10-04 printed r = 1 with e(n) = -1, so those verifications stand.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,12 +129,11 @@ static u64 scanN; static volatile u64 next_n = 2; static pthread_mutex_t lk = PT
  * scan_worker -- thread body for -all: repeatedly claim the next block of 64 consecutive n (under
  * the mutex), test each n <= scanN from the definition in this thread, and print "WILSON n" for
  * every hit (under the mutex, so lines are not interleaved).  In: arg unused.  Out: NULL.
- * The condition is P(n) + e(n) == 0 mod n^2, with e(n) = -1 written as + (n^2 - 1); for N above
- * 3.04*10^9 that sum can wrap (see ERROR CONDITIONS).
+ * The condition P(n) + e(n) == 0 mod n^2 is tested as r == n^2 - 1 (e = +1) or r == 1 (e = -1).
  */
 static void *scan_worker(void *a) { (void)a; for (;;) { pthread_mutex_lock(&lk); u64 n = next_n; next_n += 64; pthread_mutex_unlock(&lk); if (n > scanN) break;
     for (u64 m = n; m < n + 64 && m <= scanN; m++) { u64 n2 = m * m, r = 1; for (u64 x = 1; x <= m; x++) if (gcd(x, m) == 1) r = (u64)(((u128)r * x) % n2);
-        int e = e_of(m); if ((r + (e > 0 ? 1 : n2 - 1)) % n2 == 0) { pthread_mutex_lock(&lk); printf("WILSON %llu\n", m); fflush(stdout); pthread_mutex_unlock(&lk); } } }
+        int e = e_of(m); if (e > 0 ? r == n2 - 1 : r == 1) { pthread_mutex_lock(&lk); printf("WILSON %llu\n", m); fflush(stdout); pthread_mutex_unlock(&lk); } } }
     return 0; }
 
 /*
@@ -140,9 +144,9 @@ int main(int argc, char **argv) {
     int nt = 8, a = 1; if (argc > 2 && !strcmp(argv[1], "-t")) { nt = atoi(argv[2]); a = 3; }
     if (a < argc && !strcmp(argv[a], "-all")) { scanN = strtoull(argv[a + 1], 0, 10); pthread_t th[256]; for (int t = 0; t < nt; t++) pthread_create(&th[t], 0, scan_worker, 0); for (int t = 0; t < nt; t++) pthread_join(th[t], 0); printf("DONE scan to %llu\n", scanN); return 0; }
     for (; a < argc; a++) { u64 n = strtoull(argv[a], 0, 10); if (n >= (1ULL << 32)) { fprintf(stderr, "n too large\n"); return 1; }
-        /* Wilson iff r + e(n) == 0 mod n^2; e(n) = -1 is added as n^2 - 1 to stay unsigned
-           (can wrap for n > 3.04*10^9; see ERROR CONDITIONS: trust r itself for such n) */
-        u64 r = P_mod_n2(n, nt); int e = e_of(n); u64 n2 = n * n; int ok = ((r + (e > 0 ? 1 : n2 - 1)) % n2) == 0;
+        /* Wilson iff P(n) + e(n) == 0 mod n^2, i.e. r == n^2 - 1 when e(n) = +1 and r == 1 when e(n) = -1
+           (r is in [0, n^2)).  Comparing r directly cannot overflow; see HISTORY for the old test. */
+        u64 r = P_mod_n2(n, nt); int e = e_of(n); u64 n2 = n * n; int ok = (e > 0) ? (r == n2 - 1) : (r == 1);
         printf("%llu  P(n) mod n^2 = %llu  e(n)=%+d  %s\n", n, r, e, ok ? "WILSON NUMBER" : "not a Wilson number"); fflush(stdout); }
     return 0;
 }
