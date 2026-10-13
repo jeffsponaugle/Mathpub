@@ -5082,9 +5082,9 @@ void printallres(int cores)  {
   
    int i,j;
    FILE* out;
-   /* [A157250 patch] binary output: for each prime p the pair (p, w_p) as two little-endian uint64,
-      where w_p = ((p-1)!+1)/p mod p is the Wilson quotient, written to wilsonres.bin.
-      The original text output (wilsonres.txt) is kept only if WILSON_TEXT is set. */
+   /* [A157250 patch, 2026-10-04] Binary output read by tools/wilsonnum.c: for each prime p, one 16-byte record { uint64 p; uint64 w; } (native little-endian) APPENDED to wilsonres.bin, where w = ((p-1)!+1)/p is the Wilson quotient, 1 <= w <= p (w == p only for a Wilson prime, i.e. (p-1)! == -1 mod p^2).
+      Called after each Stage-3 chunk when "print all residues" was answered with 1.  Errors: the assert aborts the run if r+1 is not divisible by p (a corrupt residue); fopen/fwrite failures are not checked; because the file is opened in append mode, rerunning pw13 in the same directory, or resuming after a crash between output and checkpoint, duplicates records (wilsonnum.c accepts duplicates but does not cross-check them).
+      The original text output (wilsonres.txt: p and (p-1)! mod p^2 per line) is written only if the environment variable WILSON_TEXT is set. */
    {
      static mpz_t wq; static int wq_init=0; unsigned long long buf[2];
      if(!wq_init){mpz_init(wq);wq_init=1;}
@@ -5093,7 +5093,7 @@ void printallres(int cores)  {
        for(j=0;j<numsol2[i];j++){
           mpz_add_ui(wq,saved_r2[i][j],1);
           assert(mpz_divisible_p(wq,saved_p2[i][j]));
-          mpz_divexact(wq,wq,saved_p2[i][j]);           /* = w_p, already < p since r < p^2 */
+          mpz_divexact(wq,wq,saved_p2[i][j]);           /* w = (r+1)/p, in [1, p] since 0 <= r < p^2 */
           buf[0]=mpz_get_ui(saved_p2[i][j]); buf[1]=mpz_get_ui(wq);
           fwrite(buf,sizeof(buf),1,out);
        }
