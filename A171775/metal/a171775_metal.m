@@ -549,7 +549,7 @@ static int gpu_search(int n, u128 lo, u128 hi, const char *state, double interva
                 u64 cc_ = unit_decode(&pr, done_units < pr.nunits ? done_units : pr.nunits - 1, pr_);
                 fprintf(stderr, "[%7.0fs] frontier %llu/%llu (c=%llu)  %.3e steps/s %.3e lookups/s  st2 %llu canon %llu sol %llu\n",
                         t - t0, (unsigned long long)done_units, (unsigned long long)pr.nunits, (unsigned long long)cc_,
-                        st.steps / (t - t0), st.lookups / (t - t0), (unsigned long long)(base.st2 + st.st2),
+                        st.steps / (t - t0 > 0 ? t - t0 : 1), st.lookups / (t - t0 > 0 ? t - t0 : 1), (unsigned long long)(base.st2 + st.st2),
                         (unsigned long long)(base.canon + st.canon), (unsigned long long)(base.sol + st.sol));
                 tlast = t;
             }

@@ -1,55 +1,29 @@
 /*
- * a252768.c
- *
- * Compute and extend OEIS A252768:
+ * a252768.c -- compute and extend OEIS A252768
+ * ============================================
  *
  *   "Primes p with property that the sum of the k-th powers of the successive
  *    gaps between primes <= p are prime numbers for k = 1 to n."
  *
- * Known terms (n = 1..7):  5, 5, 13, 14593, 372313, 2315773, 541613713.
+ * Terms: a(1..7) = 5, 5, 13, 14593, 372313, 2315773, 541613713 (OEIS, 2014);
+ *        a(8) = 7952072743 and a(9) = 21814967833 were found with this program
+ *        (Sep 16 2026, in the OEIS since Sep 17 2026); a(10) > 10^12.
  *
- * Definitions
+ * DEFINITIONS
  * -----------
  * Let 2 = q_1 < q_2 < ... < q_m = p be the primes up to p and g_i = q_(i+1) - q_i
- * their gaps.  Write S_k(p) = sum_i g_i^k.  The "depth" of p is the largest n
- * such that S_1(p), ..., S_n(p) are all prime, and a(n) is the smallest prime of
- * depth >= n.  Since S_1(p) = p - 2, every term is the larger member of a twin
- * prime pair (A006512), and a(n) is non-decreasing in n.
+ * their gaps (g_1 = 1, every other gap is even).  Write
+ *
+ *     S_k(p) = sum_i g_i^k             (k = 1, 2, ...).
+ *
+ * The DEPTH of p is the largest n such that S_1(p), ..., S_n(p) are all prime;
+ * a(n) is the smallest prime of depth >= n.  Since S_1(p) = p - 2, every term is
+ * the larger member of a twin prime pair (A006512), and a(n) is non-decreasing.
  *
  * Example: p = 13, gaps 1,2,2,4,2: S_1 = 11, S_2 = 29, S_3 = 89 are prime and
  * S_4 = 1+16+16+256+16 = 305 = 5*61 is not, so 13 has depth 3 and a(3) = 13.
  *
- * Method
- * ------
- * The search range is cut into chunks.  Worker threads take chunks from an
- * atomic counter, sieve them with primesieve and keep the gaps (one byte per
- * prime).  The gap histogram of a chunk gives its power-sum totals T_k, and an
- * ordered hand-off between the threads (chunk i waits until chunk i-1 has
- * published its totals) turns them into the running sums O_k at each chunk
- * start.  After that hand-off the chunks are checked fully in parallel, so the
- * range is sieved exactly once, memory stays bounded and no barrier is needed.
- *
- * Checking a chunk: S_1(p) = p - 2 is prime exactly when the gap into p is 2,
- * so only twin primes are examined.  S_2, S_3, S_4 are maintained incrementally
- * and tested in turn; S_5, S_6, ... are evaluated from the running gap
- * histogram (sum over g of count(g)*g^k) only for the rare p where S_2..S_4 are
- * all prime.  All sums are 128-bit with overflow detection.
- *
- * Primality: below 2^64 deterministic Miller-Rabin (bases 2, 325, 9375, 28178,
- * 450775, 9780504, 1795265022) in Montgomery arithmetic; above 2^64 Miller-
- * Rabin to the 24 prime bases 2..89 in 128-bit Montgomery arithmetic
- * (deterministic below 3.3e24, a strong probable-prime test beyond that).
- * When built with GMP, 'verify' cross-checks each sum with mpz_probab_prime_p.
- *
- * Congruences: g^k mod q depends only on k mod (q-1), so S_k = S_k' (mod q)
- * whenever k = k' (mod q-1).  Once S_1 and S_2 are prime, no S_k is divisible
- * by 3, S_5 = S_1 and S_6 = S_2 (mod 5), S_7 = S_1 (mod 7), and so on.  The
- * conditions are therefore positively correlated; the density of primes of
- * depth >= n falls off roughly like prod_k 2 c_k / ln S_k(p) with
- * S_k(p) ~ k! p (ln p)^(k-1).  Calibrated on a(4..7) this predicts a(8) in
- * the 10^10..10^12 range and a(9) below about 10^13.
- *
- * Usage
+ * USAGE
  * -----
  *   a252768 scan [START] END [-t T] [-c CHUNK] [-k KMAX] [-r DEPTH] [-S STATE] [-i SECS] [-q]
  *       Exhaustive scan of the primes in [START, END] (START defaults to 0; with
@@ -64,9 +38,124 @@
  *   a252768 selftest [-t T]
  *
  * Numbers may be written as decimal, 2^k, 10^k, 1e12, or X+Y / X-Y of those.
+ * Results go to stdout (one line per hit, then a summary), progress and
+ * diagnostics to stderr.  Exit status: 0 success, 1 fatal error, 2 usage error.
  *
  * Build:  cc -O2 -std=gnu11 -pthread -I/opt/homebrew/include a252768.c \
  *            -L/opt/homebrew/lib -lprimesieve -lm [-DHAVE_GMP -lgmp] -o a252768
+ *
+ * THEORY OF OPERATION
+ * -------------------
+ *
+ * 1. What is tracked.  The scan keeps S_k for k = 1..KMAX (default 12, at most
+ *    KLIM = 16) as unsigned 128-bit integers.  S_1(p) = p - 2 exactly, which
+ *    gives both the cheapest possible first filter (p can only qualify if the
+ *    gap into p is 2) and a built-in consistency check of the bookkeeping
+ *    (check_chunk verifies the published S_1 against the actual previous prime).
+ *
+ * 2. Making a sequential sum parallel.  S_k(p) depends on every gap below p, so
+ *    the obvious loop "for each prime: add the powers of its gap, test" is one
+ *    long sequential pass.  The tool cuts [start, end] into chunks of `chunk`
+ *    integers; chunk i covers [start + i*chunk, start + (i+1)*chunk).  Every
+ *    prime q except 2 has exactly one INCOMING gap q - prevprime(q), and that gap
+ *    is attributed to the chunk that contains q.  Consequently the chunk total
+ *    T_k(i) = sum of g^k over the incoming gaps of chunk i depends on the chunk
+ *    alone, and the running sum at the start of chunk i is the prefix sum
+ *    O_k(i) = O_k(0) + T_k(0) + ... + T_k(i-1), where O_k(0) is the sum at `start`
+ *    (0 for a scan from 0, otherwise taken from a checkpoint or a totals pass).
+ *
+ *    Each worker thread (worker_main) repeats three steps per chunk:
+ *      a) SIEVE (sieve_chunk): primesieve enumerates the primes of the chunk,
+ *         plus the prime just below it, which is found by starting MARGIN below
+ *         lo.  The incoming gaps are stored one byte each (gap/2, with an escape
+ *         for the gap 1 and gaps >= 510) and counted in a histogram cnt[g], from
+ *         which T_k(i) = sum_g cnt[g]*g^k is formed (chunk_totals).
+ *      b) HAND-OFF: under the scan mutex the worker waits until sc->pub == i,
+ *         i.e. until sc->O holds O_k(i).  That happens as soon as chunk i-1 has
+ *         finished its own SIEVE (not its check), so the wait is short.  The
+ *         worker copies O_k(i), adds its totals so that sc->O becomes O_k(i+1),
+ *         records O_k(i) in the ring slot of chunk i for checkpoints, sets
+ *         pub = i+1 and wakes the other threads.  Chunk indices come from an
+ *         atomic counter in increasing order and nobody blocks while sieving,
+ *         so the chain always advances: no deadlock, no barrier.
+ *      c) CHECK (check_chunk): with O_k(i) known, the worker walks its stored
+ *         gaps once more, now knowing the exact S_k at every prime of the chunk,
+ *         and tests the candidates.  This needs no synchronisation, so the
+ *         expensive part runs fully in parallel.
+ *    The range is sieved exactly once and memory is one chunk of gap bytes per
+ *    thread (about 40 MB at chunk = 10^9).
+ *
+ * 3. Bookkeeping ring and completion frontier.  sc->cf is the lowest chunk
+ *    index whose check has not finished; everything below it is provably done,
+ *    so checkpoints are written at cf and "a(n) > X" claims refer to it.  A ring
+ *    of RING slots indexed by chunk mod RING holds each chunk's done flag and
+ *    its O_k(i) record.  A worker may not take chunk i before i < cf + RING, so
+ *    a slot is never reused while its chunk is live.  A stale record is
+ *    recognised by its idx field.
+ *
+ * 4. Testing a prime (check_chunk).  Only primes whose incoming gap is 2 are
+ *    tested (S_1 = p - 2 prime).  S_2, S_3, S_4 are maintained incrementally
+ *    from the power tables PW[k][g] (three 128-bit adds per prime) and tested in
+ *    turn; most candidates fail at S_2.  For the roughly 1 in 10^5 primes with
+ *    S_2..S_4 all prime, S_5, S_6, ... are evaluated on demand as
+ *    O_k(i) + sum_g hist[g]*g^k from a running histogram of the chunk's gaps so
+ *    far: a few hundred multiply-adds, instead of KMAX adds at every prime.
+ *    Per chunk the worker records the number of primes of each exact depth, the
+ *    smallest prime of each depth, and every hit of depth >= report; these are
+ *    merged into the shared results when the chunk completes.
+ *
+ * 5. Arithmetic limits.  All sums are unsigned __int128 and every addition and
+ *    multiplication is checked with __builtin_*_overflow.  If a chunk total or
+ *    a running sum for some k would exceed 2^128, that k is marked overflowed
+ *    for the rest of the scan (sticky, position in ovf_at[k]); check_chunk then
+ *    stops at k-1 and prints "[S_k exceeds 2^128, not tested]" on hits that get
+ *    that far.  The power tables carry their own overflow flags (PWOVF).  Gaps
+ *    must be < MAXG = 4096; the largest gap below 2^64 is 1550.
+ *
+ * 6. Primality (is_prime128).  Below 2^64: trial division by the primes up to
+ *    47 through two 32-bit remainders, then Miller-Rabin in Montgomery
+ *    arithmetic to the bases {2, 325, 9375, 28178, 450775, 9780504,
+ *    1795265022}, deterministic for every n < 2^64.  From 2^64 on: trial
+ *    division by the primes up to 97, then 128-bit Montgomery Miller-Rabin to
+ *    the 24 prime bases 2..89; the first 13 are deterministic below 3.3e24
+ *    (Sorenson-Webster), beyond that the verdict is a strong probable-prime
+ *    test.  The verify command shows GMP's mpz_probab_prime_p beside it.
+ *
+ * 7. Checkpoints (state_t).  A plain-text state file holds the position lo
+ *    (first integer not yet scanned), the running sums O_k at lo, the prime
+ *    count below lo and the smallest prime of every depth found below lo.  The
+ *    monitor loop in scan_run writes it atomically (temp file + rename) every
+ *    ckpt_secs and once more after the workers stop.  SIGINT/SIGTERM only stop
+ *    the workers from taking new chunks, so chunks in flight complete and the
+ *    final checkpoint is exact.  Resuming reads the file back as O_k(0).
+ *
+ * 8. Concurrency map.  sc->next (atomic) hands out chunk indices; sc->finished
+ *    (atomic) counts exited workers.  sc->mu + sc->cv protect pub, O, Oovf,
+ *    primes_pub, cf, done[], rec[] and the merged results.  out_mu serialises
+ *    stdout/stderr so hit lines, notes and the status line do not interleave.
+ *    The power tables and the configuration globals are written before the
+ *    threads start and read-only afterwards.  Each worker owns its primesieve
+ *    iterator, chunk buffers, histogram and per-chunk result fields.
+ *
+ * 9. Errors.  Anything that would make the results untrustworthy -- bad
+ *    arguments, allocation failure, a primesieve error, an inconsistent S_1
+ *    offset, a gap >= MAXG, an unreadable state file -- calls die(), which
+ *    prints "a252768: <message>" and exits with status 1.  A checkpoint that
+ *    cannot be written is reported with note() and the scan goes on.
+ *    Primality code is validated by the selftest against GMP and a list of
+ *    strong pseudoprimes.
+ *
+ * SOURCE MAP
+ * ----------
+ *   generic helpers ....... timing, fatal errors, allocation, 128-bit printing, number parsing
+ *   power tables .......... PW[k][g] = g^k with overflow flags
+ *   primality ............. 64-bit and 128-bit Montgomery Miller-Rabin, optional GMP bridge
+ *   chunks ................ chunk_t, chunk_push, sieve_chunk, chunk_totals
+ *   scan state ............ worker_t, struct scan, report_hit, check_chunk, worker_main
+ *   checkpoints ........... state_t, write_state, read_state, checkpoint
+ *   running a scan ........ print_status, scan_run (threads + monitor), result helpers
+ *   direct computation .... direct_hist, sums_from_hist (used by verify and selftest)
+ *   commands .............. usage, cmd_scan, cmd_verify, cmd_selftest, main
  */
 
 #include <stdio.h>
@@ -94,25 +183,32 @@ typedef uint32_t u32;
 typedef uint8_t  u8;
 typedef unsigned __int128 u128;
 
-#define KLIM    16      /* largest k the power tables support */
-#define MAXG    4096    /* every prime gap must be < MAXG (largest gap below 2^64 is 1550) */
-#define MARGIN  4096    /* sieve this far below a chunk to find the preceding prime */
-#define RING    4096    /* chunk bookkeeping ring; bounds how far threads may run ahead */
-#define NKNOWN  7
+#define KLIM    16      /* largest k the power tables support (-k may not exceed it) */
+#define MAXG    4096    /* every prime gap must be < MAXG (the largest gap below 2^64 is 1550) */
+#define MARGIN  4096    /* sieve this far below a chunk to find the prime preceding it */
+#define RING    4096    /* chunk bookkeeping ring; bounds how far threads may run ahead of cf */
+#define NKNOWN  7       /* terms listed in the OEIS entry before this work */
 
+/* a(1..7) from the OEIS; the selftest and the summary compare against these */
 static const u64 KNOWN[NKNOWN + 1] = { 0, 5, 5, 13, 14593, 372313, 2315773, 541613713 };
 
-static int  g_kmax   = 12;
-static int  g_report = 7;
-static bool g_quiet  = false;
-static bool stderr_tty;
-static volatile sig_atomic_t g_stop = 0;
-static pthread_mutex_t out_mu = PTHREAD_MUTEX_INITIALIZER;
+/* configuration, set from the command line before any thread starts */
+static int  g_kmax   = 12;          /* highest k tested (-k) */
+static int  g_report = 7;           /* print/record primes of depth >= this (-r) */
+static bool g_quiet  = false;       /* -q: no status line */
+static bool stderr_tty;             /* stderr is a terminal: use \r-rewritten status lines */
+static volatile sig_atomic_t g_stop = 0;   /* set by SIGINT/SIGTERM: workers take no new chunks */
+static pthread_mutex_t out_mu = PTHREAD_MUTEX_INITIALIZER;   /* serialises stdout/stderr output */
 
 /* ------------------------------------------------------------------ */
 /* Generic helpers                                                     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * now -- monotonic clock for timings, rates and the ETA.
+ * Returns: seconds (double) since an arbitrary fixed point; unaffected by clock changes.
+ * Errors: none (clock_gettime cannot fail for CLOCK_MONOTONIC).
+ */
 static double now(void)
 {
     struct timespec ts;
@@ -120,6 +216,14 @@ static double now(void)
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/*
+ * die -- report a fatal error and exit.
+ * Inputs:  printf-style format and arguments describing the problem.
+ * Effect:  prints "a252768: <message>" on stderr (first erasing a live status line
+ *          when stderr is a terminal) and calls exit(1).  Never returns.  Used for
+ *          every condition after which the results could not be trusted; there is
+ *          deliberately no recovery path.
+ */
 __attribute__((noreturn)) static void die(const char *fmt, ...)
 {
     va_list ap;
@@ -131,6 +235,13 @@ __attribute__((noreturn)) static void die(const char *fmt, ...)
     exit(1);
 }
 
+/*
+ * note -- print one diagnostic line on stderr without garbling the status line.
+ * Inputs:  printf-style format and arguments.
+ * Effect:  takes out_mu, erases the status line if stderr is a terminal, prints the
+ *          message plus newline.  Thread-safe; may be called from workers.
+ * Errors:  none.
+ */
 static void note(const char *fmt, ...)
 {
     va_list ap;
@@ -143,6 +254,13 @@ static void note(const char *fmt, ...)
     va_end(ap);
 }
 
+/*
+ * xmalloc / xcalloc / xrealloc -- allocation that cannot fail silently.
+ * Inputs:  as malloc / calloc / realloc.  A zero size is rounded up to one byte so
+ *          that the result is never NULL.
+ * Returns: the new block.
+ * Errors:  out of memory is fatal (die).
+ */
 static void *xmalloc(size_t n)
 {
     void *p = malloc(n ? n : 1);
@@ -164,7 +282,12 @@ static void *xrealloc(void *p, size_t n)
     return p;
 }
 
-/* decimal string of a 128-bit value; buf must hold >= 40 chars */
+/*
+ * u128_str -- decimal rendering of a 128-bit value (printf has no u128 conversion).
+ * Inputs:  v; buf with room for at least 40 characters (2^128 has 39 digits).
+ * Returns: buf, NUL-terminated.
+ * Errors:  none.
+ */
 static char *u128_str(u128 v, char *buf)
 {
     char tmp[48];
@@ -176,6 +299,9 @@ static char *u128_str(u128 v, char *buf)
     return buf;
 }
 
+/*
+ * bitlen128 -- number of significant bits of v (0 for v == 0); used in the verify output.
+ */
 static int bitlen128(u128 v)
 {
     u64 hi = (u64)(v >> 64), lo = (u64)v;
@@ -183,6 +309,11 @@ static int bitlen128(u128 v)
     return lo ? 64 - __builtin_clzll(lo) : 0;
 }
 
+/*
+ * parse_dec -- parse exactly len decimal digits of s into *out.
+ * Returns: true on success; false for an empty string, a non-digit, or a value that
+ *          does not fit in 128 bits.  *out is untouched on failure.
+ */
 static bool parse_dec(const char *s, size_t len, u128 *out)
 {
     u128 r = 0;
@@ -197,7 +328,16 @@ static bool parse_dec(const char *s, size_t len, u128 *out)
     return true;
 }
 
-/* accepts "123", "2^64", "10^12", "1e15", and X+Y / X-Y of those ("2^54-32") */
+/*
+ * parse_u128 -- parse the number syntax accepted on the command line.
+ * Accepts: plain decimal ("123"), a power ("2^64", "10^12"), a decimal mantissa with
+ *          exponent ("1e15", "25e9"), and X+Y or X-Y of any of those ("2^54-32").
+ *          The sum/difference form is handled first by splitting at the first + or -
+ *          that is not the leading character and parsing both halves recursively.
+ * Inputs:  s (NUL-terminated), out.
+ * Returns: true and *out on success; false on any syntax error, an exponent beyond
+ *          400 (power) or 40 (e-notation), or a result outside 0..2^128-1.
+ */
 static bool parse_u128(const char *s, u128 *out)
 {
     const char *pm = strpbrk(s, "+-");
@@ -240,6 +380,11 @@ static bool parse_u128(const char *s, u128 *out)
     return parse_dec(s, strlen(s), out);
 }
 
+/*
+ * arg_u64 -- parse_u128 restricted to 64 bits for command-line arguments.
+ * Inputs:  s, and `what` (e.g. "chunk size") for the error message.
+ * Returns: the value.  Errors: fatal (die) with a message naming `what`.
+ */
 static u64 arg_u64(const char *s, const char *what)
 {
     u128 v;
@@ -247,6 +392,10 @@ static u64 arg_u64(const char *s, const char *what)
     return (u64)v;
 }
 
+/*
+ * arg_int -- parse a plain decimal integer argument and check it lies in [lo, hi].
+ * Returns: the value.  Errors: fatal (die) on junk, empty input or an out-of-range value.
+ */
 static int arg_int(const char *s, const char *what, int lo, int hi)
 {
     char *end;
@@ -255,6 +404,10 @@ static int arg_int(const char *s, const char *what, int lo, int hi)
     return (int)v;
 }
 
+/*
+ * fmt_eng -- format a count for the status line: plain below 10^6, otherwise three
+ * significant digits in exponent notation ("4.52e+11").  buf needs 32 bytes.  Returns buf.
+ */
 static const char *fmt_eng(double v, char *buf)
 {
     if (v < 1e6) sprintf(buf, "%.0f", v);
@@ -262,6 +415,10 @@ static const char *fmt_eng(double v, char *buf)
     return buf;
 }
 
+/*
+ * fmt_hms -- format a duration in seconds as HH:MM:SS, or as "DdHHh" from 100 hours on.
+ * Negative or NaN input prints as zero.  buf needs 32 bytes.  Returns buf.
+ */
 static const char *fmt_hms(double s, char *buf)
 {
     long t = s > 0 ? (long)(s + 0.5) : 0;
@@ -274,9 +431,20 @@ static const char *fmt_hms(double s, char *buf)
 /* Power tables: PW[k][g] = g^k (PWOVF set where g^k >= 2^128)         */
 /* ------------------------------------------------------------------ */
 
+/*
+ * The scan never computes a power at run time: every g^k it needs is looked up here.
+ * Rows 2..4 (the incrementally maintained sums) are the hot ones, about 10 KB each
+ * for the gap sizes that actually occur.  Entries that do not fit in 128 bits are 0
+ * with the matching PWOVF flag set; the summing code treats such an entry as an
+ * overflow of the whole sum.
+ */
 static u128 PW[KLIM + 1][MAXG];
 static u8   PWOVF[KLIM + 1][MAXG];
 
+/*
+ * init_pow_tables -- fill PW and PWOVF for 0 <= k <= KLIM and 0 <= g < MAXG.
+ * Must be called once, before any scan (main does it).  No inputs, no errors.
+ */
 static void init_pow_tables(void)
 {
     for (unsigned g = 0; g < MAXG; g++) {
@@ -297,12 +465,31 @@ static void init_pow_tables(void)
 /* Primality: Montgomery Miller-Rabin, 64-bit deterministic            */
 /* ------------------------------------------------------------------ */
 
+/* trial-division primes: all of them for the 128-bit path, the first 15 (<= 47) for 64-bit */
 static const u32 SMALLP[] = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47,
                               53, 59, 61, 67, 71, 73, 79, 83, 89, 97 };
 #define NSMALLP ((int)(sizeof SMALLP / sizeof SMALLP[0]))
 
+/*
+ * Montgomery arithmetic modulo an odd n with R = 2^64.  A value x is represented as
+ * x*R mod n; the product of two representations, reduced by REDC, is again a
+ * representation.  This turns every modular multiplication into two 64x64->128
+ * multiplies and a shift instead of a 128-by-64 division, which has no hardware
+ * instruction on ARM and is 10x slower.
+ *   n    the modulus (odd, >= 3)
+ *   ninv -n^-1 mod 2^64
+ *   one  the representation of 1, i.e. 2^64 mod n
+ */
 typedef struct { u64 n, ninv, one; } mont64;
 
+/*
+ * m64_init -- prepare Montgomery constants for the odd modulus n.
+ * Inputs:  m (output), n odd and >= 3.
+ * Effect:  ninv by Newton iteration (x <- x(2 - n x) doubles the correct bits each
+ *          round: n is its own inverse mod 8, so 6 rounds give 192 > 64 bits); one =
+ *          2^64 mod n computed as (2^64 - n) mod n in 64-bit arithmetic.
+ * Errors:  none (an even n would silently give nonsense; callers reject even n first).
+ */
 static inline void m64_init(mont64 *m, u64 n)
 {
     u64 x = n;                              /* Newton iteration: n^-1 mod 2^64, n odd */
@@ -312,6 +499,15 @@ static inline void m64_init(mont64 *m, u64 n)
     m->one = ((u64)0 - n) % n;              /* 2^64 mod n */
 }
 
+/*
+ * m64_redc -- Montgomery reduction: returns T * 2^-64 mod n.
+ * Inputs:  m; T < n * 2^64 (true for any product of two values below n).
+ * Method:  mm = T * ninv mod 2^64 makes T + mm*n divisible by 2^64, so the result is
+ *          (T + mm*n) >> 64.  The low halves of T and mm*n add up to exactly 0 or
+ *          2^64, hence the carry into the high half is 1 iff (u64)T != 0.  The sum
+ *          of the high halves is < 2n, so one conditional subtraction finishes.
+ * Returns: a value in [0, n).  Errors: none.
+ */
 static inline u64 m64_redc(const mont64 *m, u128 T)   /* T < n * 2^64 */
 {
     u64 mm = (u64)T * m->ninv;
@@ -321,6 +517,12 @@ static inline u64 m64_redc(const mont64 *m, u128 T)   /* T < n * 2^64 */
     return (u64)s;
 }
 
+/*
+ * m64_mul -- product of two Montgomery representations a, b < n (result in [0, n)).
+ * m64_add -- modular sum of a, b < n; the carry check handles n close to 2^64.
+ * m64_to  -- convert an ordinary residue x < n to Montgomery form (x * 2^64 mod n); uses
+ *            a 128-by-64 division, so it is only called a handful of times per test.
+ */
 static inline u64 m64_mul(const mont64 *m, u64 a, u64 b) { return m64_redc(m, (u128)a * b); }
 
 static inline u64 m64_add(const mont64 *m, u64 a, u64 b)
@@ -332,7 +534,15 @@ static inline u64 m64_add(const mont64 *m, u64 a, u64 b)
 
 static inline u64 m64_to(const mont64 *m, u64 x) { return (u64)(((u128)x << 64) % m->n); }
 
-/* strong probable prime test to a base given in Montgomery form; n - 1 = d 2^s */
+/*
+ * m64_sprp -- strong probable-prime (Miller-Rabin) test of m->n to one base.
+ * Inputs:  m (initialised for n), am = the base in Montgomery form (nonzero mod n),
+ *          d and s with n - 1 = d * 2^s, d odd.
+ * Method:  x = base^d (right-to-left binary exponentiation); n passes if x == 1 or
+ *          x == n-1, or if squaring x up to s-1 times reaches n-1 before it reaches 1.
+ * Returns: true if n is a strong probable prime to this base (every prime passes;
+ *          a composite passes with probability <= 1/4), false if n is proven composite.
+ */
 static bool m64_sprp(const mont64 *m, u64 am, u64 d, int s)
 {
     u64 x = m->one, b = am, nm1 = m->n - m->one;
@@ -349,7 +559,12 @@ static bool m64_sprp(const mont64 *m, u64 am, u64 d, int s)
     return false;
 }
 
-/* base 2, left to right: multiplying by the base is a modular doubling */
+/*
+ * m64_sprp2 -- the same test specialised to base 2, which is the one that rejects
+ * almost every composite and is therefore run first.  Left-to-right exponentiation:
+ * squaring is a Montgomery multiply but multiplying by the base is a modular doubling,
+ * which saves about a third of the work.  Inputs and result as for m64_sprp.
+ */
 static bool m64_sprp2(const mont64 *m, u64 d, int s)
 {
     u64 two = m64_add(m, m->one, m->one), nm1 = m->n - m->one;
@@ -367,6 +582,19 @@ static bool m64_sprp2(const mont64 *m, u64 d, int s)
     return false;
 }
 
+/*
+ * is_prime64 -- deterministic primality test for any 64-bit n.
+ * Steps:   small n and even n directly; n < 1000 by trial division; otherwise two
+ *          32-bit remainders (modulo 3*5*...*29 and 31*37*41*43*47) weed out the two
+ *          thirds of candidates with a factor <= 47 at a cost of a few nanoseconds;
+ *          then Miller-Rabin to base 2, and -- for n >= 2047, the first base-2
+ *          pseudoprime -- to the six further bases of Jim Sinclair's set, which
+ *          together are deterministic for every n < 2^64.  A base that is 0 mod n is
+ *          skipped, as the set requires.
+ * Returns: true iff n is prime.  Errors: none.
+ * Cost:    this is the hot primality test (every S_2 of every twin prime goes through
+ *          it); the trial division and the base-2 shortcut are what keep it cheap.
+ */
 static bool is_prime64(u64 n)
 {
     if (n < 2) return false;
@@ -406,8 +634,18 @@ static bool is_prime64(u64 n)
 /* Primality: 128-bit Montgomery Miller-Rabin                          */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Montgomery arithmetic with R = 2^128 for moduli between 2^64 and 2^128.  Same idea
+ * as mont64; the extra field r2 = 2^256 mod n lets m128_to convert to Montgomery form
+ * with one multiplication instead of a 256-by-128 division.
+ */
 typedef struct { u128 n, ninv, one, r2; } mont128;
 
+/*
+ * mul128_full -- full 256-bit product of a and b as (hi, lo).
+ * Schoolbook with four 64x64->128 multiplies; `mid` collects the two cross terms plus
+ * the carry out of p00 and is below 3*2^64, so it cannot overflow.  Errors: none.
+ */
 static inline void mul128_full(u128 a, u128 b, u128 *hi, u128 *lo)
 {
     u64 a0 = (u64)a, a1 = (u64)(a >> 64), b0 = (u64)b, b1 = (u64)(b >> 64);
@@ -417,6 +655,9 @@ static inline void mul128_full(u128 a, u128 b, u128 *hi, u128 *lo)
     *hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
 }
 
+/*
+ * m128_add -- modular sum of a, b < n (the carry test covers n near 2^128).
+ */
 static inline u128 m128_add(const mont128 *m, u128 a, u128 b)
 {
     u128 s = a + b;
@@ -424,6 +665,16 @@ static inline u128 m128_add(const mont128 *m, u128 a, u128 b)
     return s;
 }
 
+/*
+ * m128_redc -- Montgomery reduction of the 256-bit value hi:lo; returns hi:lo * 2^-128 mod n.
+ * Inputs:  hi < n (true for products of values below n), any lo.
+ * Method:  as m64_redc one level up.  mm*n is formed in full; its low half l2 is the
+ *          two's complement of lo, so lo + l2 is 0 or 2^128 and the carry into the
+ *          high half is (lo != 0).  hi + h2 + carry can exceed 2^128 when n is close
+ *          to it; __builtin_add_overflow catches that, and subtracting n (mod 2^128)
+ *          then yields the right value because the true sum is below 2n.
+ * Returns: a value in [0, n).  Errors: none.
+ */
 static inline u128 m128_redc(const mont128 *m, u128 hi, u128 lo)   /* hi < n */
 {
     u128 mm = lo * m->ninv;
@@ -436,6 +687,9 @@ static inline u128 m128_redc(const mont128 *m, u128 hi, u128 lo)   /* hi < n */
     return t;
 }
 
+/*
+ * m128_mul -- product of two Montgomery representations a, b < n, reduced to [0, n).
+ */
 static inline u128 m128_mul(const mont128 *m, u128 a, u128 b)
 {
     u128 hi, lo;
@@ -443,6 +697,13 @@ static inline u128 m128_mul(const mont128 *m, u128 a, u128 b)
     return m128_redc(m, hi, lo);
 }
 
+/*
+ * m128_init -- Montgomery constants for an odd n in (2^64, 2^128).
+ * Effect:  ninv by Newton iteration (7 rounds: 3 -> 384 bits); one = 2^128 mod n as
+ *          (2^128 - n) mod n; r2 = 2^256 mod n by doubling `one` 128 times, which is
+ *          cheaper than a 256-bit division and runs only once per candidate.
+ * Errors:  none (even n is rejected by the caller).
+ */
 static void m128_init(mont128 *m, u128 n)
 {
     u128 x = n;
@@ -455,6 +716,10 @@ static void m128_init(mont128 *m, u128 n)
     m->r2 = r;                              /* 2^256 mod n */
 }
 
+/*
+ * m128_to  -- ordinary residue x < n to Montgomery form: x * 2^128 mod n = REDC(x * r2).
+ * ctz128   -- number of trailing zero bits of a nonzero 128-bit value.
+ */
 static inline u128 m128_to(const mont128 *m, u128 x) { return m128_mul(m, x, m->r2); }   /* x < n */
 
 static inline int ctz128(u128 v)
@@ -463,6 +728,10 @@ static inline int ctz128(u128 v)
     return lo ? __builtin_ctzll(lo) : 64 + __builtin_ctzll((u64)(v >> 64));
 }
 
+/*
+ * m128_sprp -- strong probable-prime test of m->n to the base am (Montgomery form),
+ * with n - 1 = d * 2^s.  Same algorithm and contract as m64_sprp.
+ */
 static bool m128_sprp(const mont128 *m, u128 am, u128 d, int s)
 {
     u128 x = m->one, b = am, nm1 = m->n - m->one;
@@ -483,6 +752,17 @@ static bool m128_sprp(const mont128 *m, u128 am, u128 d, int s)
 static const u32 BASES128[24] = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41,
                                   43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89 };
 
+/*
+ * is_prime128 -- primality test for any 128-bit n; the only test the scan calls.
+ * Dispatch: n < 2^64 goes to the deterministic is_prime64.  Otherwise: even -> false;
+ *          trial division by the primes up to 97 (a u128 remainder each, cheap next to
+ *          an exponentiation); then Miller-Rabin to the 24 bases of BASES128, stopping
+ *          at the first failure.  Every base is < n here, so none is 0 mod n.
+ * Returns: true iff n passes.  Proven for n < 3.3e24 (13 bases suffice there); above
+ *          that a composite can pass only if it is a strong pseudoprime to all 24
+ *          bases, which no number below 2^128 is known to be.
+ * Errors:  none.
+ */
 static bool is_prime128(u128 n)
 {
     if (n < ((u128)1 << 64)) return is_prime64((u64)n);
@@ -500,6 +780,9 @@ static bool is_prime128(u128 n)
 }
 
 #ifdef HAVE_GMP
+/*
+ * mpz_set_u128 -- store a 128-bit value in a GMP integer (two 64-bit halves).
+ */
 static void mpz_set_u128(mpz_t z, u128 v)
 {
     mpz_set_ui(z, (unsigned long)(u64)(v >> 64));
@@ -507,6 +790,11 @@ static void mpz_set_u128(mpz_t z, u128 v)
     mpz_add_ui(z, z, (unsigned long)(u64)v);
 }
 
+/*
+ * gmp_isprime128 -- GMP's verdict on n, as an independent check of is_prime128.
+ * Returns: mpz_probab_prime_p with 40 rounds: 2 = proven prime (small n), 1 = probable
+ *          prime (BPSW + Miller-Rabin), 0 = composite.
+ */
 static int gmp_isprime128(u128 n)   /* 2 prime, 1 probable prime, 0 composite */
 {
     mpz_t z;
@@ -522,15 +810,32 @@ static int gmp_isprime128(u128 n)   /* 2 prime, 1 probable prime, 0 composite */
 /* Chunks: sieve a range, keep its gaps and gap histogram              */
 /* ------------------------------------------------------------------ */
 
+/*
+ * chunk_t -- one chunk of the range as seen by one worker: the primes of [lo, hi) are
+ * represented by the sequence of their incoming gaps, in order, so that the check pass
+ * can replay them without sieving again.  Owned by a single worker and reused for
+ * every chunk it processes (buffers only grow).
+ */
 typedef struct {
-    u8  *gb;  size_t gb_cap, n;       /* gap bytes: g/2 for even g <= 508, 255 = escaped */
-    u32 *esc; size_t esc_cap, esc_n;  /* escaped gaps (1, or >= 510) in order */
-    u64  cnt[MAXG];                   /* gap histogram of the chunk */
-    u64  lo, hi, p_prev, p_last, nprimes;
-    unsigned maxg;
-    bool has_prev;                    /* false only for the chunk that contains 2 */
+    u8  *gb;  size_t gb_cap, n;       /* gap bytes: g/2 for even g <= 508, 255 = escaped; n = count */
+    u32 *esc; size_t esc_cap, esc_n;  /* escaped gaps (the gap 1, or gaps >= 510) in order of occurrence */
+    u64  cnt[MAXG];                   /* gap histogram of the chunk: cnt[g] = number of incoming gaps g */
+    u64  lo, hi;                      /* the chunk covers the primes in [lo, hi) */
+    u64  p_prev;                      /* largest prime below lo (valid iff has_prev) */
+    u64  p_last;                      /* largest prime below hi (p_prev if the chunk has no prime) */
+    u64  nprimes;                     /* number of primes in [lo, hi) */
+    unsigned maxg;                    /* largest gap seen (bounds the histogram loops) */
+    bool has_prev;                    /* false only for the chunk that contains 2 (no prime below it) */
 } chunk_t;
 
+/*
+ * chunk_push -- append the incoming gap g of the prime q to the chunk.
+ * Inputs:  c, q (only for the error message), g = q - previous prime.
+ * Effect:  stores g as a byte (g/2 for even g <= 508) or as the escape byte 255 plus
+ *          an entry in esc[]; counts it in cnt[g]; updates maxg.  Both buffers grow
+ *          by doubling when full.
+ * Errors:  g >= MAXG is fatal (cannot happen below 2^64); allocation failure is fatal.
+ */
 static inline void chunk_push(chunk_t *c, u64 q, u64 g)
 {
     if (g >= MAXG) die("prime gap %" PRIu64 " before %" PRIu64 " exceeds MAXG", g, q);
@@ -552,13 +857,29 @@ static inline void chunk_push(chunk_t *c, u64 q, u64 g)
     if (g > c->maxg) c->maxg = (unsigned)g;
 }
 
-/* primes q in [lo, hi) and the gap into each of them */
+/*
+ * sieve_chunk -- step (a) of the pipeline: enumerate the primes of [lo, hi) and record
+ * the incoming gap of each one.
+ * Inputs:  it = this worker's primesieve iterator; c = this worker's chunk buffer;
+ *          lo < hi, hi <= end + 1.
+ * Effect:  resets c, then starts the iterator MARGIN below lo so that the prime just
+ *          before the chunk (p_prev) is seen first; the first prime >= lo gets the gap
+ *          from p_prev, every later prime the gap from its predecessor.  If no prime
+ *          lies within MARGIN below lo (impossible below 2^64, where gaps are < 1551)
+ *          the margin is quadrupled and the sieve restarted.  When lo <= 2 there is no
+ *          prime below the chunk: has_prev is false and the prime 2 gets no gap.
+ *          On return: gb[0..n) and esc[] hold the gaps, cnt[] the histogram, and
+ *          nprimes, p_prev, p_last, maxg are set.  The gap buffer is pre-sized from the
+ *          prime density (hi - lo) / ln(midpoint) * 1.25 and grows if that was short.
+ * Errors:  fatal on a primesieve error, a gap >= MAXG, or no prime within 2^24 below lo.
+ */
 static void sieve_chunk(primesieve_iterator *it, chunk_t *c, u64 lo, u64 hi)
 {
     c->lo = lo; c->hi = hi;
     c->n = 0; c->esc_n = 0; c->nprimes = 0; c->maxg = 0;
     memset(c->cnt, 0, sizeof c->cnt);
 
+    /* expected number of primes in the chunk, with 25% headroom; chunk_push grows if needed */
     double lnx = log((double)lo + (double)(hi - lo) * 0.5 + 3.0);
     size_t need = (size_t)((double)(hi - lo) / (lnx > 1.0 ? lnx : 1.0) * 1.25) + 65536;
     if (c->gb_cap < need) {
@@ -593,7 +914,14 @@ static void sieve_chunk(primesieve_iterator *it, chunk_t *c, u64 lo, u64 hi)
     }
 }
 
-/* T_k = sum over the chunk's gaps of g^k, k = 1..g_kmax */
+/*
+ * chunk_totals -- the chunk's contribution to every running sum.
+ * Inputs:  c after sieve_chunk; T, Tovf with room for indices 1..g_kmax.
+ * Effect:  T[k] = sum_g cnt[g] * g^k for k = 1..g_kmax, formed from the histogram (a
+ *          few hundred multiply-adds per k).  Tovf[k] is set, and T[k] zeroed, when
+ *          a power or the sum would exceed 2^128.
+ * Errors:  none.
+ */
 static void chunk_totals(const chunk_t *c, u128 T[], bool Tovf[])
 {
     for (int k = 1; k <= g_kmax; k++) {
@@ -615,56 +943,87 @@ static void chunk_totals(const chunk_t *c, u128 T[], bool Tovf[])
 /* Scan state shared by the worker threads                             */
 /* ------------------------------------------------------------------ */
 
+/* a recorded hit: prime p of exact depth `depth` (>= the report threshold) */
 typedef struct { u64 p; int depth; } hit_t;
 
+/*
+ * rec_t -- the ring record of a chunk, written at hand-off time: the running sums at
+ * the START of the chunk.  checkpoint() reads the record of the completion frontier.
+ */
 typedef struct {
-    u64  idx;
-    u64  primes;                      /* primes below this chunk */
-    u128 O[KLIM + 1];
-    bool ovf[KLIM + 1];
+    u64  idx;                         /* chunk index the record belongs to (UINT64_MAX = empty) */
+    u64  primes;                      /* number of primes below this chunk (origin 0 or checkpoint) */
+    u128 O[KLIM + 1];                 /* O_k(idx), k = 1..g_kmax */
+    bool ovf[KLIM + 1];               /* O_k already overflowed 2^128 at this point */
 } rec_t;
 
 typedef struct scan scan_t;
 
+/*
+ * worker_t -- everything private to one worker thread.  The result fields (best,
+ * depth_count, twins, hits) hold the current chunk only; worker_main resets them
+ * before check_chunk and merges them into the scan under the mutex afterwards.
+ */
 typedef struct {
-    int id;
+    int id;                           /* 0..nthreads-1 (unused except for debugging) */
     pthread_t th;
-    scan_t *sc;
-    primesieve_iterator it;
-    chunk_t c;
-    u64 hist[MAXG];
-    u64 best[KLIM + 1];               /* per chunk: smallest p of exact depth d */
-    u64 depth_count[KLIM + 1];
-    u64 twins;
-    hit_t *hits; size_t nhits, hits_cap;
+    scan_t *sc;                       /* the shared scan */
+    primesieve_iterator it;           /* each thread has its own sieve */
+    chunk_t c;                        /* the chunk being processed */
+    u64 hist[MAXG];                   /* running gap histogram during the check pass */
+    u64 best[KLIM + 1];               /* per chunk: smallest p of exact depth d (0 = none) */
+    u64 depth_count[KLIM + 1];        /* per chunk: number of twin primes of exact depth d */
+    u64 twins;                        /* per chunk: twin primes examined (= primes of depth >= 1) */
+    hit_t *hits; size_t nhits, hits_cap;   /* per chunk: hits of depth >= report */
 } worker_t;
 
+/*
+ * struct scan -- one scan of [start, end]: its parameters, the shared pipeline state
+ * (protected by mu unless marked atomic) and the merged results.  Allocated with
+ * scan_new; large (the ring is about 1.2 MB), so never put on the stack.
+ */
 struct scan {
-    /* parameters */
-    u64  origin, start, end, chunk, nchunks;
-    bool check, print_hits, verbose;
-    int  report;
-    u128 O0[KLIM + 1]; bool O0ovf[KLIM + 1];
-    u64  primes0;
-    /* runtime */
-    atomic_uint_fast64_t next;
-    atomic_int finished;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    u64  pub;                         /* chunk whose start offsets are in O */
-    u128 O[KLIM + 1]; bool Oovf[KLIM + 1]; u64 ovf_at[KLIM + 1];
-    u64  primes_pub;
-    u64  cf;                          /* completion frontier */
-    u8   done[RING];
-    rec_t rec[RING];
-    /* results */
-    u64  best[KLIM + 1];
-    u64  depth_count[KLIM + 1];
-    u64  primes, twins, chunks_done;
-    hit_t *hits; size_t nhits, hits_cap;
-    double t0, t1;
+    /* parameters, set by the caller before scan_run */
+    u64  origin;                      /* where the whole computation began (0 = exhaustive from 0) */
+    u64  start, end;                  /* this run scans the primes in [start, end] */
+    u64  chunk, nchunks;              /* chunk size (0 = choose automatically) and resulting count */
+    bool check;                       /* false: totals only, no primality tests (used for START > 0) */
+    bool print_hits;                  /* print hit lines on stdout as they are found */
+    bool verbose;                     /* status line on stderr */
+    int  report;                      /* record/print primes of depth >= report */
+    u128 O0[KLIM + 1]; bool O0ovf[KLIM + 1];   /* running sums at `start` (S_k of the largest prime below it) */
+    u64  primes0;                     /* primes below start */
+    /* runtime, shared by the workers */
+    atomic_uint_fast64_t next;        /* next chunk index to hand out */
+    atomic_int finished;              /* workers that have exited */
+    pthread_mutex_t mu;               /* protects everything below down to the results */
+    pthread_cond_t cv;                /* signalled whenever pub or cf advances */
+    u64  pub;                         /* chunk whose start offsets are currently in O */
+    u128 O[KLIM + 1];                 /* O_k(pub) */
+    bool Oovf[KLIM + 1];              /* O_k has exceeded 2^128 (sticky) */
+    u64  ovf_at[KLIM + 1];            /* chunk start where that happened */
+    u64  primes_pub;                  /* primes below chunk pub */
+    u64  cf;                          /* completion frontier: lowest chunk whose check is unfinished */
+    u8   done[RING];                  /* done[i % RING]: chunk i (>= cf) is checked but cf has not passed it */
+    rec_t rec[RING];                  /* rec[i % RING]: start offsets of chunk i */
+    /* results, merged as chunks complete */
+    u64  best[KLIM + 1];              /* smallest p of exact depth d found so far (0 = none) */
+    u64  depth_count[KLIM + 1];       /* number of twin primes of exact depth d */
+    u64  primes, twins, chunks_done;  /* totals over completed chunks */
+    hit_t *hits; size_t nhits, hits_cap;   /* all hits of depth >= report (unordered) */
+    double t0, t1;                    /* start and end time of scan_run */
 };
 
+/*
+ * report_hit -- print one hit line on stdout.
+ * Inputs:  p and its depth; S[1..known] = the power sums that were computed (known is
+ *          depth + 1 when the first composite sum is available, else depth); capped =
+ *          S_(depth+1) could not be computed because it exceeds 2^128.
+ * Effect:  "p = ...  n = depth  S_1..S_n = ...  S_(n+1) = ... (composite)" or a note
+ *          why nothing further was tested.  Thread-safe (out_mu); flushes stdout so
+ *          the line survives a later crash or kill.
+ * Errors:  none.
+ */
 static void report_hit(u64 p, int depth, const u128 S[], int known, bool capped)
 {
     char buf[48];
@@ -680,6 +1039,23 @@ static void report_hit(u64 p, int depth, const u128 S[], int known, bool capped)
     pthread_mutex_unlock(&out_mu);
 }
 
+/*
+ * check_chunk -- step (c) of the pipeline: replay the chunk's gaps with the exact
+ * running sums and test every candidate.
+ * Inputs:  w (its chunk c filled by sieve_chunk; hist as scratch; best, depth_count,
+ *          twins, hits already reset by the caller); O[k], Oovf[k] = the running sums
+ *          O_k at the start of the chunk and their overflow flags, k = 1..g_kmax.
+ * Method:  keff = largest k such that no sum up to k has overflowed.  p starts at
+ *          p_prev (or at 2 for the first chunk) and advances gap by gap; S2, S3, S4
+ *          are updated from the power tables and the gap is counted in hist.  A
+ *          prime is a candidate only when its incoming gap is 2 (then S_1 = p - 2 is
+ *          prime).  S2, S3, S4 are tested in turn; after that S_k for k = 5..keff is
+ *          formed as O[k] + sum_g hist[g]*g^k and tested, until the first composite
+ *          one or an overflow.  The exact depth is counted, the smallest p per depth
+ *          kept, and hits of depth >= sc->report recorded (and printed if print_hits).
+ * Errors:  fatal if O[1] != p_prev - 2 (the hand-off bookkeeping is wrong) or if the
+ *          sums for k <= 4 are marked overflowed (impossible below 2^64).
+ */
 static void check_chunk(worker_t *w, const u128 O[], const bool Oovf[])
 {
     scan_t *sc = w->sc;
@@ -724,6 +1100,7 @@ static void check_chunk(worker_t *w, const u128 O[], const bool Oovf[])
             depth = 3; S[4] = S4; known = 4;
             if (is_prime128(S4)) {
                 depth = 4;
+                /* rare survivor: evaluate the higher sums from the histogram on demand */
                 for (int k = 5; k <= keff; k++) {
                     u128 s = O[k];
                     bool ovf = false;
@@ -757,6 +1134,20 @@ static void check_chunk(worker_t *w, const u128 O[], const bool Oovf[])
     }
 }
 
+/*
+ * worker_main -- body of each worker thread (see THEORY OF OPERATION, 2 and 3).
+ * Inputs:  arg = its worker_t.
+ * Loop:    take the next chunk index i from the atomic counter (stop when the range
+ *          is exhausted or g_stop is set); wait until i < cf + RING so the ring slot
+ *          is free; sieve the chunk and form its totals; hand-off: wait for pub == i,
+ *          copy O_k(i), record it in rec[i % RING], add the totals into sc->O
+ *          (marking sticky overflows), publish pub = i + 1; run the check pass
+ *          (unless this is a totals-only scan); then under the mutex mark the chunk
+ *          done, advance the completion frontier over consecutive done chunks, and
+ *          merge the chunk's statistics, best primes and hits into the scan.
+ * Returns: NULL after incrementing sc->finished.
+ * Errors:  anything fatal inside the steps calls die (process exits).
+ */
 static void *worker_main(void *arg)
 {
     worker_t *w = arg;
@@ -768,18 +1159,20 @@ static void *worker_main(void *arg)
         u64 i = atomic_fetch_add(&sc->next, 1);
         if (i >= sc->nchunks) break;
 
+        /* back-pressure: the ring slot i % RING must not belong to a live chunk */
         pthread_mutex_lock(&sc->mu);
         while (i >= sc->cf + RING) pthread_cond_wait(&sc->cv, &sc->mu);
         pthread_mutex_unlock(&sc->mu);
 
         u64 lo = sc->start + i * sc->chunk;
         u64 hi = (i + 1 == sc->nchunks) ? sc->end + 1 : lo + sc->chunk;
+        /* step (a): sieve, store the gaps, form the chunk totals */
         sieve_chunk(&w->it, c, lo, hi);
         u128 T[KLIM + 1];
         bool Tovf[KLIM + 1];
         chunk_totals(c, T, Tovf);
 
-        /* ordered hand-off: wait for the offsets of this chunk, publish the next */
+        /* step (b): ordered hand-off -- wait for the offsets of this chunk, publish the next */
         u128 O[KLIM + 1];
         bool Oovf[KLIM + 1];
         pthread_mutex_lock(&sc->mu);
@@ -805,12 +1198,14 @@ static void *worker_main(void *arg)
         pthread_cond_broadcast(&sc->cv);
         pthread_mutex_unlock(&sc->mu);
 
+        /* step (c): the check pass, with this chunk's results collected in w */
         w->nhits = 0;
         w->twins = 0;
         memset(w->best, 0, sizeof w->best);
         memset(w->depth_count, 0, sizeof w->depth_count);
         if (sc->check) check_chunk(w, O, Oovf);
 
+        /* completion: advance the frontier over every consecutive finished chunk, merge results */
         pthread_mutex_lock(&sc->mu);
         sc->done[i % RING] = 1;
         while (sc->cf < sc->nchunks && sc->done[sc->cf % RING]) {
@@ -843,6 +1238,17 @@ static void *worker_main(void *arg)
 /* Checkpoint files                                                    */
 /* ------------------------------------------------------------------ */
 
+/*
+ * state_t -- contents of a checkpoint file.  Text format, one item per line:
+ *     A252768-state 1            magic and format version
+ *     kmax K                     -k the scan was run with (must match on resume)
+ *     origin X                   where the whole computation began (0 = from scratch)
+ *     end X                      END of the run that wrote the file
+ *     lo X                       first integer not yet scanned
+ *     primes N                   number of primes below lo
+ *     O k VALUE OVF              running sum S_k at lo (decimal) and its overflow flag, k = 1..kmax
+ *     best d P                   smallest prime of exact depth d found below lo (only d with a value)
+ */
 typedef struct {
     int  kmax;
     u64  origin, end, lo, primes;
@@ -851,6 +1257,14 @@ typedef struct {
     u64  best[KLIM + 1];
 } state_t;
 
+/*
+ * write_state -- write a checkpoint atomically.
+ * Inputs:  path; st.
+ * Effect:  writes path.tmp and renames it over path, so a crash mid-write leaves the
+ *          previous checkpoint intact.
+ * Errors:  not fatal: a failure to create, close or rename the file is reported with
+ *          note() and the scan continues (the next checkpoint will try again).
+ */
 static void write_state(const char *path, const state_t *st)
 {
     char tmp[4096], b[48];
@@ -867,6 +1281,14 @@ static void write_state(const char *path, const state_t *st)
         note("warning: cannot finish writing %s: %s", path, strerror(errno));
 }
 
+/*
+ * read_state -- read a checkpoint written by write_state.
+ * Inputs:  path; st (overwritten).
+ * Returns: false if the file does not exist (a fresh start); true with st filled in
+ *          otherwise.  Unknown keys are ignored, missing ones stay zero.
+ * Errors:  fatal if the file exists but is not a valid state file (bad magic or
+ *          version, unparsable value, k or d out of range, kmax outside 4..KLIM).
+ */
 static bool read_state(const char *path, state_t *st)
 {
     FILE *f = fopen(path, "r");
@@ -901,6 +1323,19 @@ static bool read_state(const char *path, state_t *st)
     return true;
 }
 
+/*
+ * checkpoint -- write the state at the completion frontier.
+ * Inputs:  sc (locked internally), path.
+ * Method:  everything below chunk cf is checked, so the file records lo = start of
+ *          chunk cf and the running sums there.  Those sums come from one of four
+ *          places: the final sums when every chunk is done (lo = end + 1); the initial
+ *          sums when cf == 0; the ring record of chunk cf when that chunk has had its
+ *          hand-off; or sc->O itself when chunk cf was never started (pub == cf, e.g.
+ *          after Ctrl-C).  If none applies (chunk cf started but not yet handed off)
+ *          this round is skipped -- the previous file stays valid.  Only best[] values
+ *          below lo are saved; later ones will be found again after a resume.
+ * Errors:  see write_state.
+ */
 static void checkpoint(scan_t *sc, const char *path)
 {
     state_t st;
@@ -908,17 +1343,17 @@ static void checkpoint(scan_t *sc, const char *path)
     bool ok = true;
     pthread_mutex_lock(&sc->mu);
     u64 cf = sc->cf;
-    if (cf >= sc->nchunks) {
+    if (cf >= sc->nchunks) {                  /* everything done: the final sums */
         st.lo = sc->end + 1;
         memcpy(st.O, sc->O, sizeof st.O);
         memcpy(st.ovf, sc->Oovf, sizeof st.ovf);
         st.primes = sc->primes_pub;
-    } else if (cf == 0) {
+    } else if (cf == 0) {                     /* nothing completed yet: the initial sums */
         st.lo = sc->start;
         memcpy(st.O, sc->O0, sizeof st.O);
         memcpy(st.ovf, sc->O0ovf, sizeof st.ovf);
         st.primes = sc->primes0;
-    } else if (sc->rec[cf % RING].idx == cf) {
+    } else if (sc->rec[cf % RING].idx == cf) {   /* chunk cf has had its hand-off: its record */
         st.lo = sc->start + cf * sc->chunk;
         memcpy(st.O, sc->rec[cf % RING].O, sizeof st.O);
         memcpy(st.ovf, sc->rec[cf % RING].ovf, sizeof st.ovf);
@@ -946,6 +1381,15 @@ static void checkpoint(scan_t *sc, const char *path)
 /* Running a scan                                                      */
 /* ------------------------------------------------------------------ */
 
+/*
+ * print_status -- one status line on stderr: elapsed, percent done, frontier
+ * position, rate, ETA, and (for a checking scan) primes, twins, hits and the best
+ * depth so far.  Progress is measured at the completion frontier.
+ * Inputs:  sc (locked briefly to read the counters), t = current time, final = end
+ *          of the run (always finish the line with a newline).
+ * Effect:  on a terminal the line is rewritten in place (\r); otherwise a full line.
+ * Errors:  none.
+ */
 static void print_status(scan_t *sc, double t, bool final)
 {
     pthread_mutex_lock(&sc->mu);
@@ -975,6 +1419,21 @@ static void print_status(scan_t *sc, double t, bool final)
     pthread_mutex_unlock(&out_mu);
 }
 
+/*
+ * scan_run -- execute a scan: start the workers, monitor them, collect the results.
+ * Inputs:  sc with the parameter fields set (origin, start, end, chunk or 0, check,
+ *          print_hits, verbose, report, O0/O0ovf/primes0, best[] may be preloaded
+ *          from a checkpoint); nthreads; statefile (NULL = no checkpoints);
+ *          ckpt_secs = checkpoint interval.
+ * Effect:  chooses the chunk size if none was given (range / (32 * threads), clamped
+ *          to 10^6..10^9), resets the runtime state, starts nthreads workers, then
+ *          loops every 0.1 s printing the status line (every 0.5 s on a terminal,
+ *          every 60 s otherwise) and writing checkpoints until all workers have
+ *          exited; joins them and frees their buffers.  On return sc->O holds the
+ *          running sums at the end of the scanned prefix (= S_k at end for a complete
+ *          run), and best, depth_count, primes, twins, hits hold the results.
+ * Errors:  fatal if end is beyond primesieve's limit or a thread cannot be created.
+ */
 static void scan_run(scan_t *sc, int nthreads, const char *statefile, double ckpt_secs)
 {
     if (sc->end >= primesieve_get_max_stop()) die("END too large for primesieve");
@@ -1038,6 +1497,9 @@ static void scan_run(scan_t *sc, int nthreads, const char *statefile, double ckp
     if (statefile) checkpoint(sc, statefile);
 }
 
+/*
+ * scan_new / scan_free -- allocate a zeroed scan (report preset from -r) and release it.
+ */
 static scan_t *scan_new(void)
 {
     scan_t *sc = xcalloc(1, sizeof *sc);
@@ -1051,6 +1513,11 @@ static void scan_free(scan_t *sc)
     free(sc);
 }
 
+/*
+ * a_from_best -- a(n) from the smallest-prime-per-exact-depth table: the minimum of
+ * best[d] over d >= n (a prime of depth d counts for every n <= d).
+ * Returns: a(n), or 0 if no prime of depth >= n was found.
+ */
 static u64 a_from_best(const u64 best[], int n)
 {
     u64 a = 0;
@@ -1059,6 +1526,9 @@ static u64 a_from_best(const u64 best[], int n)
     return a;
 }
 
+/*
+ * cmp_hit -- qsort comparator ordering hits by p.
+ */
 static int cmp_hit(const void *x, const void *y)
 {
     const hit_t *a = x, *b = y;
@@ -1069,6 +1539,13 @@ static int cmp_hit(const void *x, const void *y)
 /* Direct (single-threaded) computation of the gap histogram up to P   */
 /* ------------------------------------------------------------------ */
 
+/*
+ * direct_hist -- the gap histogram of all primes <= P by a plain single-threaded pass
+ * (no chunks, no offsets): the reference implementation used by verify and selftest.
+ * Inputs:  P (must be prime), cnt (overwritten).
+ * Returns: the number of primes <= P; cnt[g] = number of gaps g among them.
+ * Errors:  fatal if P is not prime, on a primesieve error, or a gap >= MAXG.
+ */
 static u64 direct_hist(u64 P, u64 cnt[MAXG])
 {
     primesieve_iterator it;
@@ -1091,6 +1568,10 @@ static u64 direct_hist(u64 P, u64 cnt[MAXG])
     return nprimes;
 }
 
+/*
+ * sums_from_hist -- S[k] = sum_g cnt[g] * g^k for k = 1..kmax (kmax <= KLIM), with
+ * ovf[k] set and S[k] = 0 where the value would exceed 2^128.  Errors: none.
+ */
 static void sums_from_hist(const u64 cnt[MAXG], int kmax, u128 S[], bool ovf[])
 {
     for (int k = 1; k <= kmax; k++) {
@@ -1111,6 +1592,9 @@ static void sums_from_hist(const u64 cnt[MAXG], int kmax, u128 S[], bool ovf[])
 /* Commands                                                            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * usage -- print the command summary on stderr and exit with status 2.
+ */
 static void usage(void)
 {
     fputs(
@@ -1131,12 +1615,28 @@ static void usage(void)
     exit(2);
 }
 
+/*
+ * on_signal -- SIGINT/SIGTERM handler: ask the workers to stop taking chunks.  Installed
+ * with SA_RESETHAND, so a second signal terminates the process immediately.
+ */
 static void on_signal(int s)
 {
     (void)s;
     g_stop = 1;
 }
 
+/*
+ * print_summary -- the final report on stdout after a scan.
+ * Inputs:  sc after scan_run; exhaustive_from_zero = the computation started at 0, so
+ *          a missing depth means a(n) > the scanned bound (otherwise it only means no
+ *          such prime in this range).
+ * Effect:  prints the range, timing and rate, the counts of primes by exact depth,
+ *          then a(n) for n = 1..g_kmax -- marked "(matches OEIS)" / "** DIFFERS **"
+ *          for n <= 7 and "NEW" beyond -- or the bound / "not tested" (overflow) line,
+ *          and finally the sorted list of hits when there are at most 500.  When the
+ *          run was interrupted the bound is the completion frontier.
+ * Errors:  none.
+ */
 static void print_summary(scan_t *sc, bool exhaustive_from_zero)
 {
     char b1[32];
@@ -1180,6 +1680,20 @@ static void print_summary(scan_t *sc, bool exhaustive_from_zero)
     fflush(stdout);
 }
 
+/*
+ * cmd_scan -- the `scan` command.
+ * Inputs:  argv after the command word: one or two bounds plus options
+ *          -t threads, -c chunk, -k kmax, -r report depth, -S state file,
+ *          -i checkpoint seconds, -q quiet.
+ * Flow:    parse; if -S names an existing checkpoint, resume from it (its lo replaces
+ *          START, its sums become O0, kmax must match; END may be larger than the
+ *          END it was written with); else if START > 2, run a totals-only scan of
+ *          [0, START-1] to obtain the sums at START; print the header lines; install
+ *          the signal handler; scan_run; print the summary.
+ * Returns: 0.  Errors: fatal on bad arguments, an incompatible checkpoint, or
+ *          END below the checkpoint position (unless the checkpoint shows that exact
+ *          END already complete, which just prints a note).
+ */
 static int cmd_scan(int argc, char **argv)
 {
     u64 pos[2] = { 0, 0 };
@@ -1232,7 +1746,7 @@ static int cmd_scan(int argc, char **argv)
         resumed = true;
         note("resuming from %s at %" PRIu64 " (%" PRIu64 " primes done)", statefile, start, st.primes);
     } else if (start > 2) {
-        /* totals-only pass to get the power sums at START */
+        /* no checkpoint: a totals-only pass over [0, START-1] gives the power sums at START */
         scan_t *pre = scan_new();
         pre->origin = 0; pre->start = 0; pre->end = start - 1;
         pre->check = false; pre->verbose = !g_quiet; pre->print_hits = false;
@@ -1286,6 +1800,20 @@ static int cmd_scan(int argc, char **argv)
     return 0;
 }
 
+/*
+ * cmd_verify -- the `verify` (alias `depth`) command: recompute and test S_1..S_kmax
+ * at one prime P independently of the scan.
+ * Inputs:  argv after the command word: P, -k kmax (up to 64 with GMP, else <= KLIM),
+ *          -t threads (1 = direct single-threaded histogram, > 1 = the parallel totals
+ *          pipeline, which shares code with the scan and is limited to k <= KLIM).
+ * Effect:  prints P, the prime count, then one line per k with S_k, its bit length,
+ *          the tool's verdict ([mr]) and GMP's ([gmp: ...]), flagging any disagreement;
+ *          with GMP the sums are also formed in GMP and compared with the 128-bit ones.
+ *          Ends with the depth of P.  Sums beyond 128 bits are reported as not
+ *          computed unless GMP is available (direct mode only).
+ * Returns: 0.  Errors: fatal if P is not prime or an option is invalid; a mismatch
+ *          between the 128-bit and GMP sums is treated as an internal error.
+ */
 static int cmd_verify(int argc, char **argv)
 {
     u64 P = 0;
@@ -1400,8 +1928,12 @@ static int cmd_verify(int argc, char **argv)
 /* Selftest                                                            */
 /* ------------------------------------------------------------------ */
 
-static int st_fail;
+static int st_fail;     /* number of failed selftest checks */
 
+/*
+ * expect -- record one selftest check: prints "ok" or "FAIL" with the description and
+ * counts failures.  Inputs: ok, printf-style description.
+ */
 static void expect(bool ok, const char *fmt, ...)
 {
     va_list ap;
@@ -1413,6 +1945,10 @@ static void expect(bool ok, const char *fmt, ...)
     if (!ok) st_fail++;
 }
 
+/*
+ * rng -- xorshift64* pseudo-random generator with a fixed seed, so the selftest is
+ * reproducible.  Returns 64 random bits.
+ */
 static u64 rng_state = 0x9E3779B97F4A7C15ull;
 static u64 rng(void)
 {
@@ -1422,7 +1958,12 @@ static u64 rng(void)
     return rng_state * 0x2545F4914F6CDD1Dull;
 }
 
-/* run a quiet scan and hand back the result structure (caller frees) */
+/*
+ * quiet_scan -- run a checking scan of [start, end] with no output, for the selftest.
+ * Inputs:  chunk (0 = automatic), threads, report threshold, and optionally the
+ *          running sums O0/O0ovf and prime count at start (NULL = start from 0).
+ * Returns: the scan with its results; the caller frees it with scan_free.
+ */
 static scan_t *quiet_scan(u64 start, u64 end, u64 chunk, int threads, int report, const u128 *O0, const bool *O0ovf, u64 primes0)
 {
     scan_t *sc = scan_new();
@@ -1433,6 +1974,10 @@ static scan_t *quiet_scan(u64 start, u64 end, u64 chunk, int threads, int report
     return sc;
 }
 
+/*
+ * quiet_totals -- run a totals-only scan of [0, end] with no output; on return sc->O
+ * holds S_k at the largest prime <= end.  Caller frees.
+ */
 static scan_t *quiet_totals(u64 end, u64 chunk, int threads)
 {
     scan_t *sc = scan_new();
@@ -1442,6 +1987,10 @@ static scan_t *quiet_totals(u64 end, u64 chunk, int threads)
     return sc;
 }
 
+/*
+ * same_hits -- true iff two scans recorded exactly the same (p, depth) hits.  Sorts
+ * both hit lists as a side effect.
+ */
 static bool same_hits(scan_t *a, scan_t *b)
 {
     if (a->nhits != b->nhits) return false;
@@ -1452,6 +2001,17 @@ static bool same_hits(scan_t *a, scan_t *b)
     return true;
 }
 
+/*
+ * cmd_selftest -- the `selftest` command (option: -t threads).
+ * Checks, in order: the power tables; Miller-Rabin on known primes, Carmichael
+ * numbers and strong pseudoprimes (including the ones that fool the first 12 and 13
+ * prime bases); with GMP, agreement on 20000 random 64-bit and 3000 random 65..127-bit
+ * numbers plus 300 products of two primes; the OEIS example p = 13; the depth of
+ * a(7) by direct accumulation and by the parallel totals pipeline; reproduction of
+ * a(1..7) by a chunked scan to 6e8; identical hits and sums for three different chunk
+ * sizes; a scan starting at 3e8 after a totals pass; and a checkpoint round trip.
+ * Returns: 0 if everything passed, 1 otherwise (so `make test` fails loudly).
+ */
 static int cmd_selftest(int argc, char **argv)
 {
     int threads = 0;
@@ -1616,6 +2176,11 @@ static int cmd_selftest(int argc, char **argv)
 
 /* ------------------------------------------------------------------ */
 
+/*
+ * main -- line-buffer stdout (so `tee` and logs see hits immediately), detect whether
+ * stderr is a terminal, build the power tables, and dispatch on the command word.
+ * Returns: the command's status; 2 for a usage error.
+ */
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);

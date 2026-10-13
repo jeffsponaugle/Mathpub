@@ -206,7 +206,7 @@ directly comparable. The file headers have the full derivations.
 | `verify_a171775.py` | independent Python checks (`check`, `small`, `brute`) |
 | `scan_n10.*` | the M1 Pro a(10) run |
 | `scan_n11.*`, `metal/gpu_n11.*` | the a(11) runs (CPU and Metal) |
-| `b171775.txt` | b-file n = 1..10 |
+| `b171775.txt` | b-file n = 1..11 |
 | `submission.md` | OEIS edit for a(10)–a(11) (not yet submitted) and OEIS status check |
 
 ## Usage
@@ -240,12 +240,24 @@ On the Spark (nvcc is `/usr/local/cuda/bin/nvcc`; `make` in `cuda/`):
 `A171775_2D_LIB` (no `main`), and the CUDA one also sets `A171775_2D_NO_DRIVER` (no C11
 thread driver), so all three tools share the tables, survivor logic and state files.
 
-Searches are checkpointed with `-S`: the state file stores the frontier unit and the
-statistics, and rerunning the same command resumes. The 2D CPU and Metal tools share
-the state-file format and the unit numbering. `-E u` stops at unit u, and
-`a171775_2d -u n c HI` prints the first unit of base c; together they allow exact
-comparisons of slices. After SIGINT the tools finish their units in flight and save a
-consistent checkpoint. Solutions go to stdout, progress to stderr.
+Searches are checkpointed with `-S`: the state file stores the frontier unit, the
+statistics of exactly the units below it and the `fail` counts, and rerunning the same
+command resumes. Since 2026-10-12 every checkpoint is exact, including the ones written
+every 60 s while threads run, so a run stopped by `kill -9`, a crash or a power cut
+resumes to the same statistics and checksum as an uninterrupted one. (Before that, the
+CPU tools' periodic snapshots could include unfinished work, and resuming from one after a
+hard stop over-counted; a clean SIGINT/SIGTERM stop was always exact. The a(10) and a(11)
+results are unaffected: the segmented M1 Pro run matches the two uninterrupted atom2 runs
+in every statistic.) The 1D CPU and CUDA tools share one state-file format, and the 2D
+CPU, Metal and CUDA tools another, with the same unit numbering. `-E u` stops at unit u,
+and `a171775_2d -u n c HI` prints the first unit of base c; together they allow exact
+comparisons of slices (a state file whose frontier is beyond `-E` is refused). After
+SIGINT the tools finish their units in flight and save the checkpoint. A range without
+units prints "nothing to search" and an empty summary. Solutions go to stdout, progress
+to stderr.
+
+Each source file starts with a theory of operations, and every function has a comment
+with its inputs, outputs and error conditions.
 
 ## Performance notes
 

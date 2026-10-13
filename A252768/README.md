@@ -148,6 +148,17 @@ cc -O2 -std=gnu11 -pthread -I/opt/homebrew/include a252768.c \
    -L/opt/homebrew/lib -lprimesieve -lm -DHAVE_GMP -lgmp -o a252768
 ```
 
+On a Mac where the Xcode and Command Line Tools versions disagree (the link
+fails with a `tapi` / SDK error, or `cc` demands the Xcode license), build with
+the Command Line Tools toolchain instead:
+
+```
+DEVELOPER_DIR=/Library/Developer/CommandLineTools make
+```
+
+The source carries a "Theory of operation" section in its header comment and a
+description (inputs, effect, errors) above every function.
+
 ## Usage
 
 ```

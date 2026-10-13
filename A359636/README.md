@@ -278,13 +278,59 @@ python3 verify_a359636.py brute 6 1077940147
 python3 verify_a359636.py check-log scan_n9.txt
 ```
 
-Numbers may be written as decimal, `2^k`, `10^k`, `1e12`, or `X+Y` / `X-Y` of
-those. `scan` searches m ≡ 3 (mod 6) with START ≤ m ≤ END+2, so every gap with
-p ≤ END is covered. Options: `-t` threads, `-c` chunk size (k per chunk),
+Numbers may be written as decimal, `2^k`, `10^k`, `1e12`, or sums and
+differences of those (`10^12-1`, `7e16+12e9`), evaluated left to right; the CPU
+tool rejects values that do not fit in 64 bits and negative results. `scan`
+searches m ≡ 3 (mod 6) with START ≤ m ≤ END+2. That covers every gap with
+p ≤ END except a prime p = END when END ≡ 5 (mod 6) or p = END − 1 when
+END ≡ 0 (mod 6), whose m is p + 4; the result line of the CPU tool states the
+proven bound (END − 1 or END − 2 in those two cases). A scan with START > 9
+reports only on its own range ("smallest qualifying p with m in [A, B] is P" or
+"no qualifying gap with m in [A, B]"). Options: `-t` threads, `-c` chunk size (k per chunk),
 `-T` sieve prime bound (default automatic), `-S` state file, `-i` checkpoint
 interval, `-a` scan the whole range instead of stopping at the first certain
 a(n), `-q` quiet. Rerunning a `scan` with the same arguments and `-S` file
 resumes from the checkpoint; the state file also records solutions found so far.
+
+## Source documentation and the Oct 12 2026 review
+
+Both sources carry a THEORY OF OPERATION header (the reduction to triples
+around m ≡ 3 (mod 6) with its coverage lemma, the packed three-target sieve,
+the threshold trick, the choice of T and c, exact verification, threads,
+frontier and checkpoint, output, limits) and an In/Out/Errors block for every
+function. `a359636.c` also lists known imperfections (benign data races, the
+`-Q` pruning gap of `hunt`), and `cuda/a359636_cuda.cu` lists the issues
+below that are not yet fixed there.
+
+The review fixed five defects in the CPU tool `a359636.c`, each reproduced
+first and then retested; the CUDA file was changed only in its comments
+(code tokens and PTX identical), because the paused level-10 runs depend on it.
+
+* **Partial ranges.** A scan with START > 9 printed claims about a(N) itself,
+  for example `a(7) > 90000000000` for the range [8·10¹⁰, 9·10¹⁰] although
+  a(7) = 75582271489. It now reports only on its range, as the CUDA tool
+  already did.
+* **END ≡ 5 or 0 (mod 6).** A complete scan printed `a(N) > END`, which is not
+  proven when the prime END (or END − 1) has its m at p + 4, beyond END + 2;
+  example: the level-3 gap at p = 3911 ≡ 5 (mod 6) has m = 3915. The bound
+  printed is now min(END, covered_m + 1).
+* **Number parsing.** `10-3-2` gave 9, values above 2⁶⁴ were silently clamped,
+  `2^63+2^63` wrapped to 0, `5-7` wrapped, `1^4000000000` looped for 4.5 s,
+  and an empty argument was read past its end. Parsing is now left-to-right
+  with range checks, and those cases are rejected with a message.
+* **Checkpoint writes.** A failed write (e.g. disk full) replaced the state
+  file with an empty one, after which the scan could not resume ("bad state
+  file"). Write errors are now detected and the previous checkpoint is kept.
+* **Smaller items.** END within 65536 of 2⁶⁴ and START > END are rejected
+  up front, and the prime table is released with `primesieve_free()` as the
+  primesieve API requires (the code had used `free()`).
+
+Verification: the selftest passes (also under AddressSanitizer and
+UBSan); every case above was rerun; the comment pass changed no code (identical
+token stream, byte-identical object file). Not yet ported to the CUDA tool:
+the parsing, END-residue and checkpoint-write fixes, plus removing an unused
+128 MB host buffer there. Also noted: building the CPU tool with `-DPATC=0` sieves
+about 10% faster on the M1 Pro (2.10 vs 2.35 cycles per k, same results).
 
 ## Files
 
