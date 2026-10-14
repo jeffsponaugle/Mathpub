@@ -22,10 +22,58 @@ added a(10). The related entries A247177 (#25, 2020), A247178 (#24, 2021),
 A251623 (#37, 2021) and A252655 (#39, Nov 2025) are untouched and nothing from
 this work applies to them (A252655 already has a 1000-term b-file).
 
+## NEW (Oct 14 2026): a(11) = 1009809788912233 — submit together with a(10)
+
+Found by jeff-model2's continuation above 10^15 (37 minutes in, every chunk below it
+complete); the scans of [10^12, 10^14] (jeff-model1) and [10^14, 10^15] (jeff-model2)
+contain no prime of depth 11, so it is a(11). PARI/GP `isprime` proves S_1..S_11
+prime (`certify_a11.txt`). S_12 exceeds 2^128 and is being recomputed with GMP
+(`verify 1009809788912233 -k 14`, on jeff-model2 and jeff-model1 independently);
+until that finishes, treat the term as "certified, recomputation pending". Because
+a(n) is non-decreasing, a(12) >= a(11); if S_12 turns out prime then a(12) = a(11)
+too, otherwise the bound to submit is `a(12) > 1009809788912233`.
+
+```
+%S A252768 5,5,13,14593,372313,2315773,541613713,7952072743,21814967833,3770303151073,1009809788912233
+%e A252768 a(11) = 1009809788912233: the sums of the k-th powers of the gaps between the primes <= 1009809788912233 are prime for k = 1..11 (1009809788912231, 62234731803809413, 5657529453243494201, 680258345614629409297, 101712366014944608886241, 18180346330505067326217793, 3780026913945005398382926721, 896081555456003024041519984897, 238503222782742830604007067123201, 70414217271582880302629394661942273, 22833087308636059205086630623560611841).
+%E A252768 a(10)-a(11) from _Jeff Sponaugle_, Oct 14 2026
+```
+
+(The bound comment of item 1 becomes `a(12) > 1009809788912233` once S_12 is known
+composite; item 2's last sentence becomes "a(10) = 3770303151073 and a(11) =
+1009809788912233 lie at the heuristic's 21 % and 73 % points; it puts a(12) near
+3*10^16.")
+
+## NEW (Oct 13 2026): a(10) = 3770303151073 — ready to submit once the 10^14 run ends
+
+Found by resuming the 10^12 checkpoint on jeff-model1 (`scan 1e14 -S a252768.state`):
+the first prime of depth 10, with every chunk below it complete. Verified on the
+M1 Pro by the parallel totals pipeline with different chunking and GMP agreeing on
+all twelve verdicts (`verify_a10_pipeline.txt`), by the single-threaded direct
+recomputation (`verify_a10_direct.txt`) and by the Python/numpy verifier
+(`verify_py_a10.txt`). All ten sums are
+**proven prime**: S_1..S_7 by the deterministic bases, S_8..S_10 (90, 98, 106 bits)
+by PARI/GP 2.17.2 `isprime` (APR-CL) on jeff-model1 (`certify_a10.txt`); S_11 is
+composite. The edit summary can say "all sums certified prime with PARI/GP isprime".
+
+```
+%S A252768 5,5,13,14593,372313,2315773,541613713,7952072743,21814967833,3770303151073
+%e A252768 a(10) = 3770303151073: the sums of the k-th powers of the gaps between the primes <= 3770303151073 are 3770303151071, 190851794793757, 14196773503347641, 1394426672423205361, 170141494293736680161, 24799307171701546531777, 4202380711978049572942721, 811587406870679014576316161, 175934585824654713314446896641 and 42297466414050242039599107357697 for k = 1..10, all prime, while the sum of the 11th powers, 11167738558029370106410742901913601, is composite.
+%E A252768 a(10) from _Jeff Sponaugle_, Oct 13 2026
+```
+
+Together with it, replace the "a(10) > 10^12" bound of item 1 below by
+`a(11) > 10^14` (established Oct 13 2026 by the jeff-model1 run over [10^12, 10^14],
+all sums tested for k <= 12; raise it to the bound jeff-model2's [10^14, 10^15] run
+leaves, or to a(11) itself — 65 % by the model), and update item 2's comment: the sentence "This
+heuristic puts a(10) near 10^13 ..." becomes "a(10) = 3770303151073 lies at the
+heuristic's 21 % point; it puts a(11) near 4*10^14." Also extend `b252768.txt`
+(done, n = 1..10) and the DATA line (done).
+
 ## What can still be submitted
 
-Items 1, 2 and 4 are worth doing now; 3, 5, 6 are optional; 7 is the big one
-and needs the 3-hour run first.
+With a(10) in hand (above), items 1, 2 and 4 go into the same edit; 3, 5, 6 are
+optional; 7 is now about a(11).
 
 ### 1. Lower bound for a(10)  (recommended)
 
@@ -34,11 +82,11 @@ k ≤ 12) found no prime of depth 10. OEIS convention is a one-line comment for
 the next term:
 
 ```
-%C A252768 a(10) > 10^12. - _Jeff Sponaugle_, Oct 03 2026
+%C A252768 a(11) > 10^14. - _Jeff Sponaugle_, Oct 13 2026
 ```
 
-If the run to 10^14 happens first (see 7), submit a(10) itself or
-"a(10) > 10^14" instead.
+(The run to 10^14 is done; the a(10) bound is superseded by a(10) itself. If
+jeff-model2 finishes [10^14, 10^15] without a hit, make it `a(11) > 10^15`.)
 
 ### 2. Repair the Sep 16 comment  (recommended)
 
@@ -133,5 +181,5 @@ has a 21 % chance of a(11). Before submitting a new term:
   integers, independent Miller–Rabin): `verify_py_a8.txt`, `verify_py_a9.txt`.
 * Sums: see README "Results". All eight sums of a(8) and S_1..S_8 of a(9) are
   below 3.3*10^24 and therefore proven prime by the deterministic Miller–Rabin
-  bases; only S_9 of a(9) (88 bits, 1.6*10^26) is a probable prime (24 MR
-  bases + GMP's BPSW). PARI/GP `isprime` would certify it in milliseconds.
+  bases; S_9 of a(9) (88 bits) was proven prime with PARI/GP `isprime` on
+  jeff-model1 on Oct 13 2026 (`certify.sh 21814967833 scan_1e12.txt`).

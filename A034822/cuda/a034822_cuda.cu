@@ -1,33 +1,121 @@
 /*
  * a034822_cuda.cu -- GPU exhaustive search for palindromic squares of even length L
- * (OEIS A034822 / A263618).  Same method as ../a034822.c (see the header there):
+ * (OEIS A034822 / A263618).
  *
- *   n = t*10^h + B, B < 10^h.  B fixes the low h digits of S = n^2, hence (for a
- *   palindrome) the high h digits P, hence t to a window of width ~10^(D-2h).
- *   B is enumerated by a digit DFS; one window serves the 4 roots B, B + 5*10^(h-1),
- *   10^h - B, 5*10^(h-1) - B; 11 | n fixes t mod 11, so each root has <= 2 candidates.
+ * ===========================================================================
+ * PURPOSE
+ * ===========================================================================
  *
- * GPU layout: one thread per "base" = the low IB digits of B (unit digit 1..5,
- * unit 5 with tens digit 0..4).  The thread runs the remaining K = h - IB digit
- * levels (top digit 0..4) as template-unrolled loops.  sqrt(P*10^e) over the
- * thread's contiguous P range [Pb, Pb + 10^K) is a quadratic Taylor polynomial in
- * 2^-36 fixed point (one exact 128-bit isqrt per thread), evaluated once per
- * level-(h-1) parent and linearly for its 5 children.
+ * Lists every palindromic square S = n^2 with exactly L decimal digits, for even
+ * L = 40..70 (the lengths compiled into VARIANTS[]).  If none exists for an L,
+ * then L is a term of A034822; the first open case is L = 70 (all lengths <= 69
+ * were searched by De Geest / Xiao).  This is the GPU version of ../a034822.c and
+ * uses the same mathematics; read the THEORY OF OPERATION in that file first.
+ * This header summarizes it and describes what is specific to the GPU.
  *
- * Filters per candidate (all 64-bit): digits h,h+1 of S vs L-1-h,L-2-h through
- * D = t^2 + floor(2tB/10^h) - P*10^e mod 2^64; then 4 digit pairs; then an exact
- * 128-bit test of S digits h..2h-1 vs their mirrors.  Survivors (essentially only
- * true palindromes) are returned and fully verified on the host.
+ * ===========================================================================
+ * THEORY OF OPERATION (summary; details in ../a034822.c)
+ * ===========================================================================
  *
- * Only even L with h = L/4 rounded down (window <= 22) and h <= 17 are supported;
- * instantiated for L = 40..70.
+ * Notation: D = L/2 digits of n, split n = t*10^h + B with B < 10^h and h = L/4
+ * rounded down (h = 17 for L = 70); e = L - 3h; P = the top h digits of S.
  *
- * Usage:
+ *   - B fixes the low h digits of S (B^2 mod 10^h).  For a palindrome they are
+ *     the reversed top digits P, so t must lie in the window
+ *         isqrt(P*10^e) <= t <= isqrt((P+1)*10^e)     (width ~5..16 for L = 70).
+ *   - B is built by a digit DFS from the units digit up, carrying
+ *     Q = floor(B^2/10^i) so each new digit yields one more digit of S.
+ *   - Eight roots share one window: B, B + H5, -B, H5 - B (H5 = 5*10^(h-1)) and
+ *     their images under sigma2: B -> B*E' mod 10^h with E' = -1 (mod 2^h),
+ *     E' = 1 (mod 5^h).  Canonical B: unit digit 1..5 (unit 5: tens 0..4), top
+ *     digit 0..4, and the digit v2(B)+1 (which sigma2 shifts by 5) 0..4.
+ *   - Even-length palindromes are divisible by 11, so 11 | n: each root has one
+ *     residue class of t mod 11, i.e. at most 2 candidates in the window.
+ *
+ * GPU decomposition
+ * -----------------
+ *   - A "base" = the low IB digits of B (unit digit + IB-1 more), numbered
+ *     0 .. 5*10^(IB-1)-1 (IB = 10 for L = 70, i.e. 5*10^9 bases).  One thread
+ *     handles one base: it replays the IB digits (dstep_rt), then walks the
+ *     remaining K = h - IB levels (dfs_iter) down to the leaves (leafs).
+ *     Bases that violate a digit restriction are skipped (invalid).
+ *   - The host launches bases in batches (-b, default 2^20 per launch), collects
+ *     survivors, verifies them exactly, and checkpoints after every launch.
+ *
+ * Window computation (per leaf, integers only -- FP64 is slow on GB10)
+ * --------------------------------------------------------------------
+ *   Inside one thread P = Pb + u with 0 <= u < 10^K.  The thread computes
+ *   R = sqrt(Pb*10^e) once (exact 128-bit isqrt + double fraction) and stores
+ *   the Taylor polynomial sqrt((Pb+u)*10^e) - Rb ~ frac + u*s1 - u^2*s2 in fixed
+ *   point with 36 fractional bits (Base: FRAC, S1, S2 scaled by 2^(36+SQ)).  At
+ *   each level-(h-1) parent it evaluates V0 = v(u0) and the slope D0 =
+ *   v(u0+1) - v(u0); its 5 children (top digit 0..4) have P = P0 + s for their
+ *   S digit s, so their windows are [V0 + s*D0, V0 + (s+1)*D0], widened by
+ *   2^-10 on both sides.  The host checks that V < 2^64 can never overflow
+ *   (this exact overflow was a real bug before 2026-09-30, see README).
+ *
+ * Candidate filter (per root, 64-bit)
+ * -----------------------------------
+ *   D = t^2 + floor(2*t*f/2^64) - P*10^e (mod 2^64), f ~ root*2^64/10^h, is the
+ *   part of floor(S/10^(2h)) below the prefix P; a true hit has 0 <= D < 10^e,
+ *   so D mod 2^64 is exact where it matters.  The main filter compares 3 digit
+ *   pairs: the low digits low3 = (Bq + 2*t*root) mod 1000 (= S digits h..h+2)
+ *   must equal, reversed, the top digits floor(D / 10^(e-3)).  This is done as
+ *   "D in [rev3(low3)*10^(e-3) - SLACK, ... + 10^(e-3) + SLACK)" with a
+ *   1000-entry shared-memory table of rev3(l)*10^(e-3).  SLACK covers the error
+ *   of the f-based estimate.
+ *   Hits go into a small per-thread buffer and are processed once per leaf by
+ *   rare(): a 6-digit-pair 64-bit check (NB digits), then an exact 128-bit
+ *   check (exact_check) of digits h..2h-1 against their mirrors.  Survivors are
+ *   written to Out and verified on the host by full decimal conversion.
+ *
+ * Arithmetic notes
+ * ----------------
+ *   Several expressions wrap modulo 2^64 on purpose (D, the f of negated roots,
+ *   0 - fx, ...).  For the four roots x, x+H5, 10^h-x, H5-x of a group:
+ *     Bq(x+H5) = Q + x + Q25,  Bq(10^h-x) = 10^h - 2x + Q,  Bq(H5-x) = Q25 - x + Q
+ *     f(x+H5) = f + 2^63,      f(10^h-x) = -f,              f(H5-x) = 2^63 - f
+ *     G = floor(2*tlo*f/2^64) for f+2^63 is G + tlo; for -f it is 2*tlo - G - 1,
+ *     for 2^63 - f it is tlo - G - 1 (each within 1 of exact, covered by SLACK).
+ *
+ * Validation builds (all slower; abort/exit 3 on the first problem)
+ * -----------------------------------------------------------------
+ *   -DWINDOW_CHECK  compares every fixed-point window with exact 128-bit isqrt.
+ *   -DFILTER_CHECK  counts candidates that exact arithmetic accepts but the
+ *                   3-digit filter rejects (must be 0).
+ *   The independent cross-checks (../xcheck_subtree.py, ../base_of.py) and the
+ *   selftest are described in ../README.md.
+ *
+ * Tuning macros: -DMINB=n (min blocks per SM in __launch_bounds__; production
+ *   uses 2), -DLEAF_UNROLL=n (unroll of the 5-leaf loop; 1 is fastest).
+ *
+ * ===========================================================================
+ * USAGE
+ * ===========================================================================
+ *
  *   a034822_cuda search L [-b bases_per_launch] [-S state] [-r a:b] [-B blockdim]
- *   a034822_cuda selftest            (L = 40..52 against A263618)
- * Output: "FOUND L n n^2" lines, "DONE ..." at the end; progress on stderr.
+ *       L       even, 40..70
+ *       -b      bases per kernel launch (default 2^20 ~ 6 min at L = 70);
+ *               1 .. 2^30
+ *       -S      state file: written after every launch; a rerun with the same
+ *               L and -r range resumes from it
+ *       -r a:b  base range [a, b) (b = 0 or > count means "to the end"), for
+ *               splitting a run between GPUs/machines
+ *       -B      threads per block, a multiple of 32 in 32..256 (default 256)
+ *   a034822_cuda selftest [maxL]   even L = 40..maxL vs A263618 (maxL <= 68)
+ *
+ * Output: "FOUND L n n^2" lines on stdout as they are found, then
+ *   "DONE ..." (range finished) or "PARTIAL ..." (stopped by SIGINT/SIGTERM,
+ *   which is honoured between launches).  Progress on stderr every 10 s.
+ * Exit: 0 after a search, 1 on bad parameters/CUDA errors/output overflow,
+ *   2 on usage errors, 3 if a validation build detects a problem; selftest
+ *   returns 1 on any mismatch.
+ *
+ * Build (DGX Spark / GB10, sm_121):
+ *   nvcc -O3 -std=c++17 -arch=sm_121 -DMINB=2 -o a034822_cuda a034822_cuda.cu
  */
 #include <cuda_runtime.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <math.h>
 #include <signal.h>
@@ -44,26 +132,38 @@ typedef uint32_t u32;
 typedef unsigned __int128 u128;
 typedef __int128 i128;
 
+/* CK -- abort with a message on any CUDA runtime error. */
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(1); } } while (0)
 
+/* A263618: number of palindromic squares with n digits, n = 1..69 (68, 69 from
+ * De Geest's table).  KNOWN[70] = -1 marks the unknown L = 70.  Selftest only. */
 static const int KNOWN[71] = {0,
     4,0,3,0,7,1,5,0,11,0,5,1,19,0,13,1,25,0,18,0,48,1,31,0,70,1,44,2,105,
     0,70,1,153,1,98,3,209,0,132,0,291,1,181,1,384,0,234,2,496,1,301,1,
     636,0,383,0,798,1,474,1,981,0,578,0,1199,2,701,1,1443,-1};
 
+/* p10 -- 10^k as a compile-time constant (k <= 19). */
 __host__ __device__ constexpr u64 p10(int k) { return k == 0 ? 1ull : 10ull * p10(k - 1); }
 
+/* SLACK: tolerance of the 64-bit filter.  floor(2*t*f/2^64) differs from the
+ * exact floor((2*t*root + Bq)/10^h) by < ~20 at L = 70 (f is a truncated
+ * binary fraction, plus the +-1 group identities); SLACK = 64 covers that and
+ * is negligible next to the digit spacing 10^(e-3) = 10^16. */
 #define SLACK 64ull
 #ifndef LEAF_UNROLL
 #define LEAF_UNROLL 1
 #endif
-constexpr int kLeafUnroll = LEAF_UNROLL;
+constexpr int kLeafUnroll = LEAF_UNROLL; /* #pragma unroll needs a constant expression */
 #ifndef MINB
 #define MINB 1
 #endif
-#define MAXOUT 4096
+#define MAXOUT 4096 /* survivors per launch; at L = 70 essentially only true palindromes survive */
 
+/* Per-launch output, zeroed by the host before each launch.
+ *   nodes/filt/passB/pass3  leaves, 3-digit filter hits, 6-digit passes, exact passes
+ *   nout, t[], b[]          survivors (n = t*10^h + b), at most MAXOUT stored
+ *   dbg[0]                  FILTER_CHECK failures, dbg[1] WINDOW_CHECK failures */
 struct Out {
     unsigned long long nodes, filt, passB, pass3;
     unsigned int nout;
@@ -73,12 +173,19 @@ struct Out {
 
 /* ---------------- device helpers ---------------- */
 
+/* d_u128_to_double -- u128 -> double (rounded), as in the CPU version. */
 __device__ __forceinline__ double d_u128_to_double(u128 x)
 {
     return (double)(u64)(x >> 64) * 18446744073709551616.0 + (double)(u64)x;
 }
 
-/* floor(x/d), quotient < 2^64 */
+/*
+ * d_udiv128_64 -- exact floor(x/d).
+ *   In:  x (128-bit), d > 0.  Precondition: the quotient fits in 64 bits.
+ *   Out: the quotient.  How: double estimate, exact 128-bit remainder, second
+ *        estimate, +-1 fix-up.  Used once per thread (base isqrt) and in
+ *        WINDOW_CHECK builds.  Garbage if the preconditions are violated.
+ */
 __device__ __forceinline__ u64 d_udiv128_64(u128 x, u64 d)
 {
     double qd = d_u128_to_double(x) / (double)d;
@@ -93,6 +200,10 @@ __device__ __forceinline__ u64 d_udiv128_64(u128 x, u64 d)
     return q;
 }
 
+/*
+ * d_isqrt128 -- exact floor(sqrt(x)) for x < 2^127 (double estimate, one Newton
+ * step, +-1 fix-up).  x = 0 returns 0.  Larger x can overflow the (r+1)^2 test.
+ */
 __device__ __forceinline__ u64 d_isqrt128(u128 x)
 {
     if (x == 0) return 0;
@@ -105,56 +216,72 @@ __device__ __forceinline__ u64 d_isqrt128(u128 x)
     return r;
 }
 
-__constant__ unsigned char c_rev2[100];
-__constant__ u64 c_f64[20]; /* floor(2^64/10^k) */
-__constant__ u64 c_p10[20];
+/* Constant tables, uploaded by the host (main(), run()). */
+__constant__ u64 c_f64[20]; /* floor(2^64/10^k); c_f64[0] unused */
+__constant__ u64 c_p10[20]; /* 10^k (for runtime-indexed powers) */
 
+/* Compile-time constants for one (L, h). */
 template <int L, int H>
 struct Cfg {
     static constexpr int e = L - 3 * H;
     static constexpr u64 PE = p10(e);          /* 10^e */
-    static constexpr u64 PEX = p10(e - 2);     /* 10^(e-2) */
-    static constexpr int NB = (e >= 12) ? 6 : (e >= 9) ? 4 : 0;
-    static constexpr u64 PN = p10(e - NB);
-    static constexpr u64 PH = p10(H);
-    static constexpr u64 H5 = 5 * p10(H - 1);
-    static constexpr u64 Q25 = 25 * p10(H - 2);
+    static constexpr u64 PEX = p10(e - 2);     /* 10^(e-2): spacing of the 2-digit prefix in exact_check */
+    static constexpr int NB = (e >= 12) ? 6 : (e >= 9) ? 4 : 0; /* digit pairs checked in rare() */
+    static constexpr u64 PN = p10(e - NB);     /* spacing for the NB-digit check */
+    static constexpr u64 PH = p10(H);          /* 10^h */
+    static constexpr u64 H5 = 5 * p10(H - 1);  /* 10^h / 2 */
+    static constexpr u64 Q25 = 25 * p10(H - 2); /* H5^2 / 10^h */
     static constexpr u64 H5M11 = H5 % 11;
     static constexpr u64 PHM11 = PH % 11;
 };
 
+/* Window polynomial of one thread (see "Window computation" above).
+ *   Pb, Rb   base P and floor(sqrt(Pb*10^e))
+ *   S1, FRAC slope and fraction in 2^-36 units
+ *   S2       curvature, scaled by 2^(36+SQ) (SQ chosen by the host)
+ *   rb11, rb1000   Rb mod 11 and mod 1000 (for residues of t = Rb + offset) */
 struct Base {
     u64 Pb, Rb, S1, FRAC, S2; /* fixed point 2^-36; S2 = s2 * 2^(36+SQ) */
-    u32 rb11, rb100, rb1000;
+    u32 rb11, rb1000;
 };
 
+/* Per-thread filter-hit buffer.  At most 2 groups x 4 roots x 2 candidates = 16
+ * hits can be pushed per leaf, and the buffer is flushed after every leaf, so
+ * HITBUF = 16 can never overflow. */
 #define HITBUF 16
 struct Hit { u64 t, Bp, Bq, D; u32 y; };
+/* Per-thread statistics and the hit buffer pointer (kept separate from the
+ * array so the counters stay in registers). */
 struct Thr {
     unsigned long long nodes, filt, passB, pass3;
     int nh;
     Hit *hb; /* per-thread local array, touched only on filter hits */
 };
 
-__device__ __forceinline__ u64 addm(u64 a, u64 b, u64 m) { u64 c = a + b; return c >= m ? c - m : c; }
-__device__ __forceinline__ u64 subm(u64 a, u64 b, u64 m) { return a >= b ? a - b : a + m - b; }
-
-/* exact stage: S digits h..min(2h-1, L-1-2h) must mirror; integer-only (u128 divides are rare) */
+/*
+ * exact_check -- exact test of a candidate that passed the 64-bit filters.
+ *   In:  t, Bp, Bq = floor(Bp^2/10^h), P (top h digits), y = the 2 digits that
+ *        must follow P (reverse of S digits h, h+1).
+ *   Out: 1 if the top h+2 digits of S are exactly P*100 + y and S digits
+ *        h+2 .. min(2h-1, L-1-2h) mirror their partners in Y = floor(S/10^(2h)),
+ *        else 0.  Remaining middle digits are checked by the host.
+ *   Uses 128-bit divisions (slow, but reached by ~1e-7 of the candidates).
+ */
 template <int L, int H>
 __device__ __forceinline__ int exact_check(u64 t, u64 Bp, u64 Bq, u64 P, u64 y)
 {
     typedef Cfg<L, H> C;
-    u128 Cc = (u128)2 * t * Bp + Bq;
+    u128 Cc = (u128)2 * t * Bp + Bq;          /* S = t^2 10^(2h) + Cc 10^h + (Bp^2 mod 10^h) */
     u64 X = (u64)(Cc / C::PH);
-    u64 c0 = (u64)(Cc - (u128)X * C::PH);
-    u128 Y = (u128)t * t + X;
+    u64 c0 = (u64)(Cc - (u128)X * C::PH);     /* S digits h .. 2h-1 */
+    u128 Y = (u128)t * t + X;                 /* floor(S / 10^(2h)) */
     if ((u64)(Y / C::PEX) != P * 100 + y) return 0;
-    u64 Ym = (u64)(Y % 10000000000000000000ull);
+    u64 Ym = (u64)(Y % 10000000000000000000ull); /* low 19 digits of Y */
     int pmax = 2 * H - 1;
     if (pmax > L - 1 - 2 * H) pmax = L - 1 - 2 * H;
     u64 pw = 100;
     for (int p = H + 2; p <= pmax; p++, pw *= 10) {
-        int q = L - 1 - p - 2 * H;
+        int q = L - 1 - p - 2 * H; /* S digit p mirrors S digit L-1-p = Y digit q */
         if (q > 18) continue;
         u64 pq = c_p10[q];
         if ((c0 / pw) % 10 != (Ym / pq) % 10) return 0;
@@ -162,6 +289,7 @@ __device__ __forceinline__ int exact_check(u64 t, u64 Bp, u64 Bq, u64 P, u64 y)
     return 1;
 }
 
+/* rev_digits -- reverse the n low decimal digits of x (x < 10^n). */
 __device__ __forceinline__ u32 rev_digits(u32 x, int n)
 {
     u32 r = 0;
@@ -169,7 +297,21 @@ __device__ __forceinline__ u32 rev_digits(u32 x, int n)
     return r;
 }
 
-/* filter hit: check S digits h..h+NB-1 against their mirrors in 64-bit, then exact */
+/*
+ * rare -- process one filter hit (rare path, one code copy per leaf loop).
+ *   In:  t, Bp, Bq     candidate and root
+ *        P             leaf's top digits
+ *        D             64-bit filter value (approximate within SLACK)
+ *        y             2 digits that must follow P
+ *        st, out       statistics; survivors are appended to out
+ *   Steps: (1) NB-digit check: low = (Bq + 2 t Bp) mod 10^NB must equal the
+ *        reversed top digits floor(D / 10^(e-NB)), unless D is within SLACK of
+ *        a digit boundary (then undecided -> continue); (2) exact_check;
+ *        (3) store (t, Bp) for host verification.
+ *   Errors: if more than MAXOUT survivors occur in one launch, the extras are
+ *        counted in nout but not stored; the host then stops with an error
+ *        (rerun that launch with a smaller -b).
+ */
 template <int L, int H>
 __device__ __forceinline__ void rare(u64 t, u64 Bp, u64 Bq, u64 P, u64 D, u32 y, Thr &st, Out *out)
 {
@@ -192,9 +334,26 @@ __constant__ u64 c_ce[20];  /* 10^i * E' mod 10^h, E' = -1 (mod 2^h), 1 (mod 5^h
 
 /* main filter: 3 digit pairs after P.  low3 = (Bq + 2 t Bp) mod 1000 = S digits h..h+2;
  * the top digits after P are D / 10^(e-3) and must equal rev3(low3); s_y3p[l] = rev3(l) * 10^(e-3). */
+/* rev3 -- reverse a 3-digit number (l < 1000); red -- x mod m for x < 2m. */
 __device__ __forceinline__ u32 rev3(u32 l) { u32 a = l / 100, r = l - 100 * a, b = r / 10, c = r - 10 * b; return 100 * c + 10 * b + a; }
 __device__ __forceinline__ u32 red(u32 x, u32 m) { return x >= m ? x - m : x; } /* x < 2m */
 
+/*
+ * root -- apply the 3-digit filter to the candidates of one root.
+ *   In:  Bp, Bq, f   the root, floor(Bp^2/10^h), f ~ Bp*2^64/10^h
+ *        G           floor(2*tlo*f/2^64) (+-1), shared per group
+ *        m           2*Bp mod 1000;  q1000 = Bq mod 1000
+ *        k           t0 = tlo + k is the root's first candidate (0 <= k <= 10)
+ *        E0          tlo^2 - P*10^e (mod 2^64);  A2 = 2*tlo
+ *        tlo, thi    window;  tm1000 = tlo mod 1000
+ *        y3p         shared table rev3(l)*10^(e-3)
+ *        NE          template: number of candidates per root (1 if the
+ *                    thread's windows are <= 11 wide, else 2)
+ *   Out: pushes (t, Bp, Bq, D, y) into st.hb for each candidate t <= thi that
+ *        passes the filter.  Branch-free except the (rare) push.
+ *   How: D(t0) = E0 + (A2 + k)*k + G + floor(2k*f/2^64), with the last term
+ *        approximated as (2k*(f>>32))>>32 (error <= 1).
+ */
 template <int L, int H, int NE>
 __device__ __forceinline__ void root(u64 Bp, u64 Bq, u64 f, u64 G, u32 m, u32 q1000, u32 k, u64 E0,
                                      u64 A2, u64 tlo, u32 tm1000, u64 thi, const u64 *y3p, Thr &st, Out *out)
@@ -205,17 +364,10 @@ __device__ __forceinline__ void root(u64 Bp, u64 Bq, u64 f, u64 G, u32 m, u32 q1
     u64 t0 = tlo + k;
     /* D = t^2 + floor(2 t f/2^64) - P*10^e (mod 2^64), E0 = tlo^2 - P*10^e, A2 = 2 tlo */
     u64 D0 = E0 + (A2 + k) * k + G + ((2ull * k * fh) >> 32);
-    u32 tt = tm1000 + k;
-#ifdef EXP_NOLOW
-    u32 l0 = (q1000 + tt) & 511;
-#else
+    u32 tt = tm1000 + k; /* t0 mod 1000, possibly + 1000 (harmless: only m*tt mod 1000 is used) */
     u32 l0 = (q1000 + m * tt) % 1000;
-#endif
-#ifdef EXP_NOLDS
-    bool h0 = (t0 <= thi) & (D0 + SLACK - (u64)l0 * PX3 < PX3 + 2 * SLACK);
-#else
+    /* unsigned trick: D0 in [y3p - SLACK, y3p + PX3 + SLACK) */
     bool h0 = (t0 <= thi) & (D0 + SLACK - y3p[l0] < PX3 + 2 * SLACK);
-#endif
 #ifdef FILTER_CHECK
     {
         /* exact D mod 2^64 (exact in the accept region): t^2 + floor((2 t Bp + Bq)/10^h) - P 10^e,
@@ -227,12 +379,9 @@ __device__ __forceinline__ void root(u64 Bp, u64 Bq, u64 f, u64 G, u32 m, u32 q1
         if (t0 <= thi && Dex >= w && Dex < w + PX3 && !h0) atomicAdd((unsigned long long *)&out->dbg[0], 1ull);
     }
 #endif
-#ifdef EXP_NOPUSH
-    st.filt += h0;
-#else
     if (h0) { int i = st.nh++; st.hb[i].t = t0; st.hb[i].Bp = Bp; st.hb[i].Bq = Bq; st.hb[i].D = D0; st.hb[i].y = rev3(l0) / 10; }
-#endif
     if (NE == 2) {
+        /* second candidate t1 = t0 + 11 (only exists when the window is > 11 wide) */
         u64 t1 = t0 + 11;
         u32 k1 = k + 11;
         u64 D1 = E0 + (A2 + k1) * k1 + G + ((2ull * k1 * fh) >> 32);
@@ -242,7 +391,16 @@ __device__ __forceinline__ void root(u64 Bp, u64 Bq, u64 f, u64 G, u32 m, u32 q1
     }
 }
 
-/* the four roots x, x + H5, 10^h - x, H5 - x (x < H5) sharing one window */
+/*
+ * group -- the four roots x, x + H5, 10^h - x, H5 - x (x < H5) sharing one window.
+ *   In:  x, Qx = floor(x^2/10^h), fx ~ x*2^64/10^h, bx11 = x mod 11,
+ *        bx1000 = x mod 1000, qx1000 = Qx mod 1000; E0, tlo, thi, tm11 = tlo mod 11,
+ *        tm1000 = tlo mod 1000, y3p, st, out.
+ *   Out: calls root() four times.  One 64x64 multiply-high (G) per group; the
+ *        partners' G, Bq, f, residues follow from the identities in the header.
+ *   The mod-11 offsets: root r needs t = -(-1)^h r (mod 11) (because 10 = -1),
+ *        and k = (that - tlo) mod 11.
+ */
 template <int L, int H, int NE>
 __device__ __forceinline__ void group(u64 x, u64 Qx, u64 fx, u32 bx11, u32 bx1000, u32 qx1000, u64 E0,
                                       u64 tlo, u32 tm11, u32 tm1000, u64 thi, const u64 *y3p, Thr &st, Out *out)
@@ -265,17 +423,41 @@ __device__ __forceinline__ void group(u64 x, u64 Qx, u64 fx, u32 bx11, u32 bx100
                    E0, A2, tlo, tm1000, thi, y3p, st, out);
 }
 
-/* digit state for B (low I digits) and B2 = B E' mod 10^h */
+/* digit state for B (low I digits) and B2 = B E' mod 10^h:
+ *   B, Q = floor(B^2/10^I), P (S digits 0..I-1 reversed into the top), f, b11
+ *   B2f = B*E' mod 10^h (full), and B2, Q2, f2, b211 for the low I digits of B2. */
 struct DS {
     u64 B, Q, P, f, B2f, B2, Q2, f2;
     u32 b11, b211;
 };
 
+/*
+ * s2_level -- is digit i the one sigma2 shifts by 5 (so it must be 0..4)?
+ *   True iff ctz(B mod 10^i) == i-1, 1 <= i <= h-2 and the unit digit is not 5.
+ *   (Same rule as the CPU version; B = 0 never occurs because the unit digit
+ *   is 1..5.)
+ */
 __device__ __forceinline__ bool s2_level(int i, u64 B, bool unit5, int H)
 {
     return !unit5 && i >= 1 && i <= H - 2 && B != 0 && (__ffsll((long long)B) - 1) == i - 1;
 }
 
+/*
+ * leafs -- process the 5 leaves below one level-(h-1) parent (top digit 0..4).
+ *   In:  a       state with h-1 digits fixed
+ *        s2      sigma2 restriction applied (test the 4 sigma2 roots too)
+ *        bs, SQ  window polynomial and its S2 scale
+ *        b10k, b210k   B mod 10^4 and B2 mod 10^4 (constant per thread: the
+ *                low digits are fixed by the base)
+ *        y3p, st, out
+ *   Per leaf: S digit s and Q from v mod 10^4 (32-bit), the window from the
+ *        fixed-point polynomial, E0 = tlo^2 - P*10^e, residues of tlo, then
+ *        group() for B and (if s2) for the sigma2 image, then the hit buffer is
+ *        flushed through rare().
+ *   Sigma2 image of the top digit: E' = 1 (mod 10), so the top digit of
+ *        B*E' mod 10^h is (top digit of a.B2f + d) mod 10.  If the image is
+ *        >= H5 it is reduced by H5 (the group covers both).
+ */
 template <int L, int H, int NE>
 __device__ __forceinline__ void leafs(const DS &a, bool s2, const Base &bs, int SQ, u32 b10k, u32 b210k,
                                       const u64 *y3p, Thr &st, Out *out)
@@ -316,13 +498,8 @@ __device__ __forceinline__ void leafs(const DS &a, bool s2, const Base &bs, int 
 #endif
         u64 E0 = tlo * tlo - (W0base + s * C::PE);
         u32 tm11 = (u32)((bs.rb11 + 11 + wa) % 11), tm1000 = (u32)((bs.rb1000 + 1000 + wa) % 1000);
-#ifdef NO_ROOTS
-        st.filt += (B ^ Q ^ f ^ b11 ^ P ^ E0 ^ tlo ^ tm11 ^ tm1000 ^ thi ^ vm) & 1;
-        if (0) {
-#else
         group<L, H, NE>(B, Q, f, b11, b1000, vm / 10, E0, tlo, tm11, tm1000, thi, y3p, st, out);
         if (s2) {
-#endif
             u32 d2 = (b2top + d) % 10; /* E' = 1 (mod 10): top digit of B2 shifts with d */
             u64 B2 = a.B2 + d2 * p10(I);
             u64 v2 = a.Q2 + 2 * d2 * a.B2 + (u64)(d2 * d2) * p10(I);
@@ -336,6 +513,7 @@ __device__ __forceinline__ void leafs(const DS &a, bool s2, const Base &bs, int 
             }
             group<L, H, NE>(B2, Q2, f2, b211, b21000, q21000, E0, tlo, tm11, tm1000, thi, y3p, st, out);
         }
+        /* flush the filter hits of this leaf (one copy of the rare path) */
         if (st.nh) {
 #pragma unroll 1
             for (int i = 0; i < st.nh; i++) rare<L, H>(st.hb[i].t, st.hb[i].Bp, st.hb[i].Bq, P, st.hb[i].D, st.hb[i].y, st, out);
@@ -344,6 +522,12 @@ __device__ __forceinline__ void leafs(const DS &a, bool s2, const Base &bs, int 
     }
 }
 
+/*
+ * dstep -- append digit d at the compile-time level I (see the CPU dstep()).
+ *   S digit I = v mod 10 with v = Q + 2 d B + d^2 10^I; the sigma2 image's
+ *   digit I is read from B2f = B*E' mod 10^h and appended to B2/Q2/f2/b211.
+ *   All divisors are compile-time constants (multiply-high, no division calls).
+ */
 template <int H, int I>
 __device__ __forceinline__ void dstep(const DS &a, DS &n, u32 d)
 {
@@ -364,7 +548,8 @@ __device__ __forceinline__ void dstep(const DS &a, DS &n, u32 d)
     n.b211 = (a.b211 + d2 * (u32)(p10(I) % 11)) % 11;
 }
 
-/* runtime-level version for the base replay */
+/* dstep_rt -- same as dstep with a runtime level I (powers from c_p10; uses real
+ * 64-bit divisions, so only used for the per-thread base replay). */
 __device__ __forceinline__ void dstep_rt(const DS &a, DS &n, u32 d, int I, int H)
 {
     u64 pI = c_p10[I], ph = c_p10[H];
@@ -384,7 +569,9 @@ __device__ __forceinline__ void dstep_rt(const DS &a, DS &n, u32 d, int I, int H
     n.b211 = (u32)((a.b211 + d2 * (pI % 11)) % 11);
 }
 
-/* dstep with a runtime level I in [I0, H-2], dispatched to compile-time constants */
+/* dstep with a runtime level I in [I0, H-2], dispatched to compile-time constants
+ * (a chain of comparisons resolved at compile time; the dstep_rt fallback is
+ * never reached at run time) */
 template <int H, int I0>
 __device__ __forceinline__ void dstep_ct(const DS &a, DS &n, u32 d, int I)
 {
@@ -396,8 +583,17 @@ __device__ __forceinline__ void dstep_ct(const DS &a, DS &n, u32 d, int I)
     }
 }
 
-/* iterative DFS over levels IB..H-2 (stack in local memory, touched once per 5 leaves);
- * the leaf parent level H-1 runs in registers (leafs) */
+/*
+ * dfs_iter -- iterative DFS over levels IB..H-2 of one thread's subtree.
+ *   In:  a0 (state after the IB base digits), s2_0 (sigma2 restriction already
+ *        applied in the base), bs, SQ, b1000/b21000 (B, B2 mod 10^4), y3p, st, out.
+ *   Out: calls leafs() for every level-(h-1) parent.
+ *   The explicit stack (stk/dig/dmx/s2s, K entries) lives in local memory and
+ *   is touched once per parent; keeping a recursive template version in
+ *   registers needed > 255 registers.  Digit limit per level is 9, or 4 where
+ *   s2_level() applies (the unit-5 exception only matters at level 1, which is
+ *   always inside the base).
+ */
 template <int L, int H, int IB, int NE>
 __device__ __forceinline__ void dfs_iter(const DS &a0, bool s2_0, const Base &bs, int SQ, u32 b1000, u32 b21000,
                                          const u64 *y3p, Thr &st, Out *out)
@@ -407,8 +603,8 @@ __device__ __forceinline__ void dfs_iter(const DS &a0, bool s2_0, const Base &bs
         leafs<L, H, NE>(a0, s2_0, bs, SQ, b1000, b21000, y3p, st, out);
     } else {
         DS stk[K];
-        unsigned char dig[K], dmx[K];
-        bool s2s[K];
+        unsigned char dig[K], dmx[K]; /* next digit to try, max digit, per level */
+        bool s2s[K];                  /* sigma2 flag for the children of each level */
         stk[0] = a0;
         {
             bool r = s2_level(IB, a0.B, false, H);
@@ -419,7 +615,7 @@ __device__ __forceinline__ void dfs_iter(const DS &a0, bool s2_0, const Base &bs
         int lv = 0;
 #pragma unroll 1
         while (lv >= 0) {
-            if (dig[lv] > dmx[lv]) { lv--; continue; }
+            if (dig[lv] > dmx[lv]) { lv--; continue; } /* level exhausted: back up */
             u32 d = dig[lv]++;
             DS n;
             dstep_ct<H, IB>(stk[lv], n, d, IB + lv);
@@ -438,10 +634,23 @@ __device__ __forceinline__ void dfs_iter(const DS &a0, bool s2_0, const Base &bs
     }
 }
 
+/*
+ * search_kernel -- one thread per base k = base0 + global thread index.
+ *   In:  base0, nbases (bases of this launch), SQ (S2 scale), out.
+ *   Out: per-launch counters (warp-reduced, then atomically added) and the
+ *        survivors in out.  Threads with idx >= nbases or an invalid base only
+ *        take part in the shared-memory setup and the warp reduction (blockDim
+ *        must be a multiple of 32 for the full-mask shuffles).
+ *   Steps per valid base: replay the IB digits (validity: unit 5 needs tens
+ *        <= 4, sigma2-restricted digits <= 4); exact sqrt base and fixed-point
+ *        Taylor coefficients; choose NE (1 if s1 < 9.9, i.e. every window in
+ *        this thread is at most 11 wide, else 2); run the DFS.
+ */
 template <int L, int H, int IB>
-__global__ void __launch_bounds__(256, MINB) search_kernel(u64 base0, u64 nbases, int SQ, int use_s2, Out *out)
+__global__ void __launch_bounds__(256, MINB) search_kernel(u64 base0, u64 nbases, int SQ, Out *out)
 {
     typedef Cfg<L, H> C;
+    /* shared table: s_y3p[l] = rev3(l) * 10^(e-3), the filter target for low digits l */
     __shared__ u64 s_y3p[1000];
     for (int i = threadIdx.x; i < 1000; i += blockDim.x) s_y3p[i] = (u64)rev3(i) * p10(C::e - 3);
     __syncthreads();
@@ -454,7 +663,7 @@ __global__ void __launch_bounds__(256, MINB) search_kernel(u64 base0, u64 nbases
     if (idx < nbases) {
         u64 k = base0 + idx;
         u64 per = p10(IB - 1);
-        u64 u = 1 + k / per, rest = k % per;
+        u64 u = 1 + k / per, rest = k % per;   /* unit digit 1..5, digits 1..IB-1 in rest */
         bool unit5 = (u == 5);
         bool valid = !(unit5 && (rest % 10) > 4);
         DS a = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, n;
@@ -463,11 +672,12 @@ __global__ void __launch_bounds__(256, MINB) search_kernel(u64 base0, u64 nbases
         for (int i = 0; i < IB && valid; i++) {
             u32 d = (i == 0) ? (u32)u : (u32)(rr % 10);
             if (i > 0) rr /= 10;
-            if (use_s2 && s2_level(i, a.B, unit5, H)) { if (d > 4) valid = false; s2 = true; }
+            if (s2_level(i, a.B, unit5, H)) { if (d > 4) valid = false; s2 = true; }
             dstep_rt(a, n, d, i, H);
             a = n;
         }
         if (valid) {
+            /* window base: exact isqrt, then the Taylor coefficients in fixed point */
             Base bs;
             u128 X = (u128)a.P * C::PE;
             u64 r = d_isqrt128(X);
@@ -477,11 +687,10 @@ __global__ void __launch_bounds__(256, MINB) search_kernel(u64 base0, u64 nbases
             double s1 = Rreal / (2.0 * Pd), s2d = Rreal / (8.0 * Pd * Pd);
             bs.Pb = a.P;
             bs.Rb = r;
-            bs.FRAC = (u64)(frac * 68719476736.0);
+            bs.FRAC = (u64)(frac * 68719476736.0); /* 2^36 */
             bs.S1 = (u64)(s1 * 68719476736.0);
             bs.S2 = (u64)(s2d * ldexp(1.0, 36 + SQ));
             bs.rb11 = (u32)(r % 11);
-            bs.rb100 = (u32)(r % 100);
             bs.rb1000 = (u32)(r % 1000);
             u32 b1000 = (u32)(a.B % 10000), b21000 = (u32)(a.B2 % 10000); /* mod 10^4 */
             /* window width <= 11 everywhere in this thread: one candidate per root */
@@ -490,6 +699,7 @@ __global__ void __launch_bounds__(256, MINB) search_kernel(u64 base0, u64 nbases
             else dfs_iter<L, H, IB, 2>(a, s2, bs, SQ, b1000, b21000, s_y3p, st, out);
         }
     }
+    /* warp reduction of the counters, then one atomic per warp */
     for (int o = 16; o > 0; o >>= 1) {
         st.nodes += __shfl_down_sync(0xffffffff, st.nodes, o);
         st.filt += __shfl_down_sync(0xffffffff, st.filt, o);
@@ -506,6 +716,8 @@ __global__ void __launch_bounds__(256, MINB) search_kernel(u64 base0, u64 nbases
 
 /* ---------------- host ---------------- */
 
+/* square_digits -- decimal digits of n^2 into out (>= 80 chars); returns the
+ * digit count.  Base-10^9 schoolbook multiplication; see the CPU version. */
 static int square_digits(u128 n, char *out)
 {
     u64 a[6] = {0}, s[12] = {0};
@@ -535,6 +747,7 @@ static int square_digits(u128 n, char *out)
     return len;
 }
 
+/* u128_str -- decimal string of n into out (>= 40 chars). */
 static void u128_str(u128 n, char *out)
 {
     char buf[64];
@@ -544,6 +757,7 @@ static void u128_str(u128 n, char *out)
     out[len] = 0;
 }
 
+/* now_sec -- monotonic time in seconds. */
 static double now_sec(void)
 {
     struct timespec ts;
@@ -551,40 +765,96 @@ static double now_sec(void)
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/* SIGINT/SIGTERM set stop_flag; run() stops after the current launch. */
 static volatile sig_atomic_t stop_flag = 0;
 static void on_sig(int s) { (void)s; stop_flag = 1; }
 
+/* Each compiled (L, h, IB) has a launcher with this signature. */
 typedef void (*launch_fn)(u64 base0, u64 nb, int SQ, Out *out, int bd);
-static int g_use_s2 = 1;
 
+/* launch -- start search_kernel<L,H,IB> for bases [base0, base0+nb) with bd
+ * threads per block (asynchronous; errors are picked up by cudaGetLastError). */
 template <int L, int H, int IB>
 static void launch(u64 base0, u64 nb, int SQ, Out *out, int bd)
 {
     u64 blocks = (nb + bd - 1) / bd;
-    search_kernel<L, H, IB><<<(unsigned)blocks, bd>>>(base0, nb, SQ, g_use_s2, out);
+    search_kernel<L, H, IB><<<(unsigned)blocks, bd>>>(base0, nb, SQ, out);
 }
 
 struct Variant { int L, H, IB; launch_fn fn; };
 
-/* IB from the cubic Taylor bound: (h+e)/2 + 3(1-IB) - log10(16) < -8, K = h - IB <= 7 */
+/* ib_for -- base depth IB: the smallest depth with the cubic Taylor term
+ * Rb*U^3/(16 Pb^3) < 1e-8 (U = 10^(h-IB)) and K = h - IB <= 7; same rule as
+ * the CPU setup(), evaluated at compile time. */
 static constexpr int ib_for(int L, int H)
 {
     int e = L - 3 * H;
     for (int ib = 2; ib <= H - 1; ib++) {
-        double lg = (H + e) / 2.0 + 3.0 * (1 - ib) - 1.2041199826559248;
+        double lg = (H + e) / 2.0 + 3.0 * (1 - ib) - 1.2041199826559248; /* log10(16) */
         if (lg < -8 && H - ib <= 7) return ib;
     }
     return H - 1;
 }
 
+/* Compiled lengths.  h = floor(L/4) keeps every window <= 22 wide. */
 #define VAR(L, H) { L, H, ib_for(L, H), launch<L, H, ib_for(L, H)> }
 static const Variant VARIANTS[] = {
     VAR(40, 10), VAR(42, 10), VAR(44, 11), VAR(46, 11), VAR(48, 12), VAR(50, 12), VAR(52, 13), VAR(54, 13),
     VAR(56, 14), VAR(58, 14), VAR(60, 15), VAR(62, 15), VAR(64, 16), VAR(66, 16), VAR(68, 17), VAR(70, 17),
 };
 
-static u64 P10H[20];
+static u64 P10H[20]; /* 10^k on the host */
 
+/*
+ * write_state -- atomically replace the state file (write "<state>.tmp", rename).
+ *   Called after every completed launch, so pos/found/counters always describe
+ *   whole launches: a resumed run neither skips nor double-counts anything.
+ *   Errors: prints a warning and keeps the previous checkpoint if the file
+ *   cannot be written, flushed or renamed; the run continues.
+ */
+static void write_state(const char *state, int L, u64 ra, u64 rb, u64 pos, u64 found,
+                        unsigned long long nodes, unsigned long long filt, unsigned long long passB,
+                        unsigned long long pass3)
+{
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s.tmp", state);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { fprintf(stderr, "\nwarning: cannot write %s: %s\n", tmp, strerror(errno)); return; }
+    int ok = fprintf(f, "A034822cuda L=%d range=%" PRIu64 ":%" PRIu64 " pos=%" PRIu64 " found=%" PRIu64
+                        " nodes=%llu filt=%llu passB=%llu pass3=%llu\n",
+                     L, ra, rb, pos, found, nodes, filt, passB, pass3) > 0;
+    int err = errno;
+    if (fclose(f) != 0 && ok) { ok = 0; err = errno; }
+    if (ok && rename(tmp, state) != 0) { ok = 0; err = errno; }
+    if (!ok) {
+        fprintf(stderr, "\nwarning: state file %s not updated: %s\n", state, strerror(err));
+        remove(tmp);
+    }
+}
+
+/*
+ * run -- search length L over the base range [ra, rb).
+ *   In:  L          even length (must be in VARIANTS)
+ *        bpl        bases per launch (1 .. 2^30)
+ *        state      state file or NULL
+ *        ra, rb     base range; rb = 0 or rb > count means "to the end"
+ *        bd         threads per block (multiple of 32, 32..256)
+ *        quiet      selftest: no FOUND lines or progress
+ *   Out: returns the number of palindromic squares found in the range
+ *        (including those recorded in a resumed state file); prints FOUND lines,
+ *        progress, and a final DONE/PARTIAL line.
+ *   Setup: uploads c_ce for this h, picks SQ so S2 = s2*2^(36+SQ) < 2^62, and
+ *        checks that the 128-bit curvature product and the 2^-36 fixed-point
+ *        window cannot overflow for u < 10^K.
+ *   Each launch: zero Out, run the kernel, copy Out back, verify every survivor
+ *        by full decimal conversion (only genuine L-digit palindromes count),
+ *        add the counters, advance pos, write the state file.
+ *   Errors (exit 1): L not compiled in; empty or out-of-range base range;
+ *        state file present but for a different L or range; any CUDA error;
+ *        more than MAXOUT survivors in one launch (rerun with a smaller -b; the
+ *        state file still points at the start of that launch); overflow checks.
+ *        Validation builds exit 3 on a detected problem.
+ */
 static u64 run(int L, u64 bpl, const char *state, u64 ra, u64 rb, int bd, int quiet)
 {
     const Variant *vv = NULL;
@@ -603,6 +873,10 @@ static u64 run(int L, u64 bpl, const char *state, u64 ra, u64 rb, int bd, int qu
         CK(cudaMemcpyToSymbol(c_ce, ce, sizeof ce));
     }
     if (rb == 0 || rb > nbases) rb = nbases;
+    if (ra >= rb) {
+        fprintf(stderr, "empty base range [%" PRIu64 ",%" PRIu64 ") (L=%d has %" PRIu64 " bases)\n", ra, rb, L, nbases);
+        exit(1);
+    }
     /* SQ: S2 = s2 * 2^(36+SQ) < 2^63 for the largest s2 = s1max/(4*10^(h-1)) */
     double s1max = sqrt(pow(10.0, e - H + 1)) / 2.0;
     double s2max = s1max / (4.0 * pow(10.0, H - 1));
@@ -626,11 +900,11 @@ static u64 run(int L, u64 bpl, const char *state, u64 ra, u64 rb, int bd, int qu
             if (fscanf(f, "A034822cuda L=%d range=%" SCNu64 ":%" SCNu64 " pos=%" SCNu64 " found=%" SCNu64
                           " nodes=%llu filt=%llu passB=%llu pass3=%llu",
                        &sL, &sra, &srb, &spos, &sfound, &nodes, &filt, &passB, &pass3) == 9 &&
-                sL == L && sra == ra && srb == rb) {
+                sL == L && sra == ra && srb == rb && spos >= ra && spos <= rb) {
                 pos = spos;
                 found = sfound;
                 if (!quiet) fprintf(stderr, "resumed at base %" PRIu64 "\n", pos);
-            } else { fprintf(stderr, "state file mismatch\n"); exit(1); }
+            } else { fprintf(stderr, "state file %s does not match L=%d range %" PRIu64 ":%" PRIu64 "\n", state, L, ra, rb); exit(1); }
             fclose(f);
         }
     }
@@ -647,8 +921,13 @@ static u64 run(int L, u64 bpl, const char *state, u64 ra, u64 rb, int bd, int qu
         CK(cudaMemset(d_out, 0, sizeof(Out)));
         vv->fn(pos, nb, SQ, d_out, bd);
         CK(cudaGetLastError());
-        CK(cudaMemcpy(h_out, d_out, sizeof(Out), cudaMemcpyDeviceToHost));
-        if (h_out->nout > MAXOUT) { fprintf(stderr, "output overflow\n"); exit(1); }
+        CK(cudaMemcpy(h_out, d_out, sizeof(Out), cudaMemcpyDeviceToHost)); /* waits for the kernel */
+        if (h_out->nout > MAXOUT) {
+            fprintf(stderr, "output overflow (%u survivors > %d) in bases [%" PRIu64 ",%" PRIu64 "); rerun with smaller -b\n",
+                    h_out->nout, MAXOUT, pos, pos + nb);
+            exit(1);
+        }
+        /* host verification: only genuine L-digit palindromic squares count */
         for (unsigned i = 0; i < h_out->nout; i++) {
             u128 n = (u128)h_out->t[i] * P10H[H] + h_out->b[i];
             char ss[128], ns[64];
@@ -661,10 +940,6 @@ static u64 run(int L, u64 bpl, const char *state, u64 ra, u64 rb, int bd, int qu
                 if (!quiet) { printf("FOUND %d %s %s\n", L, ns, ss); fflush(stdout); }
             }
         }
-#ifdef DBG_T
-        if (h_out->dbg[5]) fprintf(stderr, "DBGT D=%llu Bp=%llu Bq=%llu P=%llu y=%llu\n", (unsigned long long)h_out->dbg[0],
-            (unsigned long long)h_out->dbg[1], (unsigned long long)h_out->dbg[2], (unsigned long long)h_out->dbg[3], (unsigned long long)h_out->dbg[4]);
-#endif
 #ifdef WINDOW_CHECK
         if (h_out->dbg[1]) { fprintf(stderr, "WINDOW_CHECK: %llu bad windows!\n", (unsigned long long)h_out->dbg[1]); exit(3); }
 #endif
@@ -674,18 +949,7 @@ static u64 run(int L, u64 bpl, const char *state, u64 ra, u64 rb, int bd, int qu
         nodes += h_out->nodes; filt += h_out->filt; passB += h_out->passB; pass3 += h_out->pass3;
         pos += nb;
         double t = now_sec();
-        if (state) {
-            char tmp[1024];
-            snprintf(tmp, sizeof tmp, "%s.tmp", state);
-            FILE *f = fopen(tmp, "w");
-            if (f) {
-                fprintf(f, "A034822cuda L=%d range=%" PRIu64 ":%" PRIu64 " pos=%" PRIu64 " found=%" PRIu64
-                           " nodes=%llu filt=%llu passB=%llu pass3=%llu\n",
-                        L, ra, rb, pos, found, nodes, filt, passB, pass3);
-                fclose(f);
-                rename(tmp, state);
-            }
-        }
+        if (state) write_state(state, L, ra, rb, pos, found, nodes, filt, passB, pass3);
         if (!quiet && (t - tlast > 10 || pos >= rb)) {
             double frac = (double)(pos - ra) / (double)(rb - ra);
             double rate = (double)(pos - pos0) / (t - t0);
@@ -701,22 +965,24 @@ static u64 run(int L, u64 bpl, const char *state, u64 ra, u64 rb, int bd, int qu
     printf("%s L=%d count=%" PRIu64 " bases=[%" PRIu64 ",%" PRIu64 ") pos=%" PRIu64
            " leaves=%llu filt=%llu passB=%llu pass3=%llu time=%.2fs rate=%.3e leaves/s\n",
            pos >= rb ? "DONE" : "PARTIAL", L, found, ra, rb, pos, nodes, filt, passB, pass3, el,
-           (double)nodes / el);
+           el > 0 ? (double)nodes / el : 0.0);
     fflush(stdout);
     cudaFree(d_out);
     cudaFreeHost(h_out);
     return found;
 }
 
+/*
+ * main -- set up the constant tables and dispatch "search" / "selftest".
+ *   Validates -b (1..2^30), -B (multiple of 32 in 32..256) and the selftest
+ *   range (maxL <= 68: KNOWN[70] is unknown).  See USAGE for exit codes.
+ */
 int main(int argc, char **argv)
 {
     P10H[0] = 1;
     for (int i = 1; i < 20; i++) P10H[i] = P10H[i - 1] * 10;
-    unsigned char rev2[100];
-    for (int k = 0; k < 100; k++) rev2[k] = (unsigned char)(10 * (k % 10) + k / 10);
     u64 f64[20];
     for (int k = 0; k < 20; k++) f64[k] = k == 0 ? ~0ull : (u64)(((u128)1 << 64) / P10H[k]);
-    CK(cudaMemcpyToSymbol(c_rev2, rev2, sizeof rev2));
     CK(cudaMemcpyToSymbol(c_f64, f64, sizeof f64));
     CK(cudaMemcpyToSymbol(c_p10, P10H, sizeof P10H));
     signal(SIGINT, on_sig);
@@ -724,6 +990,11 @@ int main(int argc, char **argv)
     int bd = 256;
     if (argc >= 2 && !strcmp(argv[1], "selftest")) {
         int maxL = argc >= 3 ? atoi(argv[2]) : 52, bad = 0;
+        if (maxL > 68) {
+            fprintf(stderr, "selftest: counts are known only up to L = 69 (odd L not supported); using maxL = 68\n");
+            maxL = 68;
+        }
+        if (maxL < 40) { fprintf(stderr, "selftest: maxL must be >= 40\n"); return 2; }
         for (int L = 40; L <= maxL; L += 2) {
             u64 c = run(L, 1 << 20, NULL, 0, 0, bd, 1);
             fprintf(stderr, "L=%d count=%" PRIu64 " expected %d %s\n", L, c, KNOWN[L], (int)c == KNOWN[L] ? "ok" : "MISMATCH");
@@ -744,6 +1015,8 @@ int main(int argc, char **argv)
                 if (sscanf(argv[++i], "%" SCNu64 ":%" SCNu64, &ra, &rb) != 2) goto usage;
             } else goto usage;
         }
+        if (bpl < 1 || bpl > (1ull << 30)) { fprintf(stderr, "-b must be in 1..2^30\n"); return 1; }
+        if (bd < 32 || bd > 256 || bd % 32) { fprintf(stderr, "-B must be a multiple of 32 in 32..256\n"); return 1; }
         run(L, bpl, state, ra, rb, bd, 0);
         return 0;
     }

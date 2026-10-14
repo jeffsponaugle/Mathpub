@@ -163,7 +163,7 @@ Observations:
 Requires [primesieve](https://github.com/kimwalisch/primesieve)
 (`brew install primesieve`) and a C11 compiler with `unsigned __int128`.
 [GMP](https://gmplib.org) (`brew install gmp`) is optional; the Makefile
-detects it and enables `search -l` above 2¹²⁷.
+detects it and enables `search -l` from 2¹²⁷ upward.
 
 ```bash
 make            # builds ./a137723
@@ -175,7 +175,7 @@ make test       # runs the self-test (about half a second)
 ```
 a137723 scan N [-t T] [-m MAXN] [-o FILE]     exhaustive: every a(n) <= N
 a137723 search n [n ...] [-l LIMIT] [-t T]    structural search for even n (default LIMIT 2^64);
-                                              LIMIT above 2^127 (e.g. 2^1000) uses GMP, --gmp forces it,
+                                              LIMIT >= 2^127 (e.g. 2^1000) uses GMP, --gmp forces it,
                                               --max-nodes X caps the estimated enumeration (default 5e9)
 a137723 next [-N SCAN] [-l LIMIT] [-t T] [-m MAXN] [-o FILE]
                                               scan to SCAN (default 10^10), then search the missing even n
@@ -268,7 +268,7 @@ it is necessarily
 
     E = 2^e1 · 3^e2 · 5^e3 · … · p_k^ek     (the first k primes, every exponent ≥ 1).
 
-These numbers are extremely sparse: about 2.5 million below 2⁶⁴ and 1.7·10¹⁰
+These numbers are extremely sparse: 2,537,666 below 2⁶⁴ and 1.74·10¹⁰
 below 2¹²⁷ (compare with 1.7·10³⁸ integers). Enumerating all of them is cheap,
 and for each E only two partners have to be examined, O = E + d and O = E − d.
 If O is gap-free and the numbers strictly between E and O all have a gap, then
@@ -346,7 +346,7 @@ like d = 33 (k ≤ 4, about a million E) a fraction of a second.
 
 **Step 6 — beyond 128 bits (GMP mode).** Above 2¹²⁷ the same theorem is
 applied more selectively, because enumerating *every* even gap-free number is
-no longer an option (there are ~10¹⁴ of them below 2¹⁰⁰⁰). Let p_j be the
+no longer an option (there are well over 10⁴⁰ of them below 2¹⁰⁰⁰). Let p_j be the
 smallest odd prime dividing d and {p_j, …, p_m} the maximal block of
 consecutive primes starting at p_j that all divide d. For an even endpoint
 with k primes the odd partner O = E ± d is
@@ -495,7 +495,10 @@ re-checked with `verify_run.py` (and, for the first three, `openssl prime`).
 
 ## Files
 
-* `a137723.c` — the tool (single file)
+* `a137723.c` — the tool (single file). Its header comment is a full theory of operation
+  (definitions, the three methods with their correctness lemmas, the gapless test, rigor, threading,
+  limits, self-test, source map), and every function has a block describing its inputs, outputs
+  and error conditions
 * `Makefile`
 * `verify_run.py` — independent verifier for one run
 * `next_1e11.txt` — table produced by `a137723 next -N 10^11 -l 2^64` (plus its log)

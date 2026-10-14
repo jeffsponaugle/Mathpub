@@ -42,9 +42,11 @@ REC = [
     (1476, 1425172824437699411), (1488, 5733241593241196731), (1510, 6787988999657777797),
     (1526, 15570628755536096243), (1530, 17678654157568189057), (1550, 18361375334787046697),
 ]
-KNOWN = [2, 4, 6, 14, 34, 36, 52, 86, 132, 154, 250, 336]                       # A053686
-A133788 = [3, 7, 23, 113, 1327, 9551, 19609, 155921, 1357201, 4652353, 387096133, 3842610773]
-A085237_LAST = 57       # A085237 (to its term 778) lists records 35..57 exactly once
+KNOWN = [2, 4, 6, 14, 34, 36, 52, 86, 132, 154, 250, 336, 906]                  # A053686
+A133788 = [3, 7, 23, 113, 1327, 9551, 19609, 155921, 1357201, 4652353, 387096133, 3842610773,
+           218209405436543]
+OEIS_DECIDED = 63       # records 1..63 are decided in the OEIS (A053686 rev. #28, Sep 17 2026:
+                        # a(13) = 906, a(14) >= 1132)
 HK = 100                # histogram depth of the tool: gaps g_n - 2k, k < HK
 fails = 0
 
@@ -123,11 +125,8 @@ def rec_end(i):
 
 def expected_member(n):
     """what OEIS says about record n (1-based): True / False / None (undecided)"""
-    g = REC[n - 1][0]
-    if n <= 34:
-        return g in KNOWN
-    if n <= A085237_LAST:
-        return False
+    if n <= OEIS_DECIDED:
+        return REC[n - 1][0] in KNOWN
     return None
 
 
@@ -143,8 +142,10 @@ def cmd_table():
             print(f"     entry #{i + 1} ({g} after {p}) is not a prime gap of that size")
     check(ok, f"all {len(REC)} table entries are increasing prime gaps of the listed size")
     firsts = [p for g, p in REC if g in KNOWN]
-    check(firsts == A133788, "the first occurrences of the 12 terms are A133788")
-    check([g for g, p in REC[:34] if g in KNOWN] == KNOWN, "the 12 terms are records 2,3,4,6,10,11,13,15,20,22,29,34")
+    check(firsts == A133788, f"the first occurrences of the {len(KNOWN)} terms are A133788")
+    terms = [n for n, (g, p) in enumerate(REC[:OEIS_DECIDED], 1) if g in KNOWN]
+    check([REC[n - 1][0] for n in terms] == KNOWN,
+          f"the {len(KNOWN)} terms are records {','.join(map(str, terms))}")
 
 
 # ---------------------------------------------------------------- P G

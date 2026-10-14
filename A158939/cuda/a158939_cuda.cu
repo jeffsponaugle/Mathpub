@@ -1,61 +1,198 @@
 /*
- * a158939_cuda.cu  --  GPU (CUDA) version of the A158939 scan (see ../a158939.c)
+ * a158939_cuda.cu -- GPU (CUDA) version of the A158939 scan (see ../a158939.c)
  *
- * Same problem and output as the CPU tool: for every prime p find
+ * Same problem, bookkeeping and output as the CPU tool: for every prime p find
  * L(p) = largest n with g_1 < g_2 < ... < g_n (the gaps after p strictly
- * increasing), and report the first prime of every run length, the exact
- * prime count and the exact run-length histogram of the range scanned.
+ * increasing) and report the first prime of every run length, the exact prime
+ * count and the exact run-length histogram of the range scanned.  This is the
+ * program that found a(16) = 17293451238695141 and a(17) = 52461866207504471
+ * in September 2026 on a DGX Spark (NVIDIA GB10: 48 SMs, 24 MB L2, 128 GB of
+ * unified memory at 273 GB/s).  The definition, the two facts the bookkeeping
+ * rests on -- (F1) L(p) depends only on the gaps after p, so any range can be
+ * scanned on its own; (F2) a run of L gaps ending at the prime q_k settles the
+ * run lengths 1..L of the L primes before q_k -- and the OEIS context are in
+ * the header of ../a158939.c and are not repeated here.
  *
- * Sieve layout
- * ------------
+ * ======================================================================
+ * 1. Theory of operation
+ * ======================================================================
+ *
+ * 1.1 Sieve layout (wheel 30)
+ * ---------------------------
  * Only numbers coprime to 30 are represented: one byte per 30 numbers, bit j
  * of byte b standing for 30*b + R[j] with R = {1,7,11,13,17,19,23,29}.  A bit
  * that is still 0 after sieving is a prime.  For a sieving prime q >= 7 the
  * multiples q*m with gcd(m,30) = 1 fall into 8 arithmetic progressions of
- * byte index (stride q) with a fixed bit mask each, so a mark is
- * "atomicOr(word[b >> 2], mask << 8*(b & 3))".
+ * byte index (stride q bytes) with a fixed bit each (the bit of q*m depends
+ * only on q mod 30 and m mod 30, table c_BITIDX), so a mark is
+ * "atomicOr(word[b >> 2], bit << 8*(b & 3))".  The primes 2, 3, 5 are not in
+ * the wheel; the host adds them (L(2)=2, L(3)=1, L(5)=2) to a scan that
+ * starts at 0.  The primes 7..19 are applied as a precomputed periodic byte
+ * pattern (period 7*11*13*17*19 = 323323 bytes) instead of being sieved.
  *
- * The range is processed in chunks of CHUNK_SEGS segments of SEG_WORDS words
- * (2.58e6 numbers per segment, 2.48e8 per chunk).  Per chunk:
+ * 1.2 Geometry
+ * ------------
+ *   segment   SEG_WORDS = 21504 words = 84 KB = 2,580,480 numbers.  One block
+ *             of BLOCKDIM = 1024 threads processes a segment in shared memory
+ *             together with OVERLAP = 512 words (61,440 numbers) past its end,
+ *             so that runs crossing the segment end can be finished there.
+ *   chunk     CHUNK_SEGS = 96 segments = 247,726,080 numbers: the unit of the
+ *             large-prime kernels, the host loop and the checkpoint.  The
+ *             chunk bitmap (CHUNK_WORDS + OVERLAP words, 8 MB) lives in
+ *             global memory but stays inside the GB10's 24 MB L2, pinned by a
+ *             persisting access window unless -N is given; random atomics
+ *             into it run at ~2e10/s there against ~1.3e9/s in DRAM.
+ * The sieving primes are split at QSPLIT (default 4e6; 1e6 in production):
+ *   7..19              presieve pattern;
+ *   23..QSPLIT         "medium" primes, marked per segment in shared memory by
+ *                      kernel_segment (one warp per prime below PWARP = 2048,
+ *                      one thread per prime above);
+ *   QSPLIT..sqrt(END)  "large" primes, marked per chunk into the chunk bitmap
+ *                      by kernel_large / kernel_bucket (section 1.4).
  *
- *   1. kernel_large / kernel_bucket:  the sieving primes q > QSPLIT (up to
- *      sqrt of the chunk end) mark their few multiples in the chunk into an
- *      8 MB bitmap in global memory with atomics; 8 MB stays inside the
- *      GB10's 24 MB L2 (pinned with a persisting access window), where the
- *      atomics are cheap.  Each prime keeps a 4-byte state: chunk (mod 64)
- *      and byte offset of its next multiple, wheel index.  Primes below
- *      CHUNK_NUMS/6 hit every chunk and live in a flat array (one thread
- *      each); larger ones live as 8-byte entries in 64 bucket lists, one per
- *      upcoming chunk, so a chunk only touches the primes that hit it and
- *      re-appends each to the list of its next chunk (block-staged so the
- *      appends are coalesced).
- *   2. kernel_segment: one block per segment, the segment's words in shared
- *      memory.  It ORs in a periodic pattern for the primes 7..19 and the
- *      large-prime bits from the chunk bitmap, marks the primes 23..QSPLIT
- *      (warp per prime below PWARP, thread per prime above), then walks the
- *      finished bitmap: each thread takes a slice of words, extracts primes
- *      and gaps, and runs the same increasing-run bookkeeping as the CPU tool
- *      (a run that ends at q_k settles the run lengths of the L primes before
- *      it; a thread continues past its slice until the run in progress ends).
- *      Every block also sieves OVERLAP words past its own segment so that the
- *      last slices can settle their runs; a run still open at the end of the
- *      overlap is flagged for the host to settle on the CPU (never happens
- *      in practice).  Per-segment results (first prime of each run length,
- *      histogram, prime count) go to global memory; the host merges them.
+ * 1.3 Per-chunk pipeline (run_scan; one CUDA stream, chunks in order)
+ * --------------------------------------------------------------------
+ *   kernel_activate   primes whose square first falls into this chunk or its
+ *                     overlap get their initial state;
+ *   memset            the chunk bitmap is cleared;
+ *   kernel_large      the ~2.5 million "dense" large primes (q < CHUNK_NUMS/6,
+ *                     which hit every chunk) mark their multiples, one thread
+ *                     per prime, state read and rewritten with streaming
+ *                     loads and stores;
+ *   kernel_bucket     the "sleeping" large primes due in this chunk, read from
+ *                     the chunk's bucket list, mark their multiples and are
+ *                     re-appended to the list of the chunk that needs their
+ *                     next multiple;
+ *   kernel_chunkmod   (chunk_lo/30) mod q for every medium prime: the one
+ *                     64-bit division per medium prime per chunk;
+ *   kernel_segment    one block per segment builds the finished segment bitmap
+ *                     in shared memory and extracts primes, counts and run
+ *                     lengths (section 1.5); one SegResult per segment goes
+ *                     to global memory and is copied to pinned host memory;
+ *   merge_chunk       the host folds the 96 results in order into the table,
+ *                     the histogram and the prime count.
+ * Chunks and segments complete in order, so every term is final the moment
+ * it is recorded (no "frontier" as in the CPU tool), and pi(p) is exact:
+ * primes before the segment plus the index inside it.  Two host
+ * synchronizations per chunk (the bucket count before kernel_bucket, the
+ * results after kernel_segment); the host merge takes a few percent.
  *
- * 2, 3, 5 are not in the wheel; the host adds them (L(2)=2, L(3)=1, L(5)=2)
- * when the scan starts at 0.  Chunks complete in order, so every term found
- * is confirmed immediately.  The checkpoint (-S) records the chunk frontier,
- * the table, the histogram and the prime count; the large-prime state is
- * recomputed on resume.
+ * 1.4 Large-prime state and bucket lists
+ * --------------------------------------
+ * Every large prime keeps a 4-byte state: bits 31..26 = index (mod 64) of the
+ * chunk holding its next multiple, bits 25..3 = that multiple's byte offset
+ * inside the chunk (< 2^23), bits 2..0 = wheel index of the multiplier.
+ * Consecutive multiples are at most 6q apart, so the chunk distance is below
+ * 64 for every q below 2.6e9 (END below 6.8e18).  The dense primes keep their
+ * state in a flat array.  The larger primes ("sleepers", about 48 million at
+ * END = 1e18) mostly skip chunks; they live as 8-byte entries {state << 32 |
+ * q} in a ring of SLOTS = 64 bucket lists, one per upcoming chunk, so a chunk
+ * touches only the primes that hit it.  kernel_bucket stages each block's
+ * outgoing entries in shared memory grouped by destination and reserves one
+ * range per destination list with a single atomicAdd, so the appends are
+ * coalesced.  The lists are sized from the expected hits per chunk at END
+ * (twice that plus 2^20 entries each; 13 GB in all at END = 2e18).  A full
+ * list or an entry found in the wrong list sets a flag that the host turns
+ * into die().  A multiple in the overlap region of chunk k (the first OVERLAP
+ * words of chunk k+1) has to be marked in chunk k's bitmap and again in chunk
+ * k+1's, so the state after chunk k points at the first multiple >= chunk_hi
+ * and that multiple is processed again in chunk k+1 (state_position's
+ * "target k+1 inside the overlap" case; a sleeper is re-filed under k+1).
+ * The state is not checkpointed: kernel_init_state recomputes it from the
+ * first multiple of every active prime whenever a scan starts or resumes.
  *
- * Usage
- *   a158939_cuda scan [START] END [-n N] [-r NMIN] [-S FILE] [-i SECS] [-Q QSPLIT] [-q]
- *   a158939_cuda bench [N] [-d SPAN] [-Q QSPLIT]
- *   a158939_cuda selftest
+ * 1.5 kernel_segment, the inner loop
+ * ----------------------------------
+ *   1. Every thread ORs the presieve pattern bytes and the large-prime bits of
+ *      the chunk bitmap into the segment's SHARED_WORDS words of shared memory.
+ *   2. The medium primes are marked with shared-memory atomics.  For a prime q
+ *      and a residue class R[k], byte b (counted from the segment start) holds
+ *      a multiple iff 30*(B0 + b) + R[k] = 0 (mod q), B0 = seg_lo/30, i.e.
+ *      b = c + R[k]*beta (mod q) with c = -B0 mod q and beta = -30^-1 mod q.
+ *      B0 mod q is assembled from (chunk_lo/30) mod q (kernel_chunkmod) and
+ *      the segment number with 32-bit Barrett reductions; beta and the
+ *      Barrett constant are per-prime tables from gpu_init.  A prime whose
+ *      square lies inside the segment starts at q*q instead (early chunks).
+ *      Warp-per-prime: the 32 lanes take the 8 classes times 4 sub-strides;
+ *      thread-per-prime: a loop over the 8 classes.
+ *   3. Prime count: each thread counts the primes of its slice of
+ *      SEG_WORDS/BLOCKDIM = 21 words that lie inside [start, end) (popcount,
+ *      bit by bit only in a boundary word); a block-wide exclusive scan gives
+ *      every thread the number of primes before its slice and the block total.
+ *   4. Run lengths: each thread walks its slice and keeps going into the
+ *      following words, up to the end of the overlap, until the run in
+ *      progress ends.  The bookkeeping is the CPU tool's, but in registers
+ *      only: the run in progress is described by its first prime (run_start,
+ *      with its index), its length, and how many of its primes lie at or
+ *      beyond the slice end.  Run ends of length 1..7 are counted in
+ *      registers and folded by warp reduction, longer ones with shared
+ *      atomics.  A run longer than every earlier run of the slice re-walks
+ *      the bitmap from run_start to record the new first occurrences
+ *      (record_from; rare).  A run still open at the end of the shared bitmap
+ *      is flagged (unsettled) and the host settles the rest of that segment
+ *      on the CPU; that would need a run spanning the 61,440-number overlap
+ *      and has never happened.
+ *
+ * 1.6 Checkpoint / resume (-S FILE)
+ * ---------------------------------
+ * The checkpoint records START, END, the position up to which the scan is
+ * complete (a chunk boundary, or END when the last chunk is partial), the
+ * prime count, the histogram and the table of first primes with their gaps.
+ * Rerunning resumes at that position: the chunk containing it is rescanned
+ * with the numbers below the position excluded from the counts (the kernel's
+ * start bound), so a run that ended inside a chunk can be extended with a
+ * larger END (only START must match).  An early version recorded a partial
+ * last chunk as complete and skipped 41,615,360 numbers that way; selftest
+ * (d) guards the fix.  SIGINT/SIGTERM stop after the current chunk and save.
+ *
+ * 1.7 Verification
+ * ----------------
+ * record_first re-derives every first occurrence with the host's Miller-Rabin
+ * next-prime search and dies on a disagreement, so a wrong GPU run length
+ * never reaches the output.  The selftest compares whole scans with exact
+ * figures from the CPU tool (prime counts, first primes, prime indices and
+ * histograms on [0, 1e11), on a window with bounds inside chunks, and on
+ * [1e15, 1e15+2e12)) and checks that a resume across an END inside a chunk
+ * equals a straight run.  Every version of the kernels was also diffed
+ * against the CPU tool on 2e11-number windows at 3e16 and 1e18 (README.md).
+ *
+ * 1.8 Performance (GB10) and limits
+ * ---------------------------------
+ * 2.2-2.5e11 numbers/s at 1e15, 1.6e11 at 5e16, 1.3e11 at 1e18, i.e. 13x the
+ * M1 Pro.  Above 1e16 the large-prime kernels dominate, and their cost is
+ * state and entry traffic rather than the L2 atomics (~0.2 ms per chunk).
+ * Raising QSPLIT above ~1e6 does not pay: every segment block re-reads the
+ * medium-prime tables, and that bandwidth, not arithmetic, limits the
+ * segment kernel.  Negative results (two streams, two pinned bitmaps, wheel
+ * 210 = a158939_cuda_wheel210.cu, CPU alongside) are in README.md.
+ * Limits: run lengths up to NMAX-1 = 63 (longer runs are clamped and
+ * reported), PWARP <= QSPLIT <= 1e8, END below ~6.8e18 (chunk distance of
+ * the state encoding), fewer than 2^32 entries per bucket list.
+ * Exit status: 0 success, 1 failure (die(), failed selftest), 2 usage error.
+ *
+ * ======================================================================
+ * 2. Usage
+ * ======================================================================
+ *   a158939_cuda scan [START] END [-n N] [-r NMIN] [-S FILE] [-i SECS] [-Q QSPLIT] [-N] [-q]
+ *       Exhaustive scan of the primes in [START, END).  Prints each first
+ *       prime with run length >= NMIN (default 14) as CONFIRMED when found
+ *       and a table of a(n) at the end.  -n N stops once a(N) is found.
+ *       -S FILE keeps a checkpoint every SECS seconds (default 60) and on
+ *       Ctrl-C; rerunning resumes from it.  -Q QSPLIT sets the medium/large
+ *       prime split (default 4e6), -N disables the L2 persisting window,
+ *       -q suppresses the status line.  -1 and -L (stream and L2 options of
+ *       earlier versions) are accepted and ignored.
+ *   a158939_cuda bench [N] [-d SPAN] [-Q QSPLIT] [-N] [-p]
+ *       Time the scan of [N, N+SPAN) (defaults 1e15 and 2e12); -p adds a
+ *       per-kernel profile.
+ *   a158939_cuda selftest [-Q QSPLIT]
+ *       The checks of section 1.7.
  *
  * Build (DGX Spark / GB10, CUDA 13):
  *   nvcc -O3 -std=c++17 -arch=sm_121 a158939_cuda.cu -o a158939_cuda
+ *   (or `make`; the geometry macros can be overridden with -D, and
+ *   -DSKIP_MARK_WARP / -DSKIP_MARK_MED / -DSKIP_EXTRACT build ablation
+ *   binaries for profiling whose results are wrong by design)
  */
 
 #include <cstdio>
@@ -81,61 +218,79 @@ typedef uint16_t u16;
 typedef uint8_t  u8;
 typedef unsigned __int128 u128;
 
-/* ---- geometry (compile-time, overridable with -D) ---- */
+/* ---- geometry (compile-time, overridable with -D) ----
+ * The segment must fit in shared memory with its overlap (88 KB of the GB10's
+ * 100 KB per SM), SEG_WORDS must be a multiple of BLOCKDIM (one slice of
+ * SEG_WORDS/BLOCKDIM words per thread), and the chunk bitmap must fit in L2.
+ * Chunk geometry changes were measured flat; see README.md. */
 #ifndef SEG_WORDS
 #define SEG_WORDS   21504           /* words owned by a segment: 84 KB, 2,580,480 numbers */
 #endif
 #ifndef OVERLAP
-#define OVERLAP     512             /* extra words sieved past a segment: 61,440 numbers */
+#define OVERLAP     512             /* extra words sieved past a segment: 61,440 numbers, so that
+                                       a run crossing the segment end can be finished in the block */
 #endif
 #ifndef CHUNK_SEGS
 #define CHUNK_SEGS  96              /* segments per chunk: 7.875 MB bitmap (must stay in L2) */
 #endif
 #ifndef BLOCKDIM
-#define BLOCKDIM    1024
+#define BLOCKDIM    1024            /* threads per segment block */
 #endif
 #ifndef PWARP
-#define PWARP       2048            /* primes below this: one warp per prime */
+#define PWARP       2048            /* medium primes below this: one warp per prime (many marks
+                                       per segment); above: one thread per prime */
 #endif
-#define SHARED_WORDS (SEG_WORDS + OVERLAP)
-#define NUMS_PER_WORD 120ULL         /* 32 bits * 30/8 */
+#define SHARED_WORDS (SEG_WORDS + OVERLAP)  /* words of the segment bitmap in shared memory */
+#define NUMS_PER_WORD 120ULL         /* 32 bits * 30/8: numbers covered by one bitmap word */
 #define SEG_NUMS    (SEG_WORDS * NUMS_PER_WORD)
 #define CHUNK_WORDS ((u64)SEG_WORDS * CHUNK_SEGS)
-#define CHUNK_NUMS  (CHUNK_WORDS * NUMS_PER_WORD)
+#define CHUNK_NUMS  (CHUNK_WORDS * NUMS_PER_WORD)   /* 247,726,080 */
 #define PAT_PERIOD  323323          /* 7*11*13*17*19: period of the presieve pattern in bytes */
-#define NMAX        64              /* run lengths 1..NMAX-1 tracked */
-#define RINGP       32              /* recent primes kept per thread; runs >= RINGP-1 are flagged */
-#define NKNOWN      15
+#define NMAX        64              /* run lengths 1..NMAX-1 tracked; a run of NMAX or more gaps is
+                                       clamped and reported (the longest run below 5.5e16 has 17) */
+#define NKNOWN      17              /* terms of A158939 in the OEIS: KNOWN[1..NKNOWN] */
 
+/* KNOWN[n] = a(n) as published (KNOWN[0] unused): labels in print_table and
+ * the expected values of the selftest. */
 static const u64 KNOWN[NKNOWN + 1] = {
     0, 3, 2, 17, 347, 2903, 15373, 128981, 1319407, 17797517, 94097537,
     6927837557ULL, 48486712783ULL, 968068681511ULL, 1472840004017ULL,
-    129001208165717ULL
+    129001208165717ULL, 17293451238695141ULL, 52461866207504471ULL
 };
-/* A133697(n) = pi(A158939(n+2)) for n = 0..13 */
-static const u64 A133697[14] = {
+/* A133697(n) = pi(A158939(n+2)) for n = 0..NA133697-1: the published prime
+ * index of a(n+2), against which the scan's own pi(p) is checked. */
+#define NA133697 16
+static const u64 A133697[NA133697] = {
     1, 7, 69, 420, 1796, 12073, 101397, 1139211, 5440508, 320620306ULL,
-    2058187481ULL, 36451609409ULL, 54594153615ULL, 4100904808215ULL
+    2058187481ULL, 36451609409ULL, 54594153615ULL, 4100904808215ULL,
+    475618519121221ULL, 1400080864310974ULL
 };
-/* pi(10^k), k = 6..16 */
+static_assert(NA133697 >= NKNOWN - 1, "A133697 table must cover every known term");
+/* pi(10^k), k = 6..16: a scan [0, 10^k) must report exactly this many primes */
 static const u64 PI10[17] = {
     0, 0, 0, 0, 0, 0, 78498ULL, 664579ULL, 5761455ULL, 50847534ULL, 455052511ULL,
     4118054813ULL, 37607912018ULL, 346065536839ULL, 3204941750802ULL,
     29844570422669ULL, 279238341033925ULL
 };
 
-static bool stderr_tty;
-static volatile sig_atomic_t g_stop = 0;
-static int g_report = 14;
+static bool stderr_tty;                   /* stderr is a terminal: live status line instead of progress lines */
+static volatile sig_atomic_t g_stop = 0;  /* set by SIGINT/SIGTERM or by -n N: stop after the current chunk */
+static int g_report = 14;                 /* print CONFIRMED lines for run lengths >= this (-r NMIN) */
 static bool g_l2_persist = true;       /* keep the bitmap resident in L2 with a persisting access window (-N disables) */
-static bool g_quiet_init = false;
+static bool g_quiet_init = false;         /* gpu_init prints nothing (bench and selftest) */
 
+/* Every CUDA runtime call goes through CUDA_CHECK: any error is fatal and
+ * reported with the call and the line number. */
 #define CUDA_CHECK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) die("CUDA error %s at line %d: %s", #x, __LINE__, cudaGetErrorString(e_)); } while (0)
 
 /* ------------------------------------------------------------------ */
 /* Generic helpers (same conventions as a158939.c)                     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * now() -- monotonic wall-clock time in seconds (CLOCK_MONOTONIC), for rates
+ * and ETAs.  Inputs: none.  Errors: none.
+ */
 static double now(void)
 {
     struct timespec ts;
@@ -143,6 +298,13 @@ static double now(void)
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/*
+ * die() -- print a fatal error ("a158939_cuda: ...") and exit(1).
+ * Inputs:  printf-style format and arguments.
+ * Effects: clears the status line when stderr is a terminal, prints the
+ *          message and exits; never returns.  No checkpoint is written on
+ *          this path (the last periodic checkpoint stays valid).
+ */
 static void die(const char *fmt, ...)
 {
     va_list ap;
@@ -155,6 +317,11 @@ static void die(const char *fmt, ...)
     exit(1);
 }
 
+/*
+ * fmt_dur() -- format a duration as "1d02h03m", "1h02m03s", "5m03s" or
+ * "4.2s"; "?" for a negative, NaN or absurd value (an unknown ETA).
+ * Inputs:  s  seconds;  buf, n  output buffer.   Returns: buf.
+ */
 static const char *fmt_dur(double s, char *buf, size_t n)
 {
     if (s < 0 || s != s || s > 1e9) { snprintf(buf, n, "?"); return buf; }
@@ -166,6 +333,10 @@ static const char *fmt_dur(double s, char *buf, size_t n)
     return buf;
 }
 
+/*
+ * mul_ok() -- *r = a*b if it fits in 64 bits (returns true), else false with
+ * *r untouched.
+ */
 static bool mul_ok(u64 a, u64 b, u64 *r)
 {
     u128 x = (u128)a * b;
@@ -174,6 +345,7 @@ static bool mul_ok(u64 a, u64 b, u64 *r)
     return true;
 }
 
+/* all_digits() -- true iff s[0..n) is a non-empty string of decimal digits. */
 static bool all_digits(const char *s, size_t n)
 {
     if (n == 0) return false;
@@ -182,6 +354,14 @@ static bool all_digits(const char *s, size_t n)
     return true;
 }
 
+/*
+ * parse_term() -- parse one unsigned number term: decimal ("129001208165717",
+ * up to 20 digits), a power ("2^54", "10^16") or scientific notation with an
+ * optional decimal point ("1e12", "1.29e14"; the value must be an integer).
+ * Inputs:  s, n  the characters (not necessarily NUL-terminated);  out.
+ * Returns: true and *out on success; false on a syntax error or a value that
+ *          does not fit in 64 bits (*out untouched).
+ */
 static bool parse_term(const char *s, size_t n, u64 *out)
 {
     char buf[64], *c;
@@ -225,6 +405,12 @@ static bool parse_term(const char *s, size_t n, u64 *out)
     return true;
 }
 
+/*
+ * parse_num() -- a term, or TERM+TERM / TERM-TERM split at the last '+' or
+ * '-' ("2^54-32", "10^15+7").  Negative values are rejected.
+ * Returns: the value.   Errors: die() on a syntax error, overflow or a
+ *          negative difference.
+ */
 static u64 parse_num(const char *s)
 {
     size_t n = strlen(s);
@@ -241,6 +427,10 @@ static u64 parse_num(const char *s)
     return v;
 }
 
+/*
+ * parse_int() -- parse_num() plus an inclusive range check [lo, hi].
+ * Errors:  die() with "<what> must be between lo and hi".
+ */
 static int parse_int(const char *s, int lo, int hi, const char *what)
 {
     u64 v = parse_num(s);
@@ -248,8 +438,14 @@ static int parse_int(const char *s, int lo, int hi, const char *what)
     return (int)v;
 }
 
-/* deterministic Miller-Rabin below 2^64, for the host-side odds and ends */
+/* ---- Deterministic Miller-Rabin below 2^64, on the host.  Used to add the
+ * wheel's missing small primes, to RE-DERIVE every first occurrence the GPU
+ * reports (record_first) and for the CPU fallback (settle_cpu); it shares no
+ * code with the sieve, which is the point. ---- */
+
+/* mulmod() -- (a*b) mod m through a 128-bit product; m > 0. */
 static u64 mulmod(u64 a, u64 b, u64 m) { return (u64)(((u128)a * b) % m); }
+/* powmod() -- a^e mod m by square-and-multiply; m > 0. */
 static u64 powmod(u64 a, u64 e, u64 m)
 {
     u64 r = 1;
@@ -257,6 +453,14 @@ static u64 powmod(u64 a, u64 e, u64 m)
     while (e) { if (e & 1) r = mulmod(r, a, m); a = mulmod(a, a, m); e >>= 1; }
     return r;
 }
+/*
+ * is_prime64() -- deterministic primality test for every n < 2^64: trial
+ * division by the primes up to 37, then strong-probable-prime tests to the
+ * seven bases 2, 325, 9375, 28178, 450775, 9780504, 1795265022 (verified to
+ * leave no strong pseudoprime below 2^64).  A base that is 0 mod n is
+ * skipped, which is correct for the n > 37 that reach that point.
+ * Inputs:  n.   Returns: true iff n is prime (false for n < 2).
+ */
 static bool is_prime64(u64 n)
 {
     static const u64 small[] = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37 };
@@ -278,6 +482,11 @@ static bool is_prime64(u64 n)
     }
     return true;
 }
+/*
+ * next_prime64() -- smallest prime greater than n, by testing odd candidates
+ * with is_prime64 (about log(n)/2 tests).  n must stay below the largest
+ * 64-bit prime, 18446744073709551557, which no scan reaches.
+ */
 static u64 next_prime64(u64 n)
 {
     if (n < 2) return 2;
@@ -286,7 +495,13 @@ static u64 next_prime64(u64 n)
     while (!is_prime64(m)) m += 2;
     return m;
 }
-/* run length of p by next-prime search; gaps[0..L] filled (L+1 values) */
+/*
+ * run_length64() -- L(p) straight from the definition by next-prime search.
+ * Inputs:  p  a prime;  gaps  room for maxgaps entries.
+ * Returns: L, with gaps[0..L-1] the increasing gaps and gaps[L] the gap that
+ *          ends the run; -1 if the run has maxgaps or more gaps.
+ * Errors:  none besides the -1 signal.
+ */
 static int run_length64(u64 p, u16 *gaps, int maxgaps)
 {
     u64 prev = p, prevgap = 0;
@@ -306,6 +521,17 @@ static int run_length64(u64 p, u16 *gaps, int maxgaps)
 /* Device side                                                         */
 /* ------------------------------------------------------------------ */
 
+/* Wheel tables in constant memory (8 entries: uniform accesses broadcast).
+ *   c_R[j]         the residues coprime to 30, in order;
+ *   c_GAP[j]       R[j+1] - R[j] (wrapping 29 -> 31), the step between the
+ *                  multipliers of consecutive wheel multiples;
+ *   c_RIDX[r]      index of residue r in R, 8 if r is not coprime to 30;
+ *   c_BITIDX[a][j] bit (= residue index) of R[a]*R[j] mod 30: the bit a
+ *                  multiple q*m occupies depends only on the classes of q
+ *                  and m (filled by gpu_init);
+ *   c_QINV30[r]    r^-1 mod 30 for the residues coprime to 30;
+ *   wheelR(j)      R[j] from an immediate, for use in divergent code where a
+ *                  constant-memory table lookup would serialize. */
 __constant__ u32 c_R[8]       = { 1, 7, 11, 13, 17, 19, 23, 29 };
 __constant__ u32 c_GAP[8]     = { 6, 4, 2, 4, 2, 4, 6, 2 };       /* R[j+1] - R[j] */
 __constant__ u8  c_RIDX[30]   = { 8,0,8,8,8,8,8,1,8,8, 8,2,8,3,8,8,8,4,8,5, 8,8,8,6,8,8,8,8,8,7 };
@@ -313,7 +539,9 @@ __constant__ u8  c_BITIDX[8][8];                                  /* bit of (R[a
 __constant__ u8  c_QINV30[30]  = { 0,1,0,0,0,0,0,13,0,0, 0,11,0,7,0,0,0,23,0,19, 0,0,0,17,0,0,0,0,0,29 };  /* q^-1 mod 30 */
 __device__ __forceinline__ u32 wheelR(u32 j) { return (u32)((0x1D1713110D0B0701ULL >> (8 * j)) & 0xFF); }   /* R[j] without a divergent table read */
 
-/* Per-segment results written by kernel_segment, merged on the host. */
+/* Per-segment results written by kernel_segment and merged on the host, in
+ * segment order.  Offsets are numbers counted from the segment start seg_lo;
+ * "inside the bounds" means inside [start, end) as passed to the kernel. */
 struct SegResult {
     u32 first[NMAX];        /* offset (from seg_lo) of the first prime with run length n, ~0u = none */
     u32 firstidx[NMAX];     /* its index among the segment's primes inside the bounds (1-based) */
@@ -321,11 +549,19 @@ struct SegResult {
     u32 extra[NMAX];        /* run lengths from final run ends, per prime inside the bounds */
     u32 count;              /* primes in [seg_lo, seg_hi) ∩ [start, end) */
     u32 unsettled;          /* offset of the first prime of a run still open at the bitmap end, ~0u = none */
-    u32 overflow;           /* a run reached RINGP-1 gaps */
-    u32 pad;
+    u32 overflow;           /* a run reached NMAX-1 gaps and was clamped */
+    u32 pad;                /* keeps the struct 16-byte aligned */
 };
 
-/* First multiplier m >= max(q, ceil(lo/q)) with gcd(m, 30) = 1. */
+/*
+ * first_multiplier() -- smallest multiplier m with q*m >= lo, m >= q and
+ * gcd(m, 30) = 1: multiples with a factor of the wheel are not in the
+ * bitmap, and multiples below q*q have a smaller prime factor and are marked
+ * by that prime.
+ * Inputs:  q  a sieving prime not dividing the wheel;  lo  chunk start.
+ * Returns: m, i.e. the first multiple of q to mark is q*m.
+ * Errors:  none.
+ */
 __device__ __forceinline__ u64 first_multiplier(u32 q, u64 lo)
 {
     u64 m = (lo + q - 1) / q;
@@ -348,10 +584,19 @@ __device__ __forceinline__ u64 first_multiplier(u32 q, u64 lo)
  * chunk, so a chunk touches only the primes that hit it (kernel_bucket), and
  * each entry is re-appended to the list of the chunk holding its next
  * multiple, block-staged so the appends are coalesced. */
-#define SLOTS        64
-#define OVERLAP_NUMS ((u64)OVERLAP * NUMS_PER_WORD)
-#define BLOCKDIM_B   1024
+#define SLOTS        64                              /* bucket lists = chunks of look-ahead (state field is 6 bits) */
+#define OVERLAP_NUMS ((u64)OVERLAP * NUMS_PER_WORD)  /* numbers in the overlap region: 61,440 */
+#define BLOCKDIM_B   1024                            /* threads per kernel_bucket block */
 
+/*
+ * pack_state() -- encode the multiple n of a large prime as a state word.
+ * Inputs:  n  the multiple (coprime to 30);  j  wheel index of its
+ *          multiplier n/q (so that the next multiple is n + q*c_GAP[j]).
+ * Returns: (chunk of n mod SLOTS) << 26 | (byte offset of n in that chunk)
+ *          << 3 | j.  The byte offset is below 2^23 because a chunk has
+ *          CHUNK_WORDS*4 = 8,257,536 bytes.
+ * Errors:  none.
+ */
 __device__ __forceinline__ u32 pack_state(u64 n, u32 j)
 {
     u64 kc = n / CHUNK_NUMS;
@@ -359,12 +604,31 @@ __device__ __forceinline__ u32 pack_state(u64 n, u32 j)
     return ((u32)(kc & (SLOTS - 1)) << 26) | (b << 3) | j;
 }
 
-/* the chunk whose extended range [chunk_lo, hi_ext) first contains n */
+/*
+ * slot_of() -- the chunk in which the multiple n must first be marked: the
+ * chunk whose extended range [chunk_lo, chunk_hi + OVERLAP_NUMS) contains n.
+ * Inputs:  n  any number.
+ * Returns: that chunk index; a number in the overlap region of chunk k maps
+ *          to k, not to k+1 (it is marked in both, k first).
+ * Errors:  none.
+ */
 __device__ __forceinline__ u64 slot_of(u64 n)
 {
     return n < OVERLAP_NUMS ? 0 : (n - OVERLAP_NUMS) / CHUNK_NUMS;
 }
 
+/*
+ * append_entry() -- push a sleeper entry onto the bucket list of a chunk
+ * (used by the initialization kernels; kernel_bucket has its own staged
+ * version).
+ * Inputs:  entries, counts, cap  the SLOTS lists of cap entries each and
+ *          their fill counts;  err  error flag word;  slot  absolute index
+ *          of the destination chunk (reduced mod SLOTS);  entry  state<<32|q.
+ * Effects: one global atomicAdd on the list count; stores the entry at the
+ *          reserved position, or sets bit 0 of *err when the list is full
+ *          (the host dies at the next chunk).
+ * Errors:  list overflow -> *err bit 0.
+ */
 __device__ __forceinline__ void append_entry(u64 *entries, u32 *counts, u32 cap, u32 *err, u64 slot, u64 entry)
 {
     u32 s = (u32)(slot % SLOTS);
@@ -373,8 +637,24 @@ __device__ __forceinline__ void append_entry(u64 *entries, u32 *counts, u32 cap,
     else atomicOr(err, 1u);
 }
 
-/* State of the active large primes [0, nactive) for a scan (re)starting at chunk_lo:
- * dense primes (i < nd) into the flat array, sleepers into their bucket lists. */
+/*
+ * kernel_init_state -- initial state of every active large prime for a scan
+ * that starts or resumes at chunk k0 (the state is not checkpointed).
+ * Launch:  one thread per prime i < nactive, blocks of 256.
+ * Inputs:  primes   large sieving primes, ascending;  state  flat state
+ *          array of the dense primes;  nd  number of dense primes (the first
+ *          nd of primes[]);  nactive  primes with q*q below the first chunk's
+ *          extended end;  k0  first chunk;  entries/counts/cap/err  the
+ *          bucket lists.
+ * Effects: dense primes get the state of their first multiple >= k0's start
+ *          (first_multiplier); sleepers are filed under the chunk that first
+ *          needs that multiple, but never under a chunk below k0: a multiple
+ *          in the overlap region of chunk k0-1 lies inside chunk k0, and
+ *          filing it under k0-1, which is never processed, would lose it
+ *          (the first bucket build lost 86,000 marks per 2e11-number window
+ *          exactly that way; caught by the CPU-tool window diff).
+ * Errors:  bucket overflow -> err bit 0.
+ */
 __global__ void kernel_init_state(const u32 *__restrict__ primes, u32 *__restrict__ state, u32 nd, u32 nactive, u64 k0,
                                   u64 *__restrict__ entries, u32 *__restrict__ counts, u32 cap, u32 *__restrict__ err)
 {
@@ -390,7 +670,15 @@ __global__ void kernel_init_state(const u32 *__restrict__ primes, u32 *__restric
     append_entry(entries, counts, cap, err, sl, ((u64)st << 32) | q);
 }
 
-/* Newly active primes [nprev, nactive): their first multiple q*q lies in the current chunk or its overlap. */
+/*
+ * kernel_activate -- state of the primes [nprev, nactive) that become active
+ * in chunk k, i.e. whose square lies in the chunk or its overlap.
+ * Launch:  one thread per new prime, blocks of 256; only when nactive > nprev.
+ * Inputs:  as kernel_init_state; nprev = primes already active;  k  chunk.
+ * Effects: the first multiple to mark is q*q (multiplier q): dense primes
+ *          into state[], sleepers into the list of max(slot_of(q*q), k).
+ * Errors:  bucket overflow -> err bit 0.
+ */
 __global__ void kernel_activate(const u32 *__restrict__ primes, u32 *__restrict__ state, u32 nd, u32 nprev, u32 nactive, u64 k,
                                 u64 *__restrict__ entries, u32 *__restrict__ counts, u32 cap, u32 *__restrict__ err)
 {
@@ -405,22 +693,53 @@ __global__ void kernel_activate(const u32 *__restrict__ primes, u32 *__restrict_
     append_entry(entries, counts, cap, err, sl, ((u64)st << 32) | q);
 }
 
-/* (chunk_lo/30) mod q for every medium sieving prime (one 64-bit division each, once per chunk) */
+/*
+ * kernel_chunkmod -- rchunk[i] = (chunk_lo / 30) mod q for every medium
+ * prime: the one 64-bit division per medium prime per chunk.  kernel_segment
+ * derives every segment's start residue from it with 32-bit arithmetic.
+ * Launch:  one thread per medium prime, blocks of 256, once per chunk.
+ * Inputs:  sprimes/nsmall  the medium primes;  chunk_lo  chunk start.
+ * Effects: fills rchunk[0..nsmall).
+ * Errors:  none.
+ */
 __global__ void kernel_chunkmod(const u32 *__restrict__ sprimes, u32 *__restrict__ rchunk, u32 nsmall, u64 chunk_lo)
 {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < nsmall) rchunk[i] = (u32)((chunk_lo / 30) % sprimes[i]);
 }
 
-/* x mod q for x < 2^32, with inv = floor(2^32 / q) */
+/*
+ * barrett32() -- x mod q for 32-bit x without a division.
+ * Inputs:  x < 2^32;  q  the modulus (< 2^31);  inv = floor(2^32 / q), the
+ *          per-prime table sinv built by gpu_init.
+ * Returns: x mod q.  __umulhi(x, inv) = floor(x*inv / 2^32) is floor(x/q) or
+ *          one less, so a single conditional subtraction corrects it.
+ * Errors:  none; callers keep x < 2^32 (a residue plus at most 95 times a
+ *          value below 2^17, or a residue plus 29q with q <= 1e8).
+ */
 __device__ __forceinline__ u32 barrett32(u32 x, u32 q, u32 inv)
 {
     u32 r = x - __umulhi(x, inv) * q;
     return r >= q ? r - q : r;
 }
 
-/* Mark the multiples of q from n (wheel index j) below hi_ext into the chunk bitmap;
- * returns the packed state of the first multiple >= chunk_hi. */
+/*
+ * mark_prime() -- mark the multiples of a large prime q in the chunk bitmap,
+ * from n up to hi_ext, and return the state of the first multiple beyond
+ * the chunk.
+ * Inputs:  q  the prime;  n  its first multiple to mark (>= chunk_lo), with
+ *          j  the wheel index of n/q;  chunk_lo, chunk_hi  the chunk;
+ *          hi_ext = chunk_hi + OVERLAP_NUMS;  bitmap  the chunk bitmap
+ *          (CHUNK_WORDS + OVERLAP words).
+ * Effects: one global atomicOr per multiple: byte (n - chunk_lo)/30, bit
+ *          c_BITIDX[class of q][j].  n advances by q*c_GAP[j] and j by one,
+ *          so the eight residue progressions are visited in number order.
+ * Returns: pack_state() of the first multiple >= chunk_hi.  That multiple is
+ *          either inside the overlap (then it has been marked here and will
+ *          be marked again in the next chunk) or beyond hi_ext (then it is
+ *          the first unmarked one).
+ * Errors:  none.
+ */
 __device__ __forceinline__ u32 mark_prime(u32 q, u64 n, u32 j, u64 chunk_lo, u64 chunk_hi, u64 hi_ext, u32 *__restrict__ bitmap)
 {
     const u32 a = c_RIDX[q % 30];
@@ -438,7 +757,18 @@ __device__ __forceinline__ u32 mark_prime(u32 q, u64 n, u32 j, u64 chunk_lo, u64
     return pack_state(nsave, jsave);
 }
 
-/* Multiple encoded by state s for chunk k: in the chunk (target k) or in its overlap (target k+1). */
+/*
+ * state_position() -- decode a state word relative to chunk k.
+ * Inputs:  s  the state;  q  its prime;  k  the current chunk;  chunk_lo,
+ *          chunk_hi  its bounds.
+ * Returns: true, with *n = the multiple and *j = its wheel index, when the
+ *          multiple is due now: inside chunk k (target field == k mod 64), or
+ *          inside chunk k's overlap region (target == k+1 and byte offset
+ *          within the first OVERLAP words).  false when the prime sleeps
+ *          through this chunk.  The residue of the multiple is
+ *          c_R[c_BITIDX[class of q][j]].
+ * Errors:  none.
+ */
 __device__ __forceinline__ bool state_position(u32 s, u32 q, u64 k, u64 chunk_lo, u64 chunk_hi, u64 *n, u32 *j)
 {
     const u32 tgt = s >> 26, kk = (u32)(k & (SLOTS - 1)), b = (s >> 3) & 0x7FFFFFu;
@@ -451,7 +781,21 @@ __device__ __forceinline__ bool state_position(u32 s, u32 q, u64 k, u64 chunk_lo
     return true;
 }
 
-/* Dense large primes: one thread per prime, state always rewritten (coalesced). */
+/*
+ * kernel_large -- the dense large primes (q below the dense threshold, which
+ * hit every chunk): one thread per prime, every chunk.
+ * Launch:  n_dense threads in blocks of 256 (launch bound 256).
+ * Inputs:  primes, state  the flat arrays (the first n_dense entries);  k,
+ *          chunk_lo, chunk_hi, hi_ext  the chunk;  bitmap  the chunk bitmap.
+ * Effects: decodes the state (state_position); if the multiple is due, marks
+ *          the chunk (mark_prime) and stores the new state, otherwise stores
+ *          the old state unchanged.  Loads and stores use the streaming
+ *          cache hint (__ldcs/__stcs) so the ~10 MB of prime and state
+ *          arrays do not evict the bitmap from L2, and the unconditional
+ *          store keeps the writes coalesced (the sparse write-back of only
+ *          the ~18% of primes that hit was measured to be slower).
+ * Errors:  none.
+ */
 __global__ void __launch_bounds__(256)
 kernel_large(const u32 *__restrict__ primes, u32 *__restrict__ state, u32 n_dense,
              u64 k, u64 chunk_lo, u64 chunk_hi, u64 hi_ext, u32 *__restrict__ bitmap)
@@ -466,8 +810,27 @@ kernel_large(const u32 *__restrict__ primes, u32 *__restrict__ state, u32 n_dens
     __stcs(&state[i], mark_prime(q, n, j, chunk_lo, chunk_hi, hi_ext, bitmap));
 }
 
-/* Sleeping large primes due in chunk k: process the n_in entries of its bucket list,
- * re-append each to the list of the chunk holding its next multiple. */
+/*
+ * kernel_bucket -- the sleeping large primes due in chunk k.
+ * Launch:  one thread per entry of list k mod SLOTS (n_in entries, read by
+ *          the host before the launch), blocks of BLOCKDIM_B = 1024.
+ * Inputs:  entries, counts, cap, err  the lists;  n_in  entries in this
+ *          chunk's list;  k, chunk_lo, chunk_hi, hi_ext, bitmap  as in
+ *          kernel_large.
+ * Effects: each entry's multiples in the chunk are marked (mark_prime) and
+ *          the entry, with its new state, is re-filed under the chunk that
+ *          first needs the next multiple: slot_of() of that multiple, or
+ *          k+1 when it lies in this chunk's overlap (it must be marked again
+ *          there).  Outgoing entries are staged in shared memory grouped by
+ *          destination (relative chunk 1..63): per-destination counts by
+ *          shared atomics, an exclusive prefix over the 64 counts, one
+ *          global atomicAdd per destination per block to reserve a range in
+ *          the destination list, then a coalesced write-out.  The host
+ *          clears this chunk's list count afterwards.
+ * Errors:  err bit 0 on list overflow; err bit 1 if an entry's multiple is
+ *          not due in this chunk, i.e. it was filed in the wrong list (a
+ *          bug, never seen).  The host dies on either flag at the next chunk.
+ */
 __global__ void __launch_bounds__(BLOCKDIM_B)
 kernel_bucket(u64 *__restrict__ entries, u32 *__restrict__ counts, u32 cap, u32 *__restrict__ err, u32 n_in,
               u64 k, u64 chunk_lo, u64 chunk_hi, u64 hi_ext, u32 *__restrict__ bitmap)
@@ -485,7 +848,7 @@ kernel_bucket(u64 *__restrict__ entries, u32 *__restrict__ counts, u32 cap, u32 
     u32 rel = 0, rank = 0;
     u64 out = 0;
     if (have) {
-        const u64 e = entries[(u64)slot * cap + i];
+        const u64 e = entries[(u64)slot * cap + i];     /* entry = state << 32 | q */
         const u32 q = (u32)e, s = (u32)(e >> 32);
         u64 n;
         u32 j;
@@ -530,24 +893,15 @@ kernel_bucket(u64 *__restrict__ entries, u32 *__restrict__ counts, u32 cap, u32 
     }
 }
 
-/* Block-wide sum of u32 (blockDim.x multiple of 32); scratch needs blockDim/32 words. */
-__device__ __forceinline__ u32 block_sum(u32 v, u32 *scratch)
-{
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = blockDim.x >> 5;
-    if (lane == 0) scratch[warp] = v;
-    __syncthreads();
-    u32 s = 0;
-    if (threadIdx.x < 32) {
-        s = (threadIdx.x < (u32)nwarps) ? scratch[threadIdx.x] : 0;
-        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-    }
-    __syncthreads();
-    return s;                       /* valid in thread 0 */
-}
-
-/* Block-wide exclusive prefix sum (blockDim.x <= 1024, multiple of 32); scratch: 32 words.
- * Returns the exclusive prefix; *tot receives the block total (all threads). */
+/*
+ * block_exscan() -- block-wide exclusive prefix sum of one u32 per thread.
+ * Inputs:  v  this thread's value;  scratch  32 shared words;  blockDim.x a
+ *          multiple of 32 and at most 1024; every thread must call it.
+ * Returns: the sum of v over the lower thread indices; *tot = the block
+ *          total, valid in every thread.  Shuffle scan inside each warp, the
+ *          warp totals scanned by warp 0.
+ * Errors:  none.
+ */
 __device__ __forceinline__ u32 block_exscan(u32 v, u32 *scratch, u32 *tot)
 {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
@@ -567,9 +921,22 @@ __device__ __forceinline__ u32 block_exscan(u32 v, u32 *scratch, u32 *tot)
     return prefix;
 }
 
-/* Record the first `count` primes of the run that starts at offset o (a prime)
- * as the first occurrences of run lengths run, run-1, ...: prime t of the walk
- * has run length run - t and index idx0 + t.  Stops at slice_hi. */
+/*
+ * record_from() -- record first occurrences of new run lengths by re-walking
+ * a run in the shared bitmap.
+ * Inputs:  sh  the segment bitmap;  o  offset of the run's first prime;
+ *          idx0  that prime's index among the counted primes;  count  how
+ *          many primes to record;  run  the run's length;  slice_hi  the
+ *          calling thread's slice end;  s_first  shared (offset << 32 |
+ *          index) words, one per run length.
+ * Effects: prime t of the walk (t = 0..count-1) has run length run - t and
+ *          index idx0 + t; each is atomicMin'd into s_first[run - t], so the
+ *          smallest offset wins across the block's threads.  Stops at
+ *          slice_hi (primes beyond it belong to the next slice, which records
+ *          them itself) or at the end of the bitmap.
+ * Errors:  none.  Called only when a run is longer than every earlier run of
+ *          the slice, so the re-walk is rare.
+ */
 __device__ __forceinline__ void record_from(const u32 *sh, u32 o, u32 idx0, u32 count, u32 run, u32 slice_hi,
                                             unsigned long long *s_first)
 {
@@ -587,10 +954,33 @@ __device__ __forceinline__ void record_from(const u32 *sh, u32 o, u32 idx0, u32 
 }
 
 /*
- * One block per segment.  sprimes[0..nsmall) are the sieving primes 23..QSPLIT
- * (ascending, nwarpprimes of them below PWARP).  start_off/end_off bound the
- * primes to be accounted for, as offsets from seg_lo (end_off may exceed the
- * owned region, in which case the owned region end applies).
+ * kernel_segment -- one block per segment: finish the segment's bitmap in
+ * shared memory and extract primes, counts and run lengths (section 1.5 of
+ * the header).
+ * Launch:  CHUNK_SEGS blocks of BLOCKDIM threads with SHARED_WORDS*4 bytes
+ *          of dynamic shared memory (88 KB; gpu_init raises the limit).
+ * Inputs:  bitmap   chunk bitmap holding the large-prime marks;
+ *          pattern  presieve pattern bytes;
+ *          sprimes  medium primes 23..QSPLIT ascending, nsmall of them,
+ *                   the first nwarpprimes below PWARP;
+ *          sinv, ssegmod (and sbeta in the wheel-30 version)  per-prime
+ *                   tables from gpu_init (Barrett constant, segment length
+ *                   mod q, -30^-1 mod q);
+ *          rchunk   chunk start mod q from kernel_chunkmod;
+ *          chunk_lo chunk start;  start, end  bounds of the numbers to
+ *                   account for: primes outside [start, end) are sieved but
+ *                   neither counted nor recorded (START, END and the resume
+ *                   position are enforced this way);
+ *          results  one SegResult per segment.
+ * Effects: results[seg] = prime count, first occurrences (offsets from the
+ *          segment start and 1-based indices among the counted primes),
+ *          the two histogram arrays, the unsettled flag and the overflow
+ *          flag.
+ * Errors:  none raised.  overflow (a run of NMAX or more gaps, clamped) and
+ *          unsettled (a run still open at the bitmap end) are reported in
+ *          the result and handled by the host.  Requires SEG_WORDS to be a
+ *          multiple of BLOCKDIM and every segment start to be a multiple of
+ *          the wheel size.
  */
 __global__ void __launch_bounds__(BLOCKDIM)
 kernel_segment(const u32 *__restrict__ bitmap, const u8 *__restrict__ pattern,
@@ -608,7 +998,11 @@ kernel_segment(const u32 *__restrict__ bitmap, const u8 *__restrict__ pattern,
     const u32 word0 = seg * SEG_WORDS;
     const u32 tid = threadIdx.x;
 
-    /* --- 1. presieve pattern (7, 11, 13, 17, 19) and large-prime bits --- */
+    /* --- 1. presieve pattern (7, 11, 13, 17, 19) and large-prime bits ---
+     * The pattern repeats every PAT_PERIOD bytes; pbase is the pattern byte
+     * of the segment's first byte.  Each thread assembles four pattern bytes
+     * per word and ORs in the chunk bitmap word (the large-prime marks) with
+     * a streaming load, so the chunk bitmap is read exactly once. */
     {
         u32 pbase = (u32)((seg_lo / 30) % PAT_PERIOD);
         for (u32 w = tid; w < SHARED_WORDS; w += BLOCKDIM) {
@@ -641,9 +1035,11 @@ kernel_segment(const u32 *__restrict__ bitmap, const u8 *__restrict__ pattern,
 #ifndef SKIP_MARK_WARP
         for (u32 i = warp; i < nwarpprimes; i += nwarps) {
             const u32 q = sprimes[i];
+            /* lane -> residue class k (8 classes) x sub-stride sub (4 per class):
+             * lane marks the bytes b, b+4q, b+8q, ... of class k from b + sub*q */
             const u32 k = lane & 7, sub = lane >> 3, mask = 1u << k, stride = 4 * q;
             u32 b;
-            if ((u64)q * q > seg_lo) {
+            if ((u64)q * q > seg_lo) {              /* early chunks: start at q*q (q itself must stay unmarked) */
                 u64 d = (u64)q * q - seg_lo;
                 if (d >= (u64)SHB * 30) continue;
                 const u32 D = (u32)d, qinv = c_QINV30[q % 30], Dm = D % 30;
@@ -662,7 +1058,7 @@ kernel_segment(const u32 *__restrict__ bitmap, const u8 *__restrict__ pattern,
 #ifndef SKIP_MARK_MED
         for (u32 i = nwarpprimes + tid; i < nsmall; i += BLOCKDIM) {
             const u32 q = sprimes[i];
-            if ((u64)q * q > seg_lo) {
+            if ((u64)q * q > seg_lo) {              /* early chunks: start at q*q */
                 u64 d = (u64)q * q - seg_lo;
                 if (d >= (u64)SHB * 30) continue;
                 const u32 D = (u32)d, qinv = c_QINV30[q % 30], Dm = D % 30;
@@ -691,13 +1087,16 @@ kernel_segment(const u32 *__restrict__ bitmap, const u8 *__restrict__ pattern,
     if (seg_lo == 0 && tid == 0) sh[0] = (sh[0] & ~0x3Eu) | 1u;   /* 1 is not prime; 7..19 are */
     __syncthreads();
 
-    /* --- 3. prime count in the owned region ∩ [start, end) --- */
+    /* --- 3. prime count in the owned region ∩ [start, end) ---
+     * Each thread counts its slice of WPT words; a block-wide exclusive scan
+     * then gives every thread the number of counted primes before its slice
+     * (needed for the prime indices of step 4) and thread 0 the total. */
     /* bounds as offsets from seg_lo */
     const u64 own_nums = SEG_NUMS;
     u32 lo_off = (start > seg_lo) ? (u32)(start - seg_lo) : 0;              /* first number accounted */
     u32 hi_off = (end < seg_lo + own_nums) ? (u32)(end - seg_lo) : (u32)own_nums;   /* exclusive */
     if (lo_off > hi_off) lo_off = hi_off;
-    const u32 WPT = SEG_WORDS / BLOCKDIM;                  /* words per thread slice */
+    const u32 WPT = SEG_WORDS / BLOCKDIM;                  /* words per thread slice: 21 (SEG_WORDS is a multiple of BLOCKDIM) */
     const u32 w0 = tid * WPT;
     u32 prefix;                                            /* primes (inside the bounds) before this slice */
     {
@@ -807,6 +1206,7 @@ kernel_segment(const u32 *__restrict__ bitmap, const u8 *__restrict__ pattern,
         }
     }
     __syncthreads();
+    /* write the segment's results (one SegResult per block) for the host merge */
     if (tid < NMAX) {
         results[seg].first[tid] = (u32)(s_first[tid] >> 32);
         results[seg].firstidx[tid] = (u32)s_first[tid];
@@ -820,10 +1220,17 @@ kernel_segment(const u32 *__restrict__ bitmap, const u8 *__restrict__ pattern,
 /* Host side: sieving primes, pattern, GPU context                     */
 /* ------------------------------------------------------------------ */
 
+/* host copies of the wheel residues and the residue -> index map (8 = not coprime to 30) */
 static const u32 H_R[8] = { 1, 7, 11, 13, 17, 19, 23, 29 };
 static const u8  H_RIDX[30] = { 8,0,8,8,8,8,8,1,8,8, 8,2,8,3,8,8,8,4,8,5, 8,8,8,6,8,8,8,8,8,7 };
 
-/* all primes <= n (simple odd sieve; n <= ~2e8 takes well under a second) */
+/*
+ * primes_upto() -- all primes <= n, ascending, by a plain odd-only sieve of
+ * Eratosthenes on the host.
+ * Inputs:  n  (the sieving primes go up to sqrt(END): 2.6e9 at most, ~1.4e9
+ *          for END = 2e18, which takes a few seconds and 0.7 GB).
+ * Returns: the vector of primes.   Errors: none (std::bad_alloc if n is huge).
+ */
 static std::vector<u32> primes_upto(u32 n)
 {
     std::vector<u32> out;
@@ -837,6 +1244,14 @@ static std::vector<u32> primes_upto(u32 n)
     return out;
 }
 
+/*
+ * build_pattern() -- the presieve pattern: for every byte position b of the
+ * period, the bits of the residues 30*b + R[j] (or 210*p + R[j]) that are
+ * divisible by one of the pattern primes.  Sieving them once here replaces
+ * the five (four) most expensive medium primes in every segment.
+ * Inputs:  none.   Returns: PAT_PERIOD (PAT_BYTES) pattern bytes.
+ * Errors:  none.
+ */
 static std::vector<u8> build_pattern(void)
 {
     std::vector<u8> pat(PAT_PERIOD, 0);
@@ -849,21 +1264,46 @@ static std::vector<u8> build_pattern(void)
     return pat;
 }
 
+/* The GPU context: device buffers, pinned host buffers and the sieving-prime
+ * split, built by gpu_init() for a given END and freed by gpu_free(). */
 struct Gpu {
-    u32 *d_bitmap, *d_sprimes, *d_lprimes, *d_mstate;
+    u32 *d_bitmap, *d_sprimes, *d_lprimes, *d_mstate;   /* chunk bitmap; medium primes; large primes; dense-prime state */
     u32 *d_sinv, *d_ssegmod, *d_sbeta, *d_rchunk;   /* per medium prime: floor(2^32/q), (SEG_NUMS/30) mod q, -30^-1 mod q, (chunk_lo/30) mod q */
-    u8  *d_pattern;
+    u8  *d_pattern;                 /* presieve pattern */
     u64 *d_entries;                 /* SLOTS bucket lists of cap entries for the sleeping large primes */
     u32 *d_counts, *d_err, *h_cnt;  /* per-list counts, error flags, pinned copy of {count, err} */
-    u32 cap, nd;                    /* list capacity; number of dense large primes (q < CHUNK_NUMS/6) */
-    SegResult *d_results, *h_results;
+    u32 cap, nd;                    /* list capacity; number of dense large primes (q below the dense threshold) */
+    SegResult *d_results, *h_results;   /* per-segment results, device and pinned host copy */
     std::vector<u32> lprimes;       /* large sieving primes (> qsplit), ascending */
-    u32 nsmall, nwarpprimes, nlarge;
+    u32 nsmall, nwarpprimes, nlarge;    /* medium primes, those below PWARP, large primes */
     u32 qsplit;
-    cudaStream_t sA;
-    cudaEvent_t ev_t0, ev_t1, ev_t2, ev_t3;
+    cudaStream_t sA;                /* the one stream everything runs on */
+    cudaEvent_t ev_t0, ev_t1, ev_t2, ev_t3;     /* per-kernel timing for bench -p */
 };
 
+/*
+ * gpu_init() -- build the sieving-prime tables and allocate the device.
+ * Inputs:  g  the context to fill;  max_number  the largest number any chunk
+ *          of the scan touches (the sieving primes go up to its square
+ *          root);  qsplit  medium/large split.
+ * Effects: uploads the wheel tables; sieves the primes up to
+ *          sqrt(max_number) on the host and splits them into medium
+ *          (23..qsplit, with the warp-per-prime count) and large (> qsplit);
+ *          builds the presieve pattern; creates the stream, the chunk
+ *          bitmap, the per-segment result buffers (device and pinned host),
+ *          the timing events, the bucket lists (capacity from the expected
+ *          hits per chunk of the sleepers at END, Sum over sleepers of
+ *          CHUNK_NUMS * (wheel density) / q, doubled, plus 2^20), the pinned
+ *          {count, err} pair, the per-medium-prime tables and the
+ *          large-prime arrays; raises kernel_segment's dynamic shared memory
+ *          limit; with g_l2_persist, sets the persisting-L2 limit and an
+ *          access policy window over the bitmap on the stream (hit ratio 1,
+ *          persisting; misses streaming), capped at the device maxima.
+ * Returns: nothing; prints the large-prime split unless g_quiet_init.
+ * Errors:  die() on any CUDA error, or if a bucket list would need 2^32 or
+ *          more entries.  Memory: 4 bytes of state per large prime, 64 * cap
+ *          * 8 bytes for the lists (13 GB at END = 2e18), 8 MB bitmap.
+ */
 static void gpu_init(Gpu &g, u64 max_number, u32 qsplit)
 {
     u8 bitidx[8][8];
@@ -871,7 +1311,7 @@ static void gpu_init(Gpu &g, u64 max_number, u32 qsplit)
         for (int j = 0; j < 8; j++) bitidx[a][j] = H_RIDX[(H_R[a] * H_R[j]) % 30];
     CUDA_CHECK(cudaMemcpyToSymbol(c_BITIDX, bitidx, sizeof bitidx));
 
-    u32 sq = (u32)sqrt((double)max_number);
+    u32 sq = (u32)sqrt((double)max_number);          /* integer square root, corrected below for rounding */
     while ((u64)sq * sq > max_number) sq--;
     while ((u64)(sq + 1) * (sq + 1) <= max_number) sq++;
     std::vector<u32> all = primes_upto(sq);
@@ -937,6 +1377,8 @@ static void gpu_init(Gpu &g, u64 max_number, u32 qsplit)
     if (g.nlarge) CUDA_CHECK(cudaMemcpy(g.d_lprimes, g.lprimes.data(), g.nlarge * sizeof(u32), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc(&g.d_mstate, (g.nlarge + 1) * sizeof(u32)));
     CUDA_CHECK(cudaFuncSetAttribute(kernel_segment, cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_WORDS * sizeof(u32)));
+    /* Keep the chunk bitmap resident in L2: the large-prime atomics then run
+     * at L2 speed.  Both limits are capped at what the device allows. */
     if (g_l2_persist) {
         cudaDeviceProp prop;
         CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
@@ -956,7 +1398,12 @@ static void gpu_init(Gpu &g, u64 max_number, u32 qsplit)
     }
 }
 
-/* number of large primes q with q*q < limit */
+/*
+ * active_count() -- number of large primes q with q*q < limit, i.e. the
+ * primes that must be sieving by the time the scan reaches limit (they are
+ * the first that many of g.lprimes).
+ * Inputs:  g  context;  limit.   Returns: the count.   Errors: none.
+ */
 static u32 active_count(const Gpu &g, u64 limit)
 {
     u32 sq = (u32)sqrt((double)limit);
@@ -969,24 +1416,32 @@ static u32 active_count(const Gpu &g, u64 limit)
 /* Scan state and merge                                                */
 /* ------------------------------------------------------------------ */
 
+/* A first occurrence: the smallest prime with run length n.  Final as soon
+ * as it is recorded, because chunks and segments are merged in order. */
 struct Cand {
     u64 p;                  /* 0 = none */
     u64 pi;                 /* primes in [start, p] (exact: segments merge in order) */
-    u16 gaps[NMAX + 1];
+    u16 gaps[NMAX + 1];     /* the n gaps of the run, then the gap that ends it (from run_length64) */
 };
 
+/* The scan state on the host.  Reset by run_scan() for every scan, written
+ * by merge_chunk(), saved and restored by the checkpoint. */
 static struct {
     u64 start, end;         /* requested bounds */
     u64 next_chunk;         /* next chunk index to process (chunks [k_lo, next) done) */
     u64 k_lo, k_hi;         /* chunk index range [k_lo, k_hi) */
     u64 primes;             /* primes in [start, pos) */
     u64 resume_pos;         /* numbers below this were scanned by an earlier run (= start for a fresh run) */
-    u64 hist[NMAX];
-    Cand best[NMAX];
-    bool overflow;
+    u64 hist[NMAX];         /* hist[n] = primes with run length n in [start, pos) */
+    Cand best[NMAX];        /* best[n] = first prime with run length n */
+    bool overflow;          /* some run was clamped to NMAX-1 gaps */
     u64 cpu_settled;        /* primes settled by the CPU fallback */
 } S;
 
+/*
+ * print_cand() -- print "<tag> a(n) = p  gaps: ... | g  (pi(p) = k)" on
+ * stdout (line-buffered), clearing the status line first on a terminal.
+ */
 static void print_cand(int n, const Cand *c, const char *tag)
 {
     if (stderr_tty) fputs("\r\033[K", stderr);
@@ -996,7 +1451,18 @@ static void print_cand(int n, const Cand *c, const char *tag)
     fflush(stdout);
 }
 
-/* record prime p (with prime index pi) as the first of run length n if unset */
+/*
+ * record_first() -- record prime p as the first with run length n.
+ * Inputs:  n  run length;  p  the prime;  pi  its prime index (primes in
+ *          [start, p]).
+ * Effects: if S.best[n] is still empty: stores p and pi, RE-DERIVES the run
+ *          and its gaps with the host's next-prime search (run_length64) and
+ *          prints the CONFIRMED line when n >= g_report.  Later calls for the
+ *          same n are ignored (segments arrive in order, so the first is the
+ *          smallest).
+ * Errors:  die() if the next-prime search finds a different run length: a
+ *          GPU/CPU disagreement never reaches the output silently.
+ */
 static void record_first(int n, u64 p, u64 pi)
 {
     if (n < 1 || n >= NMAX || S.best[n].p) return;
@@ -1008,7 +1474,17 @@ static void record_first(int n, u64 p, u64 pi)
     if (n >= g_report) print_cand(n, c, "CONFIRMED");
 }
 
-/* CPU fallback: settle every prime in [lo, hi) directly; pi_before = primes below lo */
+/*
+ * settle_cpu() -- CPU fallback: settle every prime in [lo, hi) directly.
+ * Inputs:  lo, hi  the range;  pi_before  primes in [start, lo).
+ * Effects: walks the primes with next_prime64, computes each run length by
+ *          next-prime search, updates the histogram, S.cpu_settled and the
+ *          first occurrences (S.primes is not touched: the segment's count
+ *          already includes these primes).  Only used for the tail of a
+ *          segment whose last run was still open at the end of the block's
+ *          bitmap; never needed so far, and slow if the tail were long.
+ * Errors:  die() if a run exceeds NMAX gaps.
+ */
 static void settle_cpu(u64 lo, u64 hi, u64 pi_before)
 {
     u64 p = is_prime64(lo) ? lo : next_prime64(lo);
@@ -1024,7 +1500,21 @@ static void settle_cpu(u64 lo, u64 hi, u64 pi_before)
     }
 }
 
-/* merge one chunk's segment results (in order) */
+/*
+ * merge_chunk() -- fold one chunk's segment results into the scan state.
+ * Inputs:  results  CHUNK_SEGS SegResults (the pinned host copy);  chunk_lo.
+ * Effects: for each segment in order, skipping segments entirely below the
+ *          resume position or at/above END: records first occurrences with
+ *          pi = primes before the segment + index inside it; adds the
+ *          histogram (primes with run length n = run ends of length >= n
+ *          plus the final-run extras, exactly as in the CPU tool); if a run
+ *          was left unsettled, counts the primes from the segment's first
+ *          counted number up to the flagged prime by next-prime search and
+ *          settles the rest of the segment on the CPU; then adds the
+ *          segment's prime count.  S.primes is exact after every segment,
+ *          which is what makes pi(a(n)) exact.
+ * Errors:  record_first() and settle_cpu() may die (see there).
+ */
 static void merge_chunk(const SegResult *results, u64 chunk_lo)
 {
     for (u32 s = 0; s < CHUNK_SEGS; s++) {
@@ -1055,6 +1545,20 @@ static void merge_chunk(const SegResult *results, u64 chunk_lo)
 /* Checkpoint                                                          */
 /* ------------------------------------------------------------------ */
 
+/*
+ * save_state() -- write the checkpoint file atomically (path.tmp, then
+ * rename).  Format:
+ *     A158939 cuda checkpoint 2
+ *     start N / end N / pos N / primes N / cpu_settled N
+ *     hist N COUNT                 (every non-zero entry)
+ *     cand N P PI G1 ... G(N+1)    (every first occurrence)
+ *     end
+ * pos is the position up to which the scan is complete: the next chunk
+ * boundary, or END when the last chunk is partial (an early version wrote
+ * the boundary in that case too and a later resume skipped the rest of the
+ * chunk).
+ * Errors:  I/O failures print a warning and leave the old file in place.
+ */
 static void save_state(const char *path)
 {
     char tmp[PATH_MAX];
@@ -1078,6 +1582,19 @@ static void save_state(const char *path)
         fprintf(stderr, "\nwarning: cannot update %s: %s\n", path, strerror(errno));
 }
 
+/*
+ * load_state() -- read a checkpoint written by save_state().
+ * Inputs:  path.  S.start and S.end must already hold the command line's
+ *          values.
+ * Effects: restores S.primes, S.cpu_settled, S.hist[], S.best[] and sets
+ *          S.next_chunk to the chunk containing pos and S.resume_pos = pos,
+ *          so that chunk is rescanned from pos.  A different END only
+ *          produces a note (that is how a finished scan is extended).
+ * Returns: true if loaded; false if the file does not exist.
+ * Errors:  die() if the file cannot be read, has the wrong header, a bad
+ *          hist/cand line, no "end" line, a different START, or a position
+ *          below START.
+ */
 static bool load_state(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -1125,19 +1642,26 @@ static bool load_state(const char *path)
     return true;
 }
 
+/* on_sigint() -- SIGINT/SIGTERM: request a stop after the current chunk
+ * (the loop then saves the checkpoint and prints the table).  Only a flag is
+ * set, so the handler is async-signal-safe. */
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
 /* ------------------------------------------------------------------ */
 /* Scan driver                                                         */
 /* ------------------------------------------------------------------ */
 
+/* What run_scan() reports: wall time, numbers scanned by this run (whole
+ * chunks), total primes in [start, pos) including resumed work. */
 struct ScanStats { double seconds; u64 numbers; u64 primes; };
 
-static Gpu G;
+static Gpu G;                       /* the one GPU context, rebuilt by every run_scan() */
 static bool G_ready = false;
-static bool g_profile = false;
+static bool g_profile = false;      /* bench -p: time the kernels with events */
 static double prof_large, prof_segment, prof_memset, prof_host;   /* seconds */
 
+/* gpu_free() -- release everything gpu_init() allocated (after a device
+ * synchronize).  Errors are ignored: this runs between scans and at exit. */
 static void gpu_free(Gpu &g)
 {
     cudaDeviceSynchronize();
@@ -1150,6 +1674,37 @@ static void gpu_free(Gpu &g)
     g.lprimes.clear();
 }
 
+/*
+ * run_scan() -- scan [start, end) on the GPU: the driver behind the scan,
+ * bench and selftest commands (section 1.3 of the header).
+ * Inputs:  start, end  the range (any numbers: chunks are aligned to
+ *                      CHUNK_NUMS and the kernels count only inside
+ *                      [start, end));
+ *          qsplit      medium/large prime split;
+ *          state       checkpoint file name or NULL;
+ *          interval    seconds between checkpoints and, without a terminal,
+ *                      between progress lines;
+ *          stop_n      stop once a(stop_n) is found (0 = never);
+ *          quiet       no status line, no start/stop notes.
+ * Effects: resets S, loads the checkpoint if any, (re)builds the GPU context
+ *          for sqrt(end of the last chunk + overlap), adds the primes the
+ *          wheel leaves out when the range contains them and the scan is
+ *          not resumed, installs the SIGINT/SIGTERM handler, builds the
+ *          initial large-prime state (kernel_init_state) and runs the
+ *          per-chunk pipeline in order on one stream: activate, clear the
+ *          bitmap, dense primes, read this chunk's bucket count and the
+ *          error flags, sleepers, chunkmod, segment kernel, copy results,
+ *          merge on the host.  Keeps a sliding window of chunk positions
+ *          for the rate and ETA, prints the status line and saves the
+ *          checkpoint every `interval` seconds.  After the loop saves the
+ *          final checkpoint and warns about a run-length overflow, CPU-
+ *          settled primes or an early stop.  Results stay in S for
+ *          print_table()/print_hist().
+ * Returns: ScanStats.
+ * Errors:  die() if end <= start, on any CUDA error, on a bucket-list
+ *          overflow or a misfiled entry, or on a GPU/CPU disagreement in
+ *          record_first().
+ */
 static ScanStats run_scan(u64 start, u64 end, u32 qsplit, const char *state, int interval, int stop_n, bool quiet)
 {
     if (end <= start) die("END must be larger than START");
@@ -1209,6 +1764,9 @@ static ScanStats run_scan(u64 start, u64 end, u32 qsplit, const char *state, int
     ts[0] = t0; ks[0] = k0;
     char b1[32], b2[32];
 
+    /* The chunk loop.  Everything is issued on the one stream in order; the
+     * host blocks twice per chunk (to read the bucket count and error flags
+     * before kernel_bucket, and to receive the results before the merge). */
     for (; k < S.k_hi && !g_stop; k++) {
         const u64 chunk_lo = k * CHUNK_NUMS, chunk_hi = chunk_lo + CHUNK_NUMS;
         const u64 hi_ext = chunk_hi + OVERLAP_NUMS;
@@ -1256,7 +1814,7 @@ static ScanStats run_scan(u64 start, u64 end, u32 qsplit, const char *state, int
         prof_host += now() - th0;
         nprev = nact;
         S.next_chunk = k + 1;
-        if (stop_n > 0 && S.best[stop_n].p) g_stop = 1;
+        if (stop_n > 0 && S.best[stop_n].p) g_stop = 1;    /* -n N: a(N) is final as soon as it is recorded */
 
         double t = now();
         if (t - ts[ns - 1] >= 1.0) {
@@ -1286,7 +1844,7 @@ static ScanStats run_scan(u64 start, u64 end, u32 qsplit, const char *state, int
     if (S.overflow) fprintf(stderr, "warning: a run exceeded %d gaps; longer run lengths were clamped\n", NMAX - 1);
     if (S.cpu_settled) fprintf(stderr, "note: %" PRIu64 " primes were settled by the CPU fallback\n", S.cpu_settled);
     if (g_stop && S.next_chunk < S.k_hi && !quiet)
-        fprintf(stderr, "stopped at position %" PRIu64 "%s\n", S.next_chunk * CHUNK_NUMS, state ? ", checkpoint saved" : "");
+        fprintf(stderr, "stopped at position %" PRIu64 "%s\n", (u64)(S.next_chunk * CHUNK_NUMS), state ? ", checkpoint saved" : "");
     ScanStats st;
     st.seconds = t1 - t0;
     st.numbers = (S.next_chunk - k0) * CHUNK_NUMS;
@@ -1294,9 +1852,16 @@ static ScanStats run_scan(u64 start, u64 end, u32 qsplit, const char *state, int
     return st;
 }
 
-/* position up to which the scan is complete (exclusive) */
+/* scan_pos() -- position up to which the scan is complete (exclusive): the
+ * next chunk boundary, or END inside the last chunk. */
 static u64 scan_pos(void) { u64 p = S.next_chunk * CHUNK_NUMS; return p < S.end ? p : S.end; }
 
+/*
+ * print_hist() -- print the prime count of [S.start, scan_pos()), compared
+ * with pi(10^k) when the scan started at 0 and ended exactly at 10^k, then
+ * the run-length histogram next to the i.i.d.-exponential-gap model
+ * primes * n/(n+1)! and the ratio of the two.
+ */
 static void print_hist(void)
 {
     const u64 pos = scan_pos();
@@ -1316,6 +1881,13 @@ static void print_hist(void)
     fflush(stdout);
 }
 
+/*
+ * print_table() -- print the a(n) table after a scan: a(n) (or the first
+ * prime >= START with run length n), pi(a(n)), the gaps and the gap that
+ * ends the run, the comparison with the OEIS (KNOWN[], A133697[]) for scans
+ * from 0 and "NEW" beyond the published terms; then the lower bound for the
+ * next term and print_hist().
+ */
 static void print_table(void)
 {
     int maxn = 0;
@@ -1332,7 +1904,7 @@ static void print_table(void)
             printf(c->p == KNOWN[n] ? "  = OEIS" : "  DIFFERS from OEIS %" PRIu64, KNOWN[n]);
         else if (S.start == 0)
             printf("  NEW");
-        if (S.start == 0 && n >= 2 && n - 2 < 14)
+        if (S.start == 0 && n >= 2 && n - 2 < NA133697)
             printf(c->pi == A133697[n - 2] ? ", pi = A133697(%d)" : ", pi DIFFERS from A133697(%d) = %" PRIu64, n - 2, A133697[n - 2]);
         else if (S.start == 0 && n >= 2)
             printf(", pi = new A133697(%d)", n - 2);
@@ -1347,6 +1919,7 @@ static void print_table(void)
 /* Commands                                                            */
 /* ------------------------------------------------------------------ */
 
+/* usage() -- print the command summary to stderr and exit(2); never returns. */
 static void usage(void)
 {
     fprintf(stderr,
@@ -1356,6 +1929,11 @@ static void usage(void)
     exit(2);
 }
 
+/*
+ * parse_qsplit() -- parse -Q: the medium/large prime split, between PWARP
+ * (below which primes would need the warp path anyway) and 10^8.
+ * Errors:  die() outside that range.
+ */
 static u32 parse_qsplit(const char *s)
 {
     u64 v = parse_num(s);
@@ -1363,6 +1941,15 @@ static u32 parse_qsplit(const char *s)
     return (u32)v;
 }
 
+/*
+ * cmd_scan() -- the `scan` command: exhaustive scan of [START, END).
+ * Inputs:  one or two positional numbers (END, or START END) and the
+ *          options -n N, -r NMIN, -S FILE, -i SECS, -Q QSPLIT, -N, -q
+ *          (-1 and -L are accepted and ignored).
+ * Effects: runs the scan, prints the table and histogram on stdout and a
+ *          one-line timing summary on stderr.
+ * Returns: 0.   Errors: die() from run_scan; usage() on bad arguments.
+ */
 static int cmd_scan(int argc, char **argv)
 {
     u64 pos[2];
@@ -1393,6 +1980,14 @@ static int cmd_scan(int argc, char **argv)
     return 0;
 }
 
+/*
+ * cmd_bench() -- the `bench` command: throughput of [N, N+SPAN) (defaults
+ * 1e15 and 2e12), quietly and without a checkpoint; prints numbers/s and
+ * primes/s, with -p the per-kernel GPU times and the host merge time, the
+ * projected wall time of full scans at that rate (a guide only: the sieve is
+ * faster below N and slower above it) and the window's histogram.
+ * Returns: 0.   Errors: die() from run_scan; usage() on bad arguments.
+ */
 static int cmd_bench(int argc, char **argv)
 {
     u64 N = 1000000000000000ULL, span = 2000000000000ULL;
@@ -1426,6 +2021,24 @@ static int cmd_bench(int argc, char **argv)
     return 0;
 }
 
+/*
+ * cmd_selftest() -- compare the GPU scan with exact figures from the CPU
+ * tool and check the resume logic.
+ * Inputs:  optional -Q QSPLIT (default 4e6).
+ * Checks:  number parsing; Miller-Rabin spot checks; the run length of every
+ *          known term by next-prime search; (a) [0, 1e11): pi(10^11),
+ *          a(1..12) with pi(a(n)) = A133697(n-2), no a(13), and the exact
+ *          histogram; (b) [12345000000, 13345000000), bounds inside chunks
+ *          and segments: prime count, the first prime >= START of each run
+ *          length with its index, and the histogram; (c) [1e15, 1e15+2e12):
+ *          prime count and histogram (the CPU tool's bench window); (d) a
+ *          scan to 12345678901 with a checkpoint, resumed to 23456789012,
+ *          must equal a straight scan to 23456789012 in prime count,
+ *          histogram, first primes and indices.  All reference figures come
+ *          from a158939.c.
+ * Returns: 0 if every check passed, 1 otherwise.
+ * Errors:  die() as for scan; usage() on unknown options.
+ */
 static int cmd_selftest(int argc, char **argv)
 {
     u32 qsplit = 4000000;
@@ -1434,6 +2047,8 @@ static int cmd_selftest(int argc, char **argv)
         if (!strcmp(argv[i], "-Q") && i + 1 < argc) qsplit = parse_qsplit(argv[++i]);
         else usage();
     }
+/* CHECK(cond, fmt, ...): print "ok    <description>" or "FAIL  <description>"
+ * and count the failures. */
 #define CHECK(cond, ...) do { if (cond) printf("ok    " __VA_ARGS__); else { printf("FAIL  " __VA_ARGS__); fails++; } putchar('\n'); fflush(stdout); } while (0)
     CHECK(parse_num("2^54-32") == 18014398509481952ULL && parse_num("1e12") == 1000000000000ULL &&
           parse_num("1.29e14") == 129000000000000ULL && parse_num("10^15+7") == 1000000000000007ULL, "number parsing");
@@ -1442,7 +2057,7 @@ static int cmd_selftest(int argc, char **argv)
     {
         bool ok = true;
         for (int n = 1; n <= NKNOWN; n++) { u16 g[NMAX + 1]; if (run_length64(KNOWN[n], g, NMAX + 1) != n) ok = false; }
-        CHECK(ok, "run lengths of a(1..15) by next-prime search");
+        CHECK(ok, "run lengths of a(1..%d) by next-prime search", NKNOWN);
     }
     g_report = NMAX;
     char b[32];
@@ -1513,6 +2128,12 @@ static int cmd_selftest(int argc, char **argv)
     return fails ? 1 : 0;
 }
 
+/*
+ * main() -- command dispatch: scan | bench | selftest.  Records whether
+ * stderr is a terminal and makes stdout line-buffered so result lines show
+ * up immediately through a pipe.  Returns the command's status; usage()
+ * exits 2.
+ */
 int main(int argc, char **argv)
 {
     stderr_tty = isatty(2);

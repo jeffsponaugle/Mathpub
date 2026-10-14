@@ -1,0 +1,16 @@
+p = 3770303151073 is prime; 135042324151 primes <= p, 135042324150 gaps (168.6 s)
+S_1  = 3770303151071  (42 bits)  prime  [mr]  [gmp: prime]
+S_2  = 190851794793757  (48 bits)  prime  [mr]  [gmp: prime]
+S_3  = 14196773503347641  (54 bits)  prime  [mr]  [gmp: probable prime]
+S_4  = 1394426672423205361  (61 bits)  prime  [mr]  [gmp: probable prime]
+S_5  = 170141494293736680161  (68 bits)  prime  [mr]  [gmp: probable prime]
+S_6  = 24799307171701546531777  (75 bits)  prime  [mr]  [gmp: probable prime]
+S_7  = 4202380711978049572942721  (82 bits)  prime  [mr]  [gmp: probable prime]
+S_8  = 811587406870679014576316161  (90 bits)  prime  [mr]  [gmp: probable prime]
+S_9  = 175934585824654713314446896641  (98 bits)  prime  [mr]  [gmp: probable prime]
+S_10 = 42297466414050242039599107357697  (106 bits)  prime  [mr]  [gmp: probable prime]
+S_11 = 11167738558029370106410742901913601  (114 bits)  composite  [mr]  [gmp: composite]
+S_12 = 3211785862873660523176176380385423361  (122 bits)  prime  [mr]  [gmp: probable prime]
+S_13 exceeds 2^128 (not computed)
+depth(3770303151073) = 10: S_1..S_10 are prime
+exit 0

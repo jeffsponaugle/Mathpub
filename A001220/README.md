@@ -76,6 +76,20 @@ per-decade counts for bases up to 1052 agree with this within about 2σ).
 * **`watch.sh`** — polls the Sparks from the Mac and exits on a solution, a mismatch, an FLT
   error, or a Spark with no scan running.
 
+Both sources start with a THEORY OF OPERATION and document every function (inputs, outputs,
+error conditions). The CUDA file's header also lists its known issues. On 2026-10-13 the CPU
+tool got these fixes, with search results unchanged (byte-identical chunk logs):
+- number parsing no longer hangs on `1^E` or `0eE` with a huge E, and rejects `e5` and an
+  overflowing `B^1`;
+- a failed checkpoint write keeps the previous checkpoint;
+- a resume refuses a checkpoint that lacks a base's checksum;
+- `check` rejects even P and compares only residues for composite P;
+- `-n` values above 2^63 work, `bench` never prints NaN, duplicate bases no longer count
+  against the 64-base limit, and resumed runs report this session's rate.
+
+The CUDA tool was left code-identical (PTX and SASS byte-identical) because the paused queue
+resumes with its binary.
+
 Both tools compute, for every tested pair, q = (b^(p-1) mod p² − 1)·p⁻¹ mod 2^64 (exact
 division). A wrong residue would give a random 64-bit q, so **q < p** re-checks Fermat's little
 theorem on every test (FLT errors are reported). Every q goes into a per-base checksum
@@ -87,8 +101,8 @@ line by line. Checkpoints (`-S`) have the same format for both tools.
 
 * Selftests (both tools): arithmetic against a shift-and-add reference (20,000 GPU quotients,
   200,000 CPU reductions); a scan of [0, 1e9) for all 23 non-power bases 2..30 gives π(1e9)
-  and exactly the 65 known solutions; windows around the 11 known solutions above 1e9 re-find
-  each one; three checksum windows at 1e15, 1e18 and 2^63 match `verify_wieferich.py`.
+  and exactly the 65 known solutions; windows around the known solutions above 1e9 re-find
+  each one (12 in the CPU selftest, which includes A306256(4); 11 in the GPU selftest); three checksum windows at 1e15, 1e18 and 2^63 match `verify_wieferich.py`.
 * `verify_wieferich.py known 3e6` reproduces every known solution below 3e6.
 * GPU = CPU chunk logs at 2e14 (20 chunks × 17 bases) and 1.2e15 (10 chunks × bases 3, 5, 7);
   the first CPU chunk line at 1e15 = Python.

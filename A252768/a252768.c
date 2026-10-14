@@ -330,8 +330,9 @@ static bool parse_dec(const char *s, size_t len, u128 *out)
 
 /*
  * parse_u128 -- parse the number syntax accepted on the command line.
- * Accepts: plain decimal ("123"), a power ("2^64", "10^12"), a decimal mantissa with
- *          exponent ("1e15", "25e9"), and X+Y or X-Y of any of those ("2^54-32").
+ * Accepts: plain decimal ("123"), a power ("2^64", "10^12"), a mantissa with exponent
+ *          ("1e15", "25e9", "2.5e10" -- the result must be an integer), and X+Y or X-Y
+ *          of any of those ("2^54-32").
  *          The sum/difference form is handled first by splitting at the first + or -
  *          that is not the leading character and parsing both halves recursively.
  * Inputs:  s (NUL-terminated), out.
@@ -367,10 +368,29 @@ static bool parse_u128(const char *s, u128 *out)
         return true;
     }
     if (ee) {
-        u128 m, e;
-        if (!parse_dec(s, (size_t)(ee - s), &m)) return false;
+        /* mantissa may contain a decimal point: "2.5e10" = 25 * 10^(10-1) */
+        u128 m, e, frac = 0;
+        const char *dot = memchr(s, '.', (size_t)(ee - s));
+        if (dot) {
+            size_t nfrac = (size_t)(ee - dot - 1);
+            u128 ip = 0, fp = 0;
+            if (dot != s && !parse_dec(s, (size_t)(dot - s), &ip)) return false;
+            if (nfrac == 0 || !parse_dec(dot + 1, nfrac, &fp)) return false;
+            if (nfrac > 30) return false;
+            m = ip;
+            for (size_t i = 0; i < nfrac; i++) {
+                if (m > ((u128)0 - 1) / 10) return false;
+                m *= 10;
+            }
+            if (m > ((u128)0 - 1) - fp) return false;
+            m += fp;
+            frac = nfrac;
+        } else if (!parse_dec(s, (size_t)(ee - s), &m)) {
+            return false;
+        }
         if (!parse_dec(ee + 1, strlen(ee + 1), &e) || e > 40) return false;
-        for (unsigned i = 0; i < (unsigned)e; i++) {
+        if (e < frac) return false;                 /* would not be an integer */
+        for (unsigned i = 0; i < (unsigned)(e - frac); i++) {
             if (m > ((u128)0 - 1) / 10) return false;
             m *= 10;
         }
@@ -1011,6 +1031,7 @@ struct scan {
     u64  depth_count[KLIM + 1];       /* number of twin primes of exact depth d */
     u64  primes, twins, chunks_done;  /* totals over completed chunks */
     hit_t *hits; size_t nhits, hits_cap;   /* all hits of depth >= report (unordered) */
+    u64 *ghist;                       /* when non-NULL: gap histogram of all completed chunks (MAXG entries) */
     double t0, t1;                    /* start and end time of scan_run */
 };
 
@@ -1215,6 +1236,8 @@ static void *worker_main(void *arg)
         sc->primes += c->nprimes;
         sc->twins += w->twins;
         sc->chunks_done++;
+        if (sc->ghist)
+            for (unsigned g = 1; g <= c->maxg; g++) sc->ghist[g] += c->cnt[g];
         for (int d = 1; d <= KLIM; d++) {
             sc->depth_count[d] += w->depth_count[d];
             if (w->best[d] && (!sc->best[d] || w->best[d] < sc->best[d])) sc->best[d] = w->best[d];
@@ -1510,6 +1533,7 @@ static scan_t *scan_new(void)
 static void scan_free(scan_t *sc)
 {
     free(sc->hits);
+    free(sc->ghist);
     free(sc);
 }
 
@@ -1610,7 +1634,8 @@ static void usage(void)
 "           again resumes from it.\n"
 "  verify   recompute S_1..S_KMAX at the prime P from scratch and test each one\n"
 "           (independently with GMP when compiled in).  -t T > 1 uses the parallel\n"
-"           totals pipeline instead of a plain single-threaded accumulation.\n"
+"           pipeline (totals + gap histogram) instead of a plain single-threaded\n"
+"           accumulation; with GMP both modes handle KMAX up to 64.\n"
 "  numbers  may be written as 123, 2^40, 10^12, 1e12, 2^40-1\n", stderr);
     exit(2);
 }
@@ -1805,7 +1830,9 @@ static int cmd_scan(int argc, char **argv)
  * at one prime P independently of the scan.
  * Inputs:  argv after the command word: P, -k kmax (up to 64 with GMP, else <= KLIM),
  *          -t threads (1 = direct single-threaded histogram, > 1 = the parallel totals
- *          pipeline, which shares code with the scan and is limited to k <= KLIM).
+ *          pipeline with a merged gap histogram; it shares the chunk code with the scan,
+ *          and with GMP it too handles any k, cross-checking GMP's sums against the
+ *          128-bit ones for k <= KLIM).
  * Effect:  prints P, the prime count, then one line per k with S_k, its bit length,
  *          the tool's verdict ([mr]) and GMP's ([gmp: ...]), flagging any disagreement;
  *          with GMP the sums are also formed in GMP and compared with the 128-bit ones.
@@ -1831,7 +1858,6 @@ static int cmd_verify(int argc, char **argv)
 #ifndef HAVE_GMP
     if (kmax > KLIM) die("without GMP at most k = %d is supported", KLIM);
 #endif
-    if (threads > 1 && kmax > KLIM) die("with -t > 1 at most k = %d is supported", KLIM);
 
     double t0 = now();
     u64 cnt[MAXG];
@@ -1844,14 +1870,19 @@ static int cmd_verify(int argc, char **argv)
         have_cnt = true;
         sums_from_hist(cnt, kmax <= KLIM ? kmax : KLIM, S, ovf);
     } else {
+        /* parallel: the totals pipeline gives S_k for k <= KLIM in 128 bits, and the merged
+         * gap histogram lets GMP form S_k exactly for any k (and cross-check the 128-bit sums) */
         int save = g_kmax;
-        g_kmax = kmax;
+        g_kmax = kmax <= KLIM ? kmax : KLIM;
         scan_t *sc = scan_new();
         sc->start = 0; sc->end = P; sc->check = false; sc->verbose = !g_quiet;
+        sc->ghist = xcalloc(MAXG, sizeof(u64));
         scan_run(sc, threads, NULL, 0);
         nprimes = sc->primes_pub;
         memcpy(S, sc->O, sizeof S);
         memcpy(ovf, sc->Oovf, sizeof ovf);
+        memcpy(cnt, sc->ghist, sizeof cnt);
+        have_cnt = true;
         scan_free(sc);
         g_kmax = save;
     }
@@ -1983,6 +2014,7 @@ static scan_t *quiet_totals(u64 end, u64 chunk, int threads)
     scan_t *sc = scan_new();
     sc->origin = 0; sc->start = 0; sc->end = end; sc->chunk = chunk;
     sc->check = false; sc->verbose = false; sc->print_hits = false;
+    sc->ghist = xcalloc(MAXG, sizeof(u64));
     scan_run(sc, threads, NULL, 0);
     return sc;
 }
@@ -2031,6 +2063,28 @@ static int cmd_selftest(int argc, char **argv)
     /* 1. power tables */
     expect(PW[3][2] == 8 && PW[12][2] == 4096 && PW[1][MAXG - 1] == MAXG - 1 &&
            !PWOVF[12][1550] && PWOVF[13][1550] && PWOVF[11][MAXG - 1], "power tables");
+
+    /* 1b. command-line number syntax */
+    {
+        static const struct { const char *s; const char *want; } NT[] = {
+            { "123", "123" }, { "2^40", "1099511627776" }, { "10^12", "1000000000000" },
+            { "1e12", "1000000000000" }, { "25e9", "25000000000" }, { "2.5e10", "25000000000" },
+            { "0.5e3", "500" }, { "2^40-1", "1099511627775" }, { "1e3+7", "1007" },
+        };
+        static const char *BAD[] = { "2.5e0", "1.e3", ".e3", "abc", "1e41", "2^", "-5", "" };
+        bool ok = true;
+        for (size_t i = 0; i < sizeof NT / sizeof NT[0]; i++) {
+            u128 v, w;
+            if (!parse_u128(NT[i].s, &v) || !parse_dec(NT[i].want, strlen(NT[i].want), &w) || v != w) {
+                ok = false; printf("      parse '%s' wrong\n", NT[i].s);
+            }
+        }
+        for (size_t i = 0; i < sizeof BAD / sizeof BAD[0]; i++) {
+            u128 v;
+            if (parse_u128(BAD[i], &v)) { ok = false; printf("      parse '%s' should fail\n", BAD[i]); }
+        }
+        expect(ok, "number syntax: 2^40, 10^12, 1e12, 25e9, 2.5e10, 2^40-1 and rejection of bad forms");
+    }
 
     /* 2. primality on known values */
     static const struct { const char *s; bool prime; } PT[] = {
@@ -2110,7 +2164,8 @@ static int cmd_selftest(int argc, char **argv)
         scan_t *tot = quiet_totals(541613713, 777777, threads);
         bool same = tot->primes_pub == direct_hist(541613713, cnt);
         for (int k = 1; k <= 12; k++) if (tot->Oovf[k] || tot->O[k] != S[k]) same = false;
-        expect(same, "parallel totals pipeline (chunk 777777) reproduces S_1..S_12 at 541613713 and the prime count %" PRIu64, tot->primes_pub);
+        for (unsigned g = 0; g < MAXG; g++) if (tot->ghist[g] != cnt[g]) same = false;
+        expect(same, "parallel totals pipeline (chunk 777777) reproduces S_1..S_12, the gap histogram and the prime count %" PRIu64 " at 541613713", tot->primes_pub);
         scan_free(tot);
     }
 

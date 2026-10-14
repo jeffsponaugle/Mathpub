@@ -148,10 +148,10 @@ and walks the finished bitmap: each thread takes a slice of words, extracts
 primes and gaps and runs the same increasing-run bookkeeping as the CPU tool
 with register-only state, continuing past its slice until the run in progress
 ends (blocks sieve an overlap of 61,440 numbers for that; a run still open at
-the end is settled on the CPU, which never happens in practice). Two streams
-keep the large-prime kernel of chunk k+1 running while the segments of chunk
-k are processed. Chunks complete in order, so every term is confirmed as it is
-found; `-S FILE` checkpoints position, table and histogram, and rerunning the
+the end is settled on the CPU, which never happens in practice). The kernels
+of a chunk run in order on one stream (overlapping two chunks on two streams
+was measured slower, see below). Chunks complete in order, so every term is
+confirmed as it is found; `-S FILE` checkpoints position, table and histogram, and rerunning the
 same command resumes (the large-prime state is recomputed). A run that ends
 inside a chunk records END as its position, and a resume with a larger END
 rescans that chunk from there, so END can be extended freely.

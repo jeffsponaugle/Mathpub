@@ -35,6 +35,13 @@ Savings:
 GPU usage: `a034822_cuda search L [-r a:b] [-b bases_per_launch] [-S state]` (bases 0..5·10^9 for L=70;
 resume with the same command line and state file), `a034822_cuda selftest [maxL]`.
 
+Both sources have a full theory-of-operation header and per-function documentation (inputs, outputs, errors).
+2026-10-13 hardening: CPU tool commits each task atomically with respect to checkpoints (exact counts across
+any number of interruptions, verified with SIGINT and SIGKILL), checks checkpoint write errors, rejects
+`-t 0`, empty `-r` ranges and over-long `check` arguments, caps `selftest` at L = 69. GPU tool validates
+`-b`, `-B` (multiple of 32, <= 256) and `-r`, caps `selftest` at 68, checks state-file write errors; dead
+experiment hooks removed; `make` now builds the production configuration (`-DMINB=2`).
+
 ## Validation
 
 * CPU: counts match A263618 for every L = 11..48; paranoid build L = 11..36.

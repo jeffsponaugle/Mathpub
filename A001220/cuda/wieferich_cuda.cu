@@ -1,38 +1,143 @@
 /*
- * wieferich_cuda.cu -- CUDA version of ../wieferich.c for the DGX Spark (GB10, sm_121).
+ * wieferich_cuda.cu  --  multi-base search for Wieferich primes, CUDA version
+ *                        (DGX Spark / GB10, sm_121, CUDA 13)
  *
- * Same search (primes p with b^(p-1) == 1 mod p^2 for many bases b), same Fermat
- * quotients, checksums, chunk log and checkpoint format as the CPU tool; see the header
- * of ../wieferich.c for the math.  A checkpoint written by either tool can be resumed
- * by the other, and chunk logs of the two tools can be compared line by line.
+ * Same search as ../wieferich.c -- primes p with b^(p-1) == 1 (mod p^2) for many bases b --
+ * with the same Fermat quotients, checksums, chunk log and checkpoint format.  The THEORY
+ * OF OPERATION in ../wieferich.c (the problem, the heuristic, what a scan proves, the
+ * result checks, checksums, frontier and checkpoints) applies unchanged and is not repeated
+ * here.  A checkpoint written by either tool can be resumed by the other, and their chunk
+ * logs agree line by line.  This program found A306256(4) = 303632117562967 (base 30) on
+ * Oct 01 2026.
  *
- * GPU kernel: one thread per (p, b) pair, blockIdx.y = base, so a warp shares b.
+ * ==========================================================================
+ * THEORY OF OPERATION (GPU-specific parts)
+ * ==========================================================================
  *
- *   N = p^2 < 2^126 as five 26-bit limbs, Montgomery R = 2^130, n' = -N^-1 mod 2^26,
- *   one = 2^130 mod N from 2^(bits(N)-1) by multiplications with 2^15.
- *   b^(p-1) mod N with a fixed window w, the largest <= 4 with b^(2^w - 1) < 2^16
- *   (4 for b = 2, 3 for b = 3, 2 for b <= 40, 1 above): w Montgomery squarings
- *   (15 + 25 limb products, each one IMAD.WIDE into a 64-bit column accumulator) and one
- *   multiplication by the plain constant c = b^d < 2^16, reduced with a single-precision
- *   estimate of floor(x*c/N) taken one too small, so the result stays in [0, 3N) with no
- *   sign test.  No FP64 anywhere (GB10 runs FP64 at 1/64 of the FP32 rate).
- *   r = REDC(x), q = (r - 1) * p^-1 mod 2^64, FLT check q < p, checksum term
- *   mix64(q ^ p*GOLD) reduced per block and added with one 64-bit atomic per block;
- *   solutions, near-Wieferich primes and FLT errors go to an event buffer.
+ * 1. Work decomposition
  *
- * Host: primes from primesieve, one sub-range of the chunk per host thread (u32 offsets
- * from the sub-range start), one kernel launch per sub-range.  While the GPU tests chunk
- * k the host threads sieve chunk k+1 (double-buffered pinned host buffers, device
- * buffers and result blocks).
+ *    One GPU thread per (prime, base) pair.  A chunk is split into T sub-ranges, one per
+ *    host sieve thread; each sub-range's primes are stored as 32-bit offsets from its start
+ *    and tested by one launch of k_wieferich with grid (ceil(n / 256), number of bases).
+ *    blockIdx.y selects the base, so all threads of a block share b, its window w and its
+ *    power table (copied to shared memory); control flow is uniform except where exponent
+ *    lengths differ (primes on both sides of a power of two).
  *
- * Usage (as the CPU tool, plus -T host sieve threads and -g GPU device):
+ * 2. Arithmetic mod N = p^2 in radix 2^26 (msqr26, redc26)
+ *
+ *    N < 2^126 is held as five 26-bit limbs and R = 2^130.  Limb products (< 2^53) are
+ *    summed in 64-bit column accumulators, so each partial product is one IMAD.WIDE.U32
+ *    (32x32 + 64 -> 64) and carries are propagated once per column (a shift and a mask).
+ *    Montgomery REDC works word by word in radix 2^26 with n' = -N^-1 mod 2^26.  A squaring
+ *    is 15 products (cross products use pre-doubled limbs) plus 25 for REDC: 40 IMAD.WIDE and
+ *    ~83 instructions in all, with no register moves (checked in the SASS).  Measured on
+ *    GB10: IMAD.WIDE issues at half the rate of a 32-bit IMAD, FFMA at twice it; this form
+ *    beat a radix-2^32 version with per-product carry handling by 1.22x on an idle GPU, with
+ *    bit-identical results on 8e8 values.
+ *
+ *    Lazy reduction: values are kept in [0, 3N).  REDC of the square of such a value is
+ *    < (9 N^2 + R N) / R < 2N because 9N < R, so a squaring needs no final subtraction;
+ *    only the conversion out of Montgomery form (redc26) reduces fully.
+ *
+ * 3. Multiplication by a small constant (mul_small26)
+ *
+ *    As in the CPU tool the multiplier c = b^d is a plain integer, here c < 2^16, and the
+ *    quotient floor(x c / N) < 3 * 2^16 is estimated -- in single precision, because GB10
+ *    runs FP64 at 1/64 of the FP32 rate -- from the top limbs of x c and of N, scaled by
+ *    2^(-26 (L-1)) so that both fit the float range (L = the top nonzero limb of N).  The
+ *    relative error, below 2^-21.7, keeps the estimate within 1 of the true quotient.
+ *    Subtracting (estimate - 1) N (or 0 N when the estimate is 0) leaves a result in
+ *    [0, 3N) with no sign test.  The window w is the largest <= 4 with b^(2^w - 1) < 2^16:
+ *    4 for b = 2, 3 for b = 3, 2 for b <= 40, 1 for b <= 65535, the largest base accepted.
+ *
+ * 4. Per-thread setup (mod_init26, mod_one26)
+ *
+ *    N = p^2 from one 64x64 product, split into 26-bit limbs; pinv = p^-1 mod 2^64 by Newton
+ *    iteration (as in the CPU tool); n' = -(pinv^2) mod 2^26; L; invD = the float reciprocal
+ *    of N's top limbs at the scale of section 3.  The Montgomery form of 1, 2^130 mod N, is
+ *    built from 2^(bits(N) - 1) < N by multiplications with 2^15 (2-3 of them in production,
+ *    at most 9) instead of a division.
+ *
+ * 5. Results on the device
+ *
+ *    q = (r - 1) p^-1 mod 2^64, the FLT check q < p and the checksum term mix64(q ^ p*GOLD)
+ *    are as in the CPU tool.  Per-thread checksum terms and test counts are summed with warp
+ *    shuffles and shared memory, and each block adds its sums with one 64-bit atomicAdd per
+ *    base.  Solutions, near-Wieferich primes and FLT errors are rare; they go to an event
+ *    buffer (at most MAXEV per chunk) through an atomic counter, and the host sorts them by
+ *    (p, base) before printing, so the output does not depend on thread scheduling.
+ *
+ * 6. Host pipeline (run_scan, sieve_chunk, enqueue_chunk, fold_chunk)
+ *
+ *    Chunks are processed strictly in order with two buffer sets, set = chunk index & 1:
+ *        sieve chunk k+1 on the host (T threads, primesieve)   while the GPU runs chunk k;
+ *        fold chunk k: wait for its event, copy back sums and events, print, log, frontier;
+ *        enqueue chunk k+1: memset of its result block, memcpys and launches on one stream,
+ *        then an event.
+ *    A buffer set is refilled only after the chunk that used it two steps earlier has been
+ *    folded, so host writes never race with device reads.  Since chunks complete in order,
+ *    the frontier is the number of folded chunks and a solution is CONFIRMED as soon as its
+ *    chunk is folded.  The checkpoint is written between chunks; after SIGINT/SIGTERM the
+ *    chunk already on the GPU is still folded, then the scan stops.
+ *    The CPU and the GPU of a GB10 share one power budget: heavy CPU load lowers the GPU clock
+ *    (12 busy threads: 2366 -> 2060 MHz), so CPU work alongside a run (dcheck.sh) should be
+ *    pinned to a few efficiency cores (CPUs 0-4 and 10-14 on a Spark).
+ *
+ * 7. Validation (selftest)
+ *
+ *    (0) 20,000 GPU Fermat quotients of random primes < 2^63 with 64 bases (all window sizes)
+ *    against the host's shift-and-add reference; (1) [0, 10^9) for the 23 non-power bases
+ *    2..30 must give pi(10^9) and exactly the 65 known solutions; (2) windows of +-10^6 around
+ *    the 11 known solutions above 10^9 must re-find each one; (3) the checksum windows of
+ *    ../wieferich_cks.h (verify_wieferich.py).  Production chunks are also re-checked on the
+ *    CPU with ../dcheck.sh.
+ *
+ * Known issues
+ *
+ *    Deliberately not fixed here, so that this source stays code-identical to the binary the
+ *    paused production queue on atom2 resumes with.  1-8 are fixed in ../wieferich.c (Oct 13
+ *    2026) and can be ported when the search is restarted.
+ *    1. parse_term: "1^E" or "0^E" and "0eE" with a huge E loop for a very long time; a
+ *       mantissa without digits ("e5") is accepted as 0; an over-long B in "B^1" gives
+ *       2^64 - 1; trailing zeros after a decimal point ("1.000...e15") can cause a false
+ *       overflow.
+ *    2. parse_bases counts duplicate bases against the limit of 64.
+ *    3. save_state does not check ferror before fclose, so a write error in an intermediate
+ *       flush could replace a good checkpoint with a partial file; a failed write leaves
+ *       FILE.tmp behind.
+ *    4. load_state calls fmemopen without a NULL check and does not verify that every base
+ *       has a "cks" line (a missing line silently resumes that base's checksum from 0).
+ *    5. record_hit silently drops solutions beyond MAXHITS = 4096 from the summary and the
+ *       checkpoint (they are still printed).
+ *    6. -n values above 2^63 - 1 become negative and silently disable NEAR reporting.
+ *    7. check: an even P is not rejected (the arithmetic then uses an even modulus and the
+ *       output is meaningless); for an odd composite P every base reports "DISAGREES",
+ *       because the exact-division quotient differs from the floor quotient.
+ *    8. bench: N < 2 gives NaN/inf projections, and a run of zero measured seconds divides
+ *       by zero; run_scan's st.primes includes a resumed part (bench never resumes).
+ *    9. More than MAXEV = 65536 events in one chunk (only possible with a large -n T or a
+ *       flood of FLT errors) drops the excess events -- solutions included -- with only a
+ *       warning at the end; S.flt and S.near then undercount.  Production runs use no -n.
+ *   10. KNOWN lacks A306256(4) = 303632117562967, so this selftest does not re-find it (the
+ *       CPU selftest does).
+ *   11. Performance: every chunk creates fresh primesieve iterators per host thread, whose
+ *       setup (sieving primes up to sqrt(hi)) dominates small chunks near 2^63; the
+ *       selftest's checksum window at 2^63 takes ~25 s for this reason.
+ *
+ * Usage (as the CPU tool; host threads instead of CPU workers)
  *   wieferich_cuda scan [START] END [-b BASES] [-c CHUNK] [-n T] [-S FILE] [-i SECS] [-L FILE] [-T N] [-g DEV] [-q]
+ *       Default CHUNK 10^10 (END is rounded up to a chunk boundary; CHUNK / T must be
+ *       < 2^32); -T N (or -t N) host sieve threads, default all cores; -g DEV the CUDA
+ *       device.  Exit status 3 if any FLT error occurred.
  *   wieferich_cuda check P [-b BASES]
- *   wieferich_cuda bench [N] [-d SPAN] [-b BASES]
- *   wieferich_cuda selftest [LIMIT]
- * Default chunk 10^10 (must be a multiple of nothing in particular; END is rounded up).
+ *       GPU Fermat quotients of P for each base, compared with the host reference.
+ *   wieferich_cuda bench [N] [-d SPAN] [-b BASES] [-c CHUNK] [-T N]
+ *       Time [N, N+SPAN) (defaults 10^15, 2*10^11) and project longer scans.
+ *   wieferich_cuda selftest [LIMIT] [-T N]
+ *       The checks of section 7.
+ *   Bases must be in [2, 65535] (the windows of section 3 need b^1 < 2^16).
  *
- * Build: nvcc -O3 -std=c++17 -arch=sm_121 wieferich_cuda.cu -lprimesieve -o wieferich_cuda
+ * Build: make  (nvcc -O3 -std=c++17 -arch=sm_121 wieferich_cuda.cu -lprimesieve -lpthread)
  */
 
 #include <cstdio>
@@ -77,6 +182,12 @@ static volatile sig_atomic_t g_stop = 0;
 /* Generic helpers (as in ../wieferich.c)                              */
 /* ------------------------------------------------------------------ */
 
+/*
+ * now: monotonic wall clock.
+ *   In:     nothing.
+ *   Out:    seconds since an arbitrary fixed point (CLOCK_MONOTONIC), as a double.
+ *   Errors: none.
+ */
 static double now(void)
 {
     struct timespec ts;
@@ -84,6 +195,13 @@ static double now(void)
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/*
+ * die: print an error message and exit (also used by CUDA_CHECK).
+ *   In:     printf-style format and arguments.
+ *   Out:    does not return; clears the status line on a terminal, prints the message and a
+ *           newline on stderr, exits with status 1.
+ *   Errors: none.  Work on the GPU and in flight is lost; the last checkpoint stays valid.
+ */
 static void die(const char *fmt, ...)
 {
     va_list ap;
@@ -95,6 +213,12 @@ static void die(const char *fmt, ...)
     exit(1);
 }
 
+/*
+ * fmt_dur: format a duration for the status line ("12.3s", "4m05s", "2h03m04s", "3d04h05m").
+ *   In:     s seconds; buf, n: output buffer.
+ *   Out:    buf (truncated to n bytes).
+ *   Errors: "?" for negative, NaN or absurd (> 10^12 s) values.
+ */
 static const char *fmt_dur(double s, char *buf, size_t n)
 {
     if (s < 0 || s != s || s > 1e12) { snprintf(buf, n, "?"); return buf; }
@@ -106,6 +230,12 @@ static const char *fmt_dur(double s, char *buf, size_t n)
     return buf;
 }
 
+/*
+ * mul_ok: 64-bit multiplication with overflow detection.
+ *   In:     a, b.
+ *   Out:    true and *r = a*b if the product fits in 64 bits, false otherwise.
+ *   Errors: none.
+ */
 static bool mul_ok(u64 a, u64 b, u64 *r)
 {
     u128 x = (u128)a * b;
@@ -114,6 +244,12 @@ static bool mul_ok(u64 a, u64 b, u64 *r)
     return true;
 }
 
+/*
+ * all_digits: is s[0..n) a non-empty run of decimal digits?
+ *   In:     s, n.
+ *   Out:    true iff n > 0 and every character is '0'..'9'.
+ *   Errors: none.
+ */
 static bool all_digits(const char *s, size_t n)
 {
     if (n == 0) return false;
@@ -122,6 +258,15 @@ static bool all_digits(const char *s, size_t n)
     return true;
 }
 
+/*
+ * parse_term: parse one term of a command-line number: decimal, B^E, or MeE with an optional
+ * decimal point in M (1e15, 1.2e15).
+ *   In:     s, n: the term's characters (need not be NUL-terminated).
+ *   Out:    true and *out = the value on success.
+ *   Errors: false for empty or over-long (>= 64 characters) terms, stray characters, values
+ *           that do not fit in 64 bits, and non-integer MeE values.  See Known issues 1 for
+ *           the inputs this copy still mishandles.
+ */
 static bool parse_term(const char *s, size_t n, u64 *out)
 {
     char buf[64], *c;
@@ -158,6 +303,13 @@ static bool parse_term(const char *s, size_t n, u64 *out)
     return errno == 0;
 }
 
+/*
+ * parse_num: parse a command-line number: a term or TERM+TERM / TERM-TERM.
+ *   In:     s, e.g. "2e14", "2^63-25", "1e15+4e6".
+ *   Out:    the value.
+ *   Errors: dies for a bad term, more than one operator, an overflowing sum and a negative
+ *           difference; a '+' or '-' directly after 'e'/'E' is not an operator.
+ */
 static u64 parse_num(const char *s)
 {
     size_t n = strlen(s);
@@ -178,6 +330,12 @@ static u64 parse_num(const char *s)
     return v;
 }
 
+/*
+ * parse_int: parse a small integer option value within [lo, hi].
+ *   In:     s, the range, the option's name for the message.
+ *   Out:    the value.
+ *   Errors: dies if s is not a number or lies outside [lo, hi].
+ */
 static int parse_int(const char *s, int lo, int hi, const char *what)
 {
     u64 v = parse_num(s);
@@ -185,12 +343,25 @@ static int parse_int(const char *s, int lo, int hi, const char *what)
     return (int)v;
 }
 
+/*
+ * default_threads: number of online CPUs (the default host sieve thread count).
+ *   In:     nothing.
+ *   Out:    sysconf(_SC_NPROCESSORS_ONLN), or 1 if that fails.
+ *   Errors: none.
+ */
 static int default_threads(void)
 {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;
 }
 
+/*
+ * mix64: the splitmix64 finalizer (host and device): checksum terms mix64(q ^ p*GOLD) and the
+ * selftest's random numbers.  Identical in ../wieferich.c and verify_wieferich.py.
+ *   In:     z.
+ *   Out:    mix64(z).
+ *   Errors: none.
+ */
 static inline __host__ __device__ u64 mix64(u64 z)
 {
     z += GOLD;
@@ -201,6 +372,13 @@ static inline __host__ __device__ u64 mix64(u64 z)
 
 /* ---- host reference arithmetic (independent of the GPU code) ---- */
 
+/*
+ * mulmod64 / powmod64: (a*b) mod m and a^e mod m with 128-bit intermediates (host only; used
+ * by is_prime64).
+ *   In:     m >= 1.
+ *   Out:    the residue.
+ *   Errors: m = 0 divides by zero (never passed).
+ */
 static u64 mulmod64(u64 a, u64 b, u64 m) { return (u64)(((u128)a * b) % m); }
 
 static u64 powmod64(u64 a, u64 e, u64 m)
@@ -215,6 +393,13 @@ static u64 powmod64(u64 a, u64 e, u64 m)
     return r;
 }
 
+/*
+ * is_prime64: deterministic primality test for 64-bit n (host only; check and selftest).
+ *   In:     n.
+ *   Out:    true iff n is prime: trial division by the primes up to 37, then strong
+ *           probable-prime tests to those 12 bases, exact for all n < 3.18e23.
+ *   Errors: none.
+ */
 static bool is_prime64(u64 n)
 {
     static const u64 small[] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37};
@@ -239,6 +424,13 @@ static bool is_prime64(u64 n)
     return true;
 }
 
+/*
+ * mulmod_ref: a*b mod m by shift and add -- the host reference arithmetic, independent of the
+ * GPU code.
+ *   In:     a, b, 1 <= m < 2^127.
+ *   Out:    (a*b) mod m.
+ *   Errors: m = 0 divides by zero; m >= 2^127 can overflow.  Callers use m = p^2 < 2^126.
+ */
 static u128 mulmod_ref(u128 a, u128 b, u128 m)
 {
     u128 r = 0;
@@ -253,6 +445,12 @@ static u128 mulmod_ref(u128 a, u128 b, u128 m)
     return r;
 }
 
+/*
+ * powmod_ref: b^e mod m with mulmod_ref (reference for check and selftest).
+ *   In:     b, e, 1 <= m < 2^127.
+ *   Out:    b^e mod m.
+ *   Errors: as mulmod_ref.
+ */
 static u128 powmod_ref(u64 b, u64 e, u128 m)
 {
     u128 r = 1 % m, x = b % m;
@@ -268,11 +466,14 @@ static u128 powmod_ref(u64 b, u64 e, u128 m)
 /* Bases                                                                */
 /* ------------------------------------------------------------------ */
 
+/* The bases with their own OEIS sequence (keyword "oeis"; base 2 is not included). */
 static const u32 OEIS_BASES[] = {3, 5, 6, 7, 10, 12, 13, 14, 15, 17, 18, 19, 20, 22, 23, 26, 30};
 static const char *const OEIS_ANUM[] = {"A014127", "A123692", "A212583", "A123693", "A045616",
     "A111027", "A128667", "A234810", "A242741", "A128668", "A244260", "A090968", "A242982",
     "A298951", "A128669", "A306255", "A306256"};
 
+/* Known solutions (OEIS; R. Fischer's table) for the bases 2..30 that are not perfect powers
+ * (keyword "known"; the selftest's reference data).  See Known issues 10. */
 typedef struct { u32 b; int n; u64 p[8]; } known_t;
 static const known_t KNOWN[] = {
     { 2, 2, {1093, 3511}},
@@ -301,6 +502,8 @@ static const known_t KNOWN[] = {
 };
 #define NKNOWN ((int)(sizeof KNOWN / sizeof *KNOWN))
 
+/* The bases of the run (host copy): sorted, deduplicated, with windows and power tables
+ * b^d for d < 2^w (unused entries 0). */
 static struct {
     int nb;
     u32 b[MAXB];
@@ -308,10 +511,18 @@ static struct {
     u32 pw[MAXB][1 << MAXW];
 } B;
 
+/* Device copies of B (bases_setup uploads them): base, window and power table per base. */
 __constant__ u32 c_b[MAXB];
 __constant__ int c_w[MAXB];
 __constant__ u32 c_pw[MAXB][1 << MAXW];
 
+/*
+ * window_for: the GPU exponent window for base b (theory section 3).
+ *   In:     b >= 2.
+ *   Out:    the largest w <= MAXW (4) with b^(2^w - 1) < 2^16, at least 1.
+ *   Errors: none; for b >= 2^16 it returns 1 although b does not fit mul_small26 (bases_setup
+ *           rejects such bases).
+ */
 static int window_for(u32 b)
 {
     for (int w = MAXW; w > 1; w--) {
@@ -326,12 +537,25 @@ static int window_for(u32 b)
     return 1;
 }
 
+/*
+ * cmp_u32: qsort comparator for ascending u32.
+ *   In:     pointers to two u32.
+ *   Out:    -1, 0 or 1.
+ *   Errors: none.
+ */
 static int cmp_u32(const void *a, const void *b)
 {
     u32 x = *(const u32 *)a, y = *(const u32 *)b;
     return x < y ? -1 : x > y;
 }
 
+/*
+ * bases_setup: make list[0..n) the bases of the run and upload them to constant memory.
+ *   In:     list (any order, duplicates allowed), 1 <= n <= MAXB.  gpu_init must have run.
+ *   Out:    B sorted and deduplicated, with windows and power tables (unused entries 0);
+ *           c_b, c_w, c_pw on the device.
+ *   Errors: dies for n outside [1, MAXB], a base outside [2, 65535], or a CUDA error.
+ */
 static void bases_setup(const u32 *list, int n)
 {
     u32 tmp[MAXB];
@@ -356,6 +580,13 @@ static void bases_setup(const u32 *list, int n)
     CUDA_CHECK(cudaMemcpyToSymbol(c_pw, B.pw, sizeof B.pw));
 }
 
+/*
+ * parse_bases: parse a -b argument (numbers, ranges LO-HI, "oeis", "known") and set up B.
+ *   In:     s, comma-separated.
+ *   Out:    B set (bases_setup).
+ *   Errors: dies for an over-long list, bad numbers, bases outside [2, 65535], a reversed
+ *           range, or more than MAXB entries counting duplicates (Known issues 2).
+ */
 static void parse_bases(const char *s)
 {
     u32 list[MAXB];
@@ -391,6 +622,12 @@ static void parse_bases(const char *s)
     bases_setup(list, n);
 }
 
+/*
+ * anum_for: the OEIS A-number of base b's sequence, or NULL.
+ *   In:     b.
+ *   Out:    "A001220" for b = 2, the OEIS_ANUM entry for the "oeis" bases, else NULL.
+ *   Errors: none.
+ */
 static const char *anum_for(u32 b)
 {
     if (b == 2) return "A001220";
@@ -399,6 +636,12 @@ static const char *anum_for(u32 b)
     return NULL;
 }
 
+/*
+ * print_bases: write the bases as "b1,b2,..." (the checkpoint's format).
+ *   In:     f.
+ *   Out:    the list on f, no newline.
+ *   Errors: none reported.
+ */
 static void print_bases(FILE *f)
 {
     for (int j = 0; j < B.nb; j++) fprintf(f, "%s%u", j ? "," : "", B.b[j]);
@@ -416,8 +659,13 @@ static void print_bases(FILE *f)
  * IMAD.WIDE issues at half the IMAD rate; this radix-2^26 form beat a radix-2^32 one with
  * per-product carry handling by 1.3x, with bit-identical results.) */
 
+/* A rare per-pair result reported to the host: type 1 = solution, 2 = near-Wieferich prime,
+ * 3 = FLT error; j = base index; q = the Fermat quotient (or the wrong value for type 3). */
 struct Event { u32 type, j; u64 p, q; };           /* type 1 solution, 2 near, 3 FLT error */
 
+/* Per-chunk results on the device: per-base checksum sums, number of tests, and the event
+ * buffer with its counter (nev may exceed MAXEV; only the first MAXEV events are stored).
+ * The header (everything before ev) is cleared before each chunk and copied back after it. */
 struct ChunkRes {
     unsigned long long cks[MAXB];
     unsigned long long tests;
@@ -428,6 +676,7 @@ struct ChunkRes {
 
 #define M26 0x3FFFFFFu
 
+/* Per-thread constants for arithmetic mod N = p^2 in radix 2^26 (theory sections 2-4). */
 struct Mod26 {
     u32 n[5];       /* limbs of N */
     u32 ninv;       /* -N^-1 mod 2^26 */
@@ -435,7 +684,13 @@ struct Mod26 {
     float invD;     /* 1 / (sum_{i >= L-1} n_i 2^(26(i-L+1))) */
 };
 
-/* x = x^2 / 2^130 mod N, x < 3N -> result < 2N, limbs normalized */
+/*
+ * msqr26: Montgomery squaring, x = x^2 / 2^130 mod N, radix 2^26 (theory section 2).
+ *   In:     x with normalized limbs (< 2^26) and value < 3N; m for N < 2^126.
+ *   Out:    x = x^2 R^-1 mod N up to a multiple of N, value < 2N, limbs normalized.
+ *   Errors: none for the stated ranges.  Column sums stay below 2^56: products are < 2^53
+ *           (limbs < 2^26, doubled limbs < 2^27) and at most a few are summed per column.
+ */
 __device__ __forceinline__ void msqr26(u32 x[5], const Mod26 &m)
 {
     const u32 d1 = x[1] << 1, d2 = x[2] << 1, d3 = x[3] << 1, d4 = x[4] << 1;
@@ -471,9 +726,15 @@ __device__ __forceinline__ void msqr26(u32 x[5], const Mod26 &m)
     x[4] = (u32)(c8 >> 26);
 }
 
-/* x = x * c mod N up to a multiple of N: x < 3N, c < 2^16 -> result in [0, 3N).
- * q' = floor-estimate(x*c/N) - 1 is at most the true quotient and at least it minus 2,
- * so x*c - q'N lies in [0, 3N) and no sign test is needed. */
+/*
+ * mul_small26: x = x * c mod N up to a multiple of N, for a plain constant c (section 3).
+ *   In:     x normalized with value < 3N; c < 2^16; m.
+ *   Out:    x = x*c - q'N with q' = (estimate of floor(x*c/N)) - 1 (0 stays 0).  q' is at most
+ *           the true quotient and at least it minus 2, so the value lies in [0, 3N) and no
+ *           sign test is needed; limbs normalized (signed carries handle negative columns).
+ *   Errors: none for the stated ranges; c >= 2^16 or x >= 3N can make the estimate off by
+ *           more than 1 and the result wrong (window_for keeps every b^d < 2^16).
+ */
 __device__ __forceinline__ void mul_small26(u32 x[5], u32 c, const Mod26 &m)
 {
     const u64 t0 = (u64)x[0] * c, t1 = (u64)x[1] * c, t2 = (u64)x[2] * c, t3 = (u64)x[3] * c, t4 = (u64)x[4] * c;
@@ -498,7 +759,13 @@ __device__ __forceinline__ void mul_small26(u32 x[5], u32 c, const Mod26 &m)
     x[4] = (u32)r4;
 }
 
-/* x / 2^130 mod N, fully reduced (x < 3N -> REDC < N + 1 -> one conditional subtraction) */
+/*
+ * redc26: leave Montgomery form and reduce fully, x = x / 2^130 mod N.
+ *   In:     x normalized with value < 3N.
+ *   Out:    x R^-1 mod N in [0, N), limbs normalized: the REDC result is at most N, and one
+ *           conditional subtraction of N (done with signed carries) finishes.
+ *   Errors: none for the stated ranges.
+ */
 __device__ __forceinline__ void redc26(u32 x[5], const Mod26 &m)
 {
     u64 c0 = x[0], c1 = x[1], c2 = x[2], c3 = x[3], c4 = x[4], c5 = 0, c6 = 0, c7 = 0, c8 = 0;
@@ -534,9 +801,16 @@ __device__ __forceinline__ void redc26(u32 x[5], const Mod26 &m)
     }
 }
 
-/* setup from p; returns p^-1 mod 2^64 */
+/*
+ * mod_init26: per-thread setup for p (theory section 4).
+ *   In:     p odd with 3 <= p < 2^63.
+ *   Out:    m (limbs of N = p^2, n' = -N^-1 mod 2^26, L, invD); returns p^-1 mod 2^64.
+ *   Errors: none detected; an even p gives a meaningless n' (callers never pass one in scans;
+ *           check does not reject it, Known issues 7).
+ */
 __device__ __forceinline__ u64 mod_init26(Mod26 &m, u64 p)
 {
+    /* N = p^2 = hi 2^64 + lo, split into 26-bit limbs n0..n4 (n4 < 2^22 since N < 2^126) */
     const u64 lo = p * p, hi = __umul64hi(p, p);
     m.n[0] = (u32)lo & M26;
     m.n[1] = (u32)(lo >> 26) & M26;
@@ -561,7 +835,13 @@ __device__ __forceinline__ u64 mod_init26(Mod26 &m, u64 p)
     return x;
 }
 
-/* x = 2^130 mod N (lazy, in [0, 3N)) */
+/*
+ * mod_one26: x = 2^130 mod N (up to a multiple of N, value < 3N): the Montgomery form of 1.
+ *   In:     m from mod_init26.
+ *   Out:    x, built from 2^(bits(N) - 1) < N by multiplications with 2^15 and one smaller
+ *           power of two (mul_small26), 131 - bits(N) doublings in all.
+ *   Errors: none.
+ */
 __device__ __forceinline__ void mod_one26(u32 x[5], const Mod26 &m)
 {
     const u32 top = m.L == 4 ? m.n[4] : m.L == 3 ? m.n[3] : m.L == 2 ? m.n[2] : m.L == 1 ? m.n[1] : m.n[0];
@@ -573,10 +853,19 @@ __device__ __forceinline__ void mod_one26(u32 x[5], const Mod26 &m)
     x[3] = lb == 3 ? 1u << bb : 0;
     x[4] = lb == 4 ? 1u << bb : 0;
     int k = 131 - bits;
+    /* 2^(bits-1) * 2^(131-bits) = 2^130; multipliers stay below 2^16 as mul_small26 requires */
     while (k >= 15) { mul_small26(x, 1u << 15, m); k -= 15; }
     if (k) mul_small26(x, 1u << k, m);
 }
 
+/*
+ * fermat_q26: the Fermat quotient of one (p, b) pair on the device.
+ *   In:     p odd, 3 <= p < 2^63, not dividing b; w and pw = the base's window and its
+ *           power table b^0..b^(2^w - 1) (each < 2^16, in shared or constant memory).
+ *   Out:    q = (b^(p-1) mod p^2 - 1) * p^-1 mod 2^64; flt = (q >= p), i.e. Fermat's little
+ *           theorem failed and the residue was wrong.  q = 0 means p is a solution.
+ *   Errors: reported through flt only.
+ */
 __device__ __forceinline__ u64 fermat_q26(u64 p, int w, const u32 *pw, bool &flt)
 {
     Mod26 m;
@@ -585,6 +874,8 @@ __device__ __forceinline__ u64 fermat_q26(u64 p, int w, const u32 *pw, bool &flt
     mod_one26(x, m);
     const u64 e = p - 1;
     const u32 mask = (1u << w) - 1;
+    /* shift of the top window; then per window: w squarings and one multiplication by b^digit
+       (b^0 = 1 for a zero digit), exactly as in ../wieferich.c's run_group */
     int sh = ((64 - __clzll((long long)e) + w - 1) / w - 1) * w;
     mul_small26(x, pw[(e >> sh) & mask], m);
     for (sh -= w; sh >= 0; sh -= w) {
@@ -592,18 +883,38 @@ __device__ __forceinline__ u64 fermat_q26(u64 p, int w, const u32 *pw, bool &flt
         mul_small26(x, pw[(e >> sh) & mask], m);
     }
     redc26(x, m);
+    /* only r mod 2^64 is needed: q = (r - 1) p^-1 mod 2^64 is an exact division by p */
     const u64 r = (u64)x[0] | ((u64)x[1] << 26) | ((u64)x[2] << 52);
     const u64 q = (r - 1) * pinv;
     flt = q >= p;
     return q;
 }
 
+/*
+ * push_event: append an event to the chunk's buffer.
+ *   In:     res, the event's fields.
+ *   Out:    stored at the slot returned by an atomic increment of res->nev.
+ *   Errors: beyond MAXEV events the event is dropped (nev still counts it; the host warns at
+ *           the end of the scan, Known issues 9).
+ */
 __device__ __forceinline__ void push_event(ChunkRes *res, u32 type, u32 j, u64 p, u64 q)
 {
     const u32 k = atomicAdd(&res->nev, 1u);
     if (k < MAXEV) { res->ev[k].type = type; res->ev[k].j = j; res->ev[k].p = p; res->ev[k].q = q; }
 }
 
+/*
+ * k_wieferich: test one sub-range of primes against every base (theory sections 1, 5).
+ *   In:     off[0..n): prime offsets from base (the sub-range start); res = the chunk's result
+ *           block; nearT = the -n bound (0 = off).  Grid (ceil(n / BLOCK), number of bases),
+ *           BLOCK threads; blockIdx.y is the base index.
+ *   Out:    per thread i < n with p = base + off[i] not dividing b: one test.  The block's
+ *           checksum terms and test count are added to res->cks[j] and res->tests;
+ *           solutions, near-Wieferich primes (0 < |A| <= nearT) and FLT errors are pushed as
+ *           events.  Threads with i >= n or p | b contribute nothing.
+ *   Errors: FLT errors become events (type 3) and are left out of the checksum.  All threads
+ *           take part in the shuffles and barriers, so no thread returns early.
+ */
 __global__ void __launch_bounds__(BLOCK)
 k_wieferich(const u32 *__restrict__ off, u32 n, u64 base, ChunkRes *res, u64 nearT)
 {
@@ -619,6 +930,7 @@ k_wieferich(const u32 *__restrict__ off, u32 n, u64 base, ChunkRes *res, u64 nea
     u32 cnt = 0;
     if (i < n) {
         const u64 p = base + off[i];
+        /* pairs with p | b are skipped (b^(p-1) = 0 mod p); they count neither as tests nor in the checksum */
         if (!(p <= b && b % p == 0)) {
             bool flt;
             const u64 q = fermat_q26(p, c_w[j], s_pw, flt);
@@ -636,6 +948,7 @@ k_wieferich(const u32 *__restrict__ off, u32 n, u64 base, ChunkRes *res, u64 nea
         }
     }
 #pragma unroll
+    /* block reduction: warp shuffles, then one partial sum per warp in shared memory */
     for (int o = 16; o; o >>= 1) {
         term += __shfl_down_sync(0xffffffffu, term, o);
         cnt += __shfl_down_sync(0xffffffffu, cnt, o);
@@ -653,7 +966,13 @@ k_wieferich(const u32 *__restrict__ off, u32 n, u64 base, ChunkRes *res, u64 nea
     }
 }
 
-/* for selftest/check: q for arbitrary (p, base index) pairs */
+/*
+ * k_quot: Fermat quotients for arbitrary (p, base index) pairs (check, selftest).
+ *   In:     ps[i], js[i] for i < n (p odd, not dividing the base); the bases' tables in
+ *           constant memory.
+ *   Out:    qs[i] = q and flts[i] = FLT failure flag, as fermat_q26.
+ *   Errors: none beyond the flag.
+ */
 __global__ void k_quot(const u64 *ps, const int *js, u64 *qs, u32 *flts, u32 n)
 {
     const u32 i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -667,8 +986,12 @@ __global__ void k_quot(const u64 *ps, const int *js, u64 *qs, u32 *flts, u32 n)
 /* Host: sieve threads, GPU pipeline, scan state                        */
 /* ------------------------------------------------------------------ */
 
+/* A solution: base, prime, and the chunk it was found in. */
 typedef struct { u32 b; u64 p; u64 chunk; bool announced; } hit_t;
 
+/* The scan (host): range, chunk size, frontier (= number of folded chunks), totals over
+ * the folded chunks, checksums, solutions, and the event-overflow flag (Known issues 9).
+ * Only the main thread touches it, so no lock is needed. */
 static struct {
     u64 start, chunk, end, nchunks;
     u64 frontier;
@@ -679,11 +1002,16 @@ static struct {
     bool ev_overflow;
 } S;
 
+/* Options: -n bound (0 = off), print result lines (off in selftest), chunk log, host threads. */
 static long long g_near = 0;
 static bool g_print = true;
 static FILE *g_log = NULL;
 static int g_hthreads = 0;
 
+/* The double-buffered host/GPU pipeline (theory section 6).  Index [s] is the buffer set
+ * s = chunk index & 1: T pinned host buffers and one device buffer of T * cap prime offsets,
+ * a device result block, per-sub-range prime counts and start values, whether the chunk
+ * contains the prime 2, the chunk's start and index, and its completion event. */
 struct Pipe {
     int T = 0;                          /* host sieve threads = sub-ranges per chunk */
     u64 cap = 0;                        /* capacity per sub-range buffer (primes) */
@@ -699,12 +1027,28 @@ struct Pipe {
     bool init = false;
 } P;
 
+/*
+ * sub_cap: capacity of a sub-range buffer, in primes.
+ *   In:     lo = the lowest number the buffers will hold, len = sub-range length.
+ *   Out:    1.25 len / ln(max(lo, 10^4)) + 10^5, a safe upper bound on the number of primes in
+ *           any interval of length len at or above lo (pi(x + y) - pi(x) ~ y / ln x).
+ *   Errors: none; if a sub-range ever held more primes, sieve_chunk dies rather than truncate.
+ */
 static u64 sub_cap(u64 lo, u64 len)
 {
     double l = log((double)(lo > 10000 ? lo : 10000));
     return (u64)(1.25 * (double)len / l) + 100000;
 }
 
+/*
+ * pipe_alloc: (re)allocate the pipeline for T sub-ranges of capacity cap.
+ *   In:     T >= 1 host threads, cap primes per sub-range.
+ *   Out:    P with 2 x T pinned host buffers, 2 device buffers, 2 result blocks, the stream
+ *           and the events.  Kept if T is unchanged and cap is large enough (repeated scans
+ *           in selftest/bench); otherwise the prime buffers are freed and reallocated.
+ *   Errors: dies on any CUDA allocation error (CUDA_CHECK).  Chunk 10^10 with T = 20 at 2e14
+ *           needs ~3 GB of pinned host memory and ~3 GB on the device.
+ */
 static void pipe_alloc(int T, u64 cap)
 {
     if (P.init && P.T == T && P.cap >= cap) return;
@@ -733,7 +1077,16 @@ static void pipe_alloc(int T, u64 cap)
     P.init = true;
 }
 
-/* sieve chunk idx into set s (host threads) */
+/*
+ * sieve_chunk: generate the primes of chunk idx into buffer set s (host).
+ *   In:     idx < S.nchunks; s = idx & 1, whose previous chunk has been folded.
+ *   Out:    T threads each sieve one sub-range [a, b) of the chunk with their own primesieve
+ *           iterator and store p - a as 32-bit offsets; P.cnt[s], P.sub_lo[s], P.has2[s]
+ *           (the prime 2 is kept out of the buffers), P.lo[s], P.idx[s].
+ *   Errors: dies if a sub-range holds more primes than its capacity (cannot happen for the
+ *           sub_cap bound; reported, never truncated).  Offsets fit 32 bits because run_scan
+ *           requires CHUNK / T < 2^32.  See Known issues 11 for the iterator setup cost.
+ */
 static void sieve_chunk(u64 idx, int s)
 {
     const u64 lo = S.start + idx * S.chunk;
@@ -772,6 +1125,14 @@ static void sieve_chunk(u64 idx, int s)
     P.idx[s] = idx;
 }
 
+/*
+ * enqueue_chunk: queue the GPU work for buffer set s on the stream.
+ *   In:     s, filled by sieve_chunk.
+ *   Out:    on P.st: clear the result header, then per non-empty sub-range one async copy of
+ *           its offsets and one k_wieferich launch; finally record P.done[s].
+ *   Errors: dies on a launch or API error (CUDA_CHECK); errors inside a kernel surface when
+ *           fold_chunk waits for the event.
+ */
 static void enqueue_chunk(int s)
 {
     CUDA_CHECK(cudaMemsetAsync(P.dres[s], 0, RES_HEADER, P.st));
@@ -787,6 +1148,14 @@ static void enqueue_chunk(int s)
     CUDA_CHECK(cudaEventRecord(P.done[s], P.st));
 }
 
+/*
+ * record_hit: remember and print a solution (host, main thread only).
+ *   In:     base b, prime p, chunk idx.
+ *   Out:    appended to S.hits unless present; "FOUND base b p P (Annnnnn)" on stdout if
+ *           g_print.
+ *   Errors: duplicates are ignored; beyond MAXHITS solutions are printed but not kept
+ *           (Known issues 5).
+ */
 static void record_hit(u32 b, u64 p, u64 idx)
 {
     for (int i = 0; i < S.nhits; i++) if (S.hits[i].b == b && S.hits[i].p == p) return;
@@ -802,6 +1171,12 @@ static void record_hit(u32 b, u64 p, u64 idx)
     }
 }
 
+/*
+ * announce: print CONFIRMED lines for solutions below the frontier, once each.
+ *   In:     nothing (reads S).
+ *   Out:    the number of solutions below the frontier.
+ *   Errors: none.
+ */
 static int announce(void)
 {
     int n = 0;
@@ -823,6 +1198,12 @@ static int announce(void)
     return n;
 }
 
+/*
+ * ev_cmp: qsort comparator ordering events by prime, then base index.
+ *   In:     pointers to two Event.
+ *   Out:    -1, 0 or 1.
+ *   Errors: none.
+ */
 static int ev_cmp(const void *a, const void *b)
 {
     const Event *x = (const Event *)a, *y = (const Event *)b;
@@ -830,7 +1211,17 @@ static int ev_cmp(const void *a, const void *b)
     return x->j < y->j ? -1 : x->j > y->j;
 }
 
-/* wait for set s, fold its results; chunks are folded in order */
+/*
+ * fold_chunk: wait for the chunk in buffer set s and fold its results (theory section 6).
+ *   In:     s; the chunk in it must be the next one at the frontier.
+ *   Out:    waits for P.done[s], copies back the result header and the events, prints
+ *           FOUND (also for the prime 2 when b = 1 mod 4), NEAR and FLT-ERROR lines sorted by
+ *           (p, base), adds primes, tests, near, flt and checksums to S, writes the chunk-log
+ *           line, and advances the frontier by one.
+ *   Errors: dies on a CUDA error (including faults inside the kernels) and, as an internal
+ *           consistency check, if the chunk is not the one at the frontier.  An event
+ *           overflow sets S.ev_overflow (Known issues 9).
+ */
 static void fold_chunk(int s)
 {
     CUDA_CHECK(cudaEventSynchronize(P.done[s]));
@@ -881,6 +1272,14 @@ static void fold_chunk(int s)
 
 /* ---- checkpoint file (same format as the CPU tool) ---- */
 
+/*
+ * save_state: write the checkpoint (same format as ../wieferich.c) as path.tmp, then rename.
+ *   In:     path.
+ *   Out:    path holds bases, start, chunk, end, frontier, totals, checksums and the
+ *           solutions below the frontier, ending with "end".
+ *   Errors: a warning if path.tmp cannot be created, written, closed or renamed; the scan
+ *           continues and the previous checkpoint normally survives (Known issues 3).
+ */
 static void save_state(const char *path)
 {
     char tmp[PATH_MAX];
@@ -901,6 +1300,16 @@ static void save_state(const char *path)
         fprintf(stderr, "\nwarning: cannot update %s: %s\n", path, strerror(errno));
 }
 
+/*
+ * load_state: resume from a checkpoint written by either tool.
+ *   In:     path; S.start, S.chunk, S.nchunks and B must be set.
+ *   Out:    false if path does not exist; true with the frontier, totals, checksums and
+ *           solutions restored.
+ *   Errors: dies if the file cannot be read, is not a checkpoint, is truncated, has a bad
+ *           cks/hit line or a checksum for a base not in the run, or was written for other
+ *           bases, START or CHUNK, or if its frontier lies beyond the new END (Known
+ *           issues 4).
+ */
 static bool load_state(const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -957,14 +1366,35 @@ static bool load_state(const char *path)
     return true;
 }
 
+/*
+ * on_sigint: SIGINT/SIGTERM handler; sets g_stop so run_scan stops queueing chunks, folds the
+ * one in flight, saves the checkpoint and returns.
+ *   In:     signal number (unused).
+ *   Out:    g_stop = 1.
+ *   Errors: none.
+ */
 static void on_sigint(int sig)
 {
     (void)sig;
     g_stop = 1;
 }
 
+/* What run_scan did: seconds and numbers of this session; tests of this session; primes
+ * include a resumed part (Known issues 8). */
 typedef struct { double seconds; u64 primes, tests, numbers; } scan_stats_t;
 
+/*
+ * run_scan: test every prime in [start, end) for the bases in B (theory section 6).
+ *   In:     start < end; chunk >= 1; state = checkpoint path or NULL; interval = seconds
+ *           between checkpoints (and status lines when stderr is not a terminal); quiet.
+ *           gpu_init and parse_bases/bases_setup must have run; g_hthreads (0 = all cores).
+ *   Out:    S holds the complete result; the checkpoint is saved at the end; statistics as
+ *           scan_stats_t.  END is rounded up to a chunk boundary (S.end).
+ *   Errors: dies if start >= end, chunk = 0, the rounded END exceeds 2^63 or 64 bits,
+ *           CHUNK / T >= 2^32, on allocation or CUDA errors, and for an unusable checkpoint.
+ *           SIGINT/SIGTERM stop the scan after the chunk in flight with a saved checkpoint;
+ *           g_stop stays set for later scans in the same process.
+ */
 static scan_stats_t run_scan(u64 start, u64 end, u64 chunk, const char *state, int interval, bool quiet)
 {
     if (end <= start) die("END must be larger than START");
@@ -1007,6 +1437,7 @@ static scan_stats_t run_scan(u64 start, u64 end, u64 chunk, const char *state, i
     char b1[32], b2[32];
     u64 next = S.frontier;              /* next chunk to sieve */
     int inflight = 0;
+    /* pipeline: keep one chunk on the GPU while the host sieves the next (theory section 6) */
     if (next < S.nchunks) { sieve_chunk(next, next & 1); enqueue_chunk(next & 1); next++; inflight = 1; }
     while (inflight) {
         const u64 cur = S.frontier;     /* chunk being computed */
@@ -1051,7 +1482,14 @@ static scan_stats_t run_scan(u64 start, u64 end, u64 chunk, const char *state, i
     return st;
 }
 
-/* S.tests counts the whole run including a resumed part; the summary uses S only */
+/*
+ * print_summary: "SUMMARY [START, position) primes tests flt_errors [near]" and one line per
+ * base with its A-number, checksum and solutions below the frontier (stdout).  The totals
+ * include a resumed part; the position is END for a complete scan.
+ *   In:     nothing (reads S, B).
+ *   Out:    the summary.
+ *   Errors: none.
+ */
 static void print_summary(void)
 {
     u64 pos = S.start + S.frontier * S.chunk;
@@ -1072,7 +1510,12 @@ static void print_summary(void)
     fflush(stdout);
 }
 
-/* q for a list of (p, base index) pairs on the GPU */
+/*
+ * gpu_quotients: run k_quot on a list of (p, base index) pairs.
+ *   In:     ps, js of equal non-zero length n < 2^32; B uploaded.
+ *   Out:    qs[i], flts[i] as fermat_q26.
+ *   Errors: dies on any CUDA error.
+ */
 static void gpu_quotients(const std::vector<u64> &ps, const std::vector<int> &js, std::vector<u64> &qs, std::vector<u32> &flts)
 {
     const u32 n = (u32)ps.size();
@@ -1098,6 +1541,12 @@ static void gpu_quotients(const std::vector<u64> &ps, const std::vector<int> &js
 /* Commands                                                             */
 /* ------------------------------------------------------------------ */
 
+/*
+ * usage: print the command summary and exit with status 2.
+ *   In:     nothing.
+ *   Out:    does not return.
+ *   Errors: none.
+ */
 static void usage(void)
 {
     fputs("usage: wieferich_cuda scan [START] END [-b BASES] [-c CHUNK] [-n T] [-S FILE] [-i SECS] [-L FILE] [-T N] [-g DEV] [-q]\n"
@@ -1108,8 +1557,16 @@ static void usage(void)
     exit(2);
 }
 
+/* CUDA device (-g). */
 static int g_dev = 0;
 
+/*
+ * gpu_init: select device g_dev and print its name, SM count and compute capability (unless
+ * g_print is off).
+ *   In:     g_dev.
+ *   Out:    the device is current for all later CUDA calls.
+ *   Errors: dies if the device does not exist or the driver fails (CUDA_CHECK).
+ */
 static void gpu_init(void)
 {
     CUDA_CHECK(cudaSetDevice(g_dev));
@@ -1119,6 +1576,14 @@ static void gpu_init(void)
     fprintf(stderr, "GPU %d: %s, %d SMs, compute %d.%d\n", g_dev, prop.name, prop.multiProcessorCount, prop.major, prop.minor);
 }
 
+/*
+ * cmd_scan: "scan [START] END [options]" (see the header's Usage).
+ *   In:     the arguments after "scan".
+ *   Out:    runs the scan; FOUND/NEAR/FLT-ERROR/CONFIRMED lines and the summary on stdout, a
+ *           timing line on stderr.  Exit status 0, or 3 if any FLT error occurred.
+ *   Errors: usage() for unknown options or a missing END; dies for bad numbers or bases, an
+ *           unwritable chunk log and every run_scan error (Known issues 6 for -n).
+ */
 static int cmd_scan(int argc, char **argv)
 {
     u64 pos[2];
@@ -1157,6 +1622,15 @@ static int cmd_scan(int argc, char **argv)
     return S.flt ? 3 : 0;
 }
 
+/*
+ * cmd_check: "check P [-b BASES]": GPU Fermat quotients of P for each base not divisible by P,
+ * compared with the host reference.
+ *   In:     the arguments after "check"; 3 <= P < 2^63; bases default "known".
+ *   Out:    per base: q, A, a WIEFERICH marker for q = 0, agreement with the reference.  Exit
+ *           status 0 if all agree, 1 otherwise.
+ *   Errors: usage() for a missing P; dies for P outside [3, 2^63), bad bases or CUDA errors.
+ *           Even or composite P give misleading output (Known issues 7).
+ */
 static int cmd_check(int argc, char **argv)
 {
     u64 p = 0;
@@ -1192,6 +1666,13 @@ static int cmd_check(int argc, char **argv)
     return bad ? 1 : 0;
 }
 
+/*
+ * li_diff: li(y) - li(x), the integral of dt / ln t, by the midpoint rule on 2000 steps in
+ * log t (an estimate of the number of primes in [x, y]).
+ *   In:     1 < x < y.
+ *   Out:    the integral.
+ *   Errors: meaningless for x <= 1 (Known issues 8).
+ */
 static double li_diff(double x, double y)
 {
     const int n = 2000;
@@ -1203,6 +1684,15 @@ static double li_diff(double x, double y)
     return s;
 }
 
+/*
+ * cmd_bench: "bench [N] [-d SPAN] [-b BASES] [-c CHUNK] [-T N]": time [N, N+SPAN) and project.
+ *   In:     the arguments after "bench"; defaults N = 10^15, SPAN = 2*10^11, CHUNK =
+ *           min(SPAN / 8, 10^10) (at least 10^6).
+ *   Out:    primes/s, tests/s and numbers/s, and for [N, 2N), [N, 10N), [N, 100N) the tests,
+ *           the projected time and the heuristic expected number of new solutions.
+ *   Errors: usage() for unknown options; dies for bad numbers or bases and every run_scan
+ *           error; see Known issues 8.
+ */
 static int cmd_bench(int argc, char **argv)
 {
     u64 n0 = 1000000000000000ULL, span = 200000000000ULL, chunk = 0;
@@ -1235,9 +1725,21 @@ static int cmd_bench(int argc, char **argv)
     return 0;
 }
 
+/*
+ * rnd: the selftest's reproducible pseudo-random numbers (splitmix64 with a fixed seed).
+ *   In:     nothing (advances rng_state).
+ *   Out:    the next 64-bit value.
+ *   Errors: none.
+ */
 static u64 rng_state = 0x243F6A8885A308D3ULL;
 static u64 rnd(void) { return mix64(rng_state += GOLD); }
 
+/*
+ * known_hit: is p a known solution for base b (table KNOWN)?
+ *   In:     b, p.
+ *   Out:    true iff listed.
+ *   Errors: none.
+ */
 static bool known_hit(u32 b, u64 p)
 {
     for (int i = 0; i < NKNOWN; i++)
@@ -1246,11 +1748,21 @@ static bool known_hit(u32 b, u64 p)
     return false;
 }
 
+/* Checksum windows generated by verify_wieferich.py (Python integers, Miller-Rabin primes),
+ * bases "oeis" ascending: {lo, hi, primes in [lo, hi), checksum per base}. */
 typedef struct { u64 lo, hi, primes; u64 cks[17]; } ckwin_t;
 static const ckwin_t CKWIN[] = {
 #include "../wieferich_cks.h"
 };
 
+/*
+ * cmd_selftest: "selftest [LIMIT] [-T N]" (theory section 7).
+ *   In:     the arguments after "selftest"; LIMIT default 10^9 (end of part 1).
+ *   Out:    one line per part on stderr and "selftest passed" or "FAILED"; exit status 0 or 1.
+ *           The pi check is made only for LIMIT = 10^9.
+ *   Errors: usage() for unknown options; dies for a bad LIMIT, CUDA errors and every run_scan
+ *           error.
+ */
 static int cmd_selftest(int argc, char **argv)
 {
     u64 limit = 1000000000ULL;
@@ -1373,6 +1885,12 @@ static int cmd_selftest(int argc, char **argv)
     return bad ? 1 : 0;
 }
 
+/*
+ * main: dispatch to scan, check, bench or selftest.
+ *   In:     argv[1] = command, the rest its arguments.
+ *   Out:    the command's exit status.
+ *   Errors: usage() (exit 2) for a missing or unknown command.
+ */
 int main(int argc, char **argv)
 {
     stderr_tty = isatty(2);

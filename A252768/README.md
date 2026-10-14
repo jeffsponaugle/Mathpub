@@ -20,8 +20,10 @@ Since S₁(p) = p − 2, every term is the larger member of a twin prime pair
 When this work started (Sep 16 2026) the OEIS entry (keyword `hard,more`)
 listed a(1..7): 5, 5, 13, 14593, 372313, 2315773, 541613713. The two terms
 found below were submitted the same day and approved on Sep 17 2026
-(revision #21); the entry now lists a(1..9). See `submission.md` for what is
-still worth submitting.
+(revision #21); the entry now lists a(1..9). **a(10) = 3770303151073** (Oct 13
+2026) and **a(11) = 1009809788912233** (Oct 14 2026, independent recomputation
+in progress) were found with this tool (see Results) and are not yet submitted;
+`submission.md` has the ready-to-paste lines.
 
 ## Results
 
@@ -31,21 +33,47 @@ single-threaded code path, every verdict cross-checked with GMP) and by
 `verify_a252768.py` (numpy sieve, exact Python integers, its own Miller–Rabin),
 which reproduce every power sum digit for digit.
 
-**Two new terms:**
+**Four new terms:**
 
 | n | a(n) | S₁..Sₙ prime, S_(n+1) composite |
 |---|------|------|
 | 8 | **7952072743** | S₉ = 38009162738943211881748481 = composite |
 | 9 | **21814967833** | S₁₀ = 30245374383129007149396784129 = composite |
+| 10 | **3770303151073** | S₁₁ = 11167738558029370106410742901913601 = composite (S₁₂ happens to be prime) |
+| 11 | **1009809788912233** | S₁₂ exceeds 2¹²⁸, being recomputed with GMP (if prime, this p is also a(12)) |
 
-The exhaustive scan of all primes below 10¹² (37,607,912,018 primes, 111 s)
-found no prime of depth ≥ 10, so **a(10) > 10¹²** (and a(11), a(12) > 10¹²;
-sums were tested up to k = 12). The OEIS terms a(1..7) are reproduced by the
-same scan. a(8) and a(9) are in the OEIS entry since Sep 17 2026; the bound
-a(10) > 10¹² is not yet (see `submission.md`). The sequence is now
+The exhaustive scan of all primes below 10¹² (37,607,912,018 primes, 111 s on the
+M1 Pro) found a(8) and a(9) and no prime of depth ≥ 10; the OEIS terms a(1..7)
+are reproduced by the same scan. a(8) and a(9) are in the OEIS entry since
+Sep 17 2026.
+
+**a(10)** came from resuming that scan's checkpoint on jeff-model1, an 8-core
+AMD EPYC server (Oct 13 2026, `scan 1e14 -S a252768.state`): the first prime of
+depth 10 is 3770303151073, found eight minutes into the run, with every chunk
+below it complete, so it is the smallest. The run went on to 10¹⁴ (4 h 19 min
+in all, 3,167,333,838,784 primes in [10¹², 10¹⁴]) and found two more primes of
+depth 10 — 20870811849529 and 67951921121011, both PARI-certified — but none
+of depth 11, so **a(11) > 10¹⁴** (and a(12) > 10¹⁴; k ≤ 12 was tested
+throughout). Its prime count at 10¹⁴, 3,204,941,750,802, is exactly π(10¹⁴),
+and its twelve running sums at 10¹⁴ are identical to the ones jeff-model2
+computed independently from scratch with different chunking (`m1_sums.txt`,
+`sums_at_1e14.txt`).
+
+**a(11)** came from jeff-model2 (22-vCPU Xeon): a scan of [10¹⁴, 10¹⁵] (15.4 h,
+26,639,628,671,867 primes) found nine primes of depth 10 but none of depth 11,
+so **a(11) > 10¹⁵**; the automatic continuation from its checkpoint then hit a
+prime of depth 11 after 37 minutes, at 1009809788912233 — only 1 % above 10¹⁵ —
+with every chunk below it complete, so it is the smallest. PARI/GP proves
+S₁..S₁₁ prime (`certify_a11.txt`). S₁₂ is beyond 128 bits at this size, so the
+scan could not test it; `verify` (parallel gap-histogram mode, GMP) is
+recomputing all sums on jeff-model2 and, independently, on jeff-model3. By
+monotonicity a(12) ≥ a(11): a(12) = a(11) if S₁₂ turns out prime, otherwise
+a(12) > 1009809788912233. The continuation was stopped at 1.039·10¹⁵ (it could
+not test k = 12 there).
+The sequence is now
 
 ```
-5, 5, 13, 14593, 372313, 2315773, 541613713, 7952072743, 21814967833
+5, 5, 13, 14593, 372313, 2315773, 541613713, 7952072743, 21814967833, 3770303151073, 1009809788912233
 ```
 
 The power sums at the new terms (all prime unless marked):
@@ -60,7 +88,31 @@ p = 21814967833  S_1 = 21814967831           S_2 = 883642617829           S_3 = 
                  S_4 = 4080850722829393      S_5 = 394810145761684001     S_6 = 45578875566881080129
                  S_7 = 6111338676278533840001                 S_8 = 932919209682371038708993
                  S_9 = 159652836113962880019857921            S_10 = 30245374383129007149396784129 (composite)
+
+p = 3770303151073  S_1 = 3770303151071      S_2 = 190851794793757      S_3 = 14196773503347641
+                 S_4 = 1394426672423205361                    S_5 = 170141494293736680161
+                 S_6 = 24799307171701546531777                S_7 = 4202380711978049572942721
+                 S_8 = 811587406870679014576316161            S_9 = 175934585824654713314446896641
+                 S_10 = 42297466414050242039599107357697      S_11 = 11167738558029370106410742901913601 (composite)
+                 S_12 = 3211785862873660523176176380385423361 (prime, but S_11 already broke the chain)
+
+p = 1009809788912233  S_1 = 1009809788912231    S_2 = 62234731803809413    S_3 = 5657529453243494201
+                 S_4 = 680258345614629409297                  S_5 = 101712366014944608886241
+                 S_6 = 18180346330505067326217793             S_7 = 3780026913945005398382926721
+                 S_8 = 896081555456003024041519984897         S_9 = 238503222782742830604007067123201
+                 S_10 = 70414217271582880302629394661942273   S_11 = 22833087308636059205086630623560611841
+                 S_12 > 2^128: pending (GMP recomputation)
 ```
+
+a(10) was verified on the M1 Pro by `a252768 verify 3770303151073 -k 14 -t 10`
+(parallel totals pipeline with different chunking, GMP agreeing on every one of
+the twelve verdicts, 169 s; `verify_a10_pipeline.txt`) and by the plain
+single-threaded recomputation (`verify_a10_direct.txt`, 889 s) and by the
+Python/numpy verifier (`verify_py_a10.txt`, 3 h 06 min; same prime count and
+the same twelve sums digit for digit). On jeff-model1, `certify.sh 3770303151073` then
+proved S₁..S₁₀ prime with PARI/GP 2.17.2's `isprime` (APR-CL, 84 ms for all
+ten) and S₁₁ composite, so the term is certified, not merely probable
+(`certify_a10.txt`). The same script certifies a(8) and a(9).
 
 ### Depth statistics below 10¹²
 
@@ -74,6 +126,29 @@ Each extra k costs a factor of only 12–15 in the count (a per-k pass rate of
 6.6–8.7 %; the conditions are positively correlated, see below). The five primes of depth 9 below 10¹² are 21814967833,
 60308763733, 73668807349, 331274803549 and 844836146389; all 438 primes of
 depth ≥ 7 are listed in `scan_1e12.txt`.
+
+The continuation on jeff-model1 adds the counts for 10¹² < p < 10¹⁴
+(`scan_1e14.txt` lists the 989 primes of depth ≥ 8):
+
+| n | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| count | 126303419259 | 7029757960 | 537449183 | 36121919 | 2780683 | 192178 | 14274 | 931 | 55 | 3 |
+
+The model below, calibrated only on the data below 10¹², predicted 1076 / 68 /
+3.9 primes of depth ≥ 8 / 9 / 10 in this range against 989 / 58 / 3 found.
+
+And for 10¹⁴ < p < 10¹⁵ from jeff-model2 (`scan_1e14_1e15.txt`, 5408 primes of
+depth ≥ 8; the nine of depth 10 are PARI-certified in
+`certify_depth10_1e14_1e15.txt`):
+
+| n | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| count | 986413341829 | 51116885498 | 3650281132 | 230513699 | 16726323 | 1090466 | 76284 | 5095 | 304 | 9 | 0 |
+
+Model: 5522 / 332 / 18.5 / 1.1 of depth ≥ 8 / 9 / 10 / 11 against 5408 / 313 /
+9 / 0 found — the depth-10 count is running about half the prediction over
+[10¹², 10¹⁵] (12 found, 22 expected), the lighter-than-exponential gap tail
+showing at high k.
 
 ### Search-range estimates for a(10) .. a(13)
 
@@ -102,13 +177,19 @@ beyond 10¹², with the Poisson probability 1 − e^(−E) that a(n) < X:
 
 Each further term costs about 1.7 decades: the per-k pass rate settles near
 6–7 % while the density of qualifying primes halves per decade, so the count
-per decade grows only ~5×. Both a(10) and a(11) are within reach of this
-machine (hours and about two days respectively, see the timings); a(12) is
-not — its median sits at two weeks of continuous computing for a 1-in-3 chance.
-The scatter is Poisson: a(9) at 2.2·10¹⁰ was a mildly lucky draw (2.4 primes of
-depth 9 expected below 10¹², 5 found), so expect a factor of 3–5 either side
-of the medians. Run `python3 estimate.py 1e13` after the next scan to refresh
-the table for the new lower bound.
+per decade grows only ~5×. a(10) duly appeared at 3.77·10¹², the model's 21 %
+point (expected 0.24 primes of depth ≥ 10 between 10¹² and there). a(11) is
+within reach of a machine-day or two; a(12) is not — its median sits at two
+weeks of continuous computing for a 1-in-3 chance. The scatter is Poisson:
+a(9) at 2.2·10¹⁰ was a mildly lucky draw (2.4 primes of depth 9 expected
+below 10¹², 5 found), so expect a factor of 3–5 either side of the medians.
+
+a(11) = 1.0098·10¹⁵ landed at the model's 73 % point (given a(11) > 10¹²).
+With a(11) known, `python3 estimate.py 1e15` gives for a(12): median 2.6·10¹⁶,
+P(a(12) < 10¹⁶) = 26 %, < 3·10¹⁶ = 54 %, < 10¹⁷ = 86 % — and the model has been
+overestimating depth ≥ 10 by about 2×, so take these as optimistic. An a(12)
+hunt would also need the scan's sums widened beyond 128 bits (S₁₂ overflows
+at 1.5·10¹⁴); see "Tips for the next run".
 
 ### Timings (M1 Pro, 10 threads)
 
@@ -122,6 +203,14 @@ the table for the new lower bound.
 | 0 .. 10¹⁴ (estimate) | ~3 h | |
 | 0 .. 10¹⁵ (estimate) | ~1.3 days | |
 | 0 .. 10¹⁶ (estimate) | ~2 weeks | |
+| jeff-model1 (8-core EPYC 7B12, gcc 14): 10¹² .. 10¹⁴ | 4 h 19 min | 6.4·10⁹ numbers/s |
+| jeff-model2: totals-only pass 0 .. 10¹⁴ | 55 min | 3.0·10¹⁰ numbers/s |
+| jeff-model2: 10¹⁴ .. 10¹⁵ | 15.4 h | 1.62·10¹⁰ numbers/s |
+| jeff-model2: `verify 1009809788912233 -t 22` (pipeline + histogram) | ~7.6 h | 3.7·10¹⁰ numbers/s |
+| jeff-model3 (32-vCPU Xeon 8581C, gcc 14): 0 .. 10¹¹ | 3.9 s (4.9 s with 16 threads) | 2.6·10¹⁰ numbers/s |
+| jeff-model3: 0 .. 10¹² | 35.8 s | 2.8·10¹⁰ numbers/s |
+| jeff-model2 (22-vCPU Xeon 8481C, gcc 12): 0 .. 10¹¹ | 6.7 s (8.1 s with 11 threads) | 1.5·10¹⁰ numbers/s |
+| jeff-model2: 0 .. 10¹² | 62 s | 1.6·10¹⁰ numbers/s |
 | totals-only pass (scan with START > 0, `verify -t 10`) | 3.5 s per 10¹¹ | 2.9·10¹⁰ numbers/s |
 
 primesieve alone counts primes 3–8× faster than this (1.4 s per 10¹¹ near 0,
@@ -132,9 +221,15 @@ to the range as the primes thin out; the rate should stay near 9·10⁹/s up to
 
 ## Building
 
-Needs [primesieve](https://github.com/kimwalisch/primesieve) (`brew install primesieve`).
-GMP (`brew install gmp`) is optional; when present the `verify` command and
-the selftest cross-check every primality verdict with `mpz_probab_prime_p`.
+Needs [primesieve](https://github.com/kimwalisch/primesieve) 11 or newer
+(`brew install primesieve` on macOS, `apt install libprimesieve-dev` on Debian/Ubuntu).
+GMP (`brew install gmp` / `apt install libgmp-dev`) is optional; when present the
+`verify` command and the selftest cross-check every primality verdict with
+`mpz_probab_prime_p`. The Makefile finds Homebrew on macOS and defaults to
+/usr/local elsewhere (`make PREFIX=/path` to override); GMP is enabled whenever
+the compiler can find `gmp.h`. Built and tested on an M1 Pro (clang) and on a
+Debian 13 x86-64 server (gcc 14, primesieve 12.7) and a Debian 12 one (gcc 12,
+primesieve 11.0).
 
 ```
 make          # builds ./a252768 (adds -DHAVE_GMP -lgmp when gmp.h is found)
@@ -167,7 +262,7 @@ a252768 verify P [-k KMAX] [-t T]
 a252768 selftest [-t T]
 ```
 
-Numbers may be written as `123`, `2^40`, `10^12`, `1e12` or `2^40-1`.
+Numbers may be written as `123`, `2^40`, `10^12`, `1e12`, `2.5e10` or `2^40-1`.
 
 **scan** searches every prime in [START, END] (START defaults to 0). It prints
 each prime of depth ≥ DEPTH (default 7) as it is found, with all its power
@@ -267,9 +362,9 @@ summary):
    over segments with the boundary primes merged afterwards would bring 10¹⁴
    to about 10 h on 10 cores).
 3. For the OEIS: the sums beyond 3.3·10²⁴ are probable primes (24 Miller–Rabin
-   bases + GMP's BPSW). A PARI/GP `isprime(S)` certificate (APR-CL, instant
-   for ≤ 130-bit numbers) makes them rigorous; PARI is not installed here
-   (`brew install pari`). Then extend `b252768.txt` and `DATA.txt`, and note
+   bases + GMP's BPSW). `./certify.sh P` proves them with PARI/GP `isprime`
+   (APR-CL, milliseconds at these sizes); PARI is installed on jeff-model1
+   (`brew install pari` on the Mac). Then extend `b252768.txt` and `DATA.txt`, and note
    the scan bound for the next term ("a(11) > X") in the entry. Ready-to-paste
    OEIS lines, and the state of the entry as of Oct 3 2026, are in
    `submission.md`.
@@ -362,10 +457,11 @@ shrinks only slowly with p.
   (previous prime − 2), which pins the chunk hand-off to the actual primes.
 
 Sums below 3.3·10²⁴ are proven prime by the deterministic bases; that covers
-every sum of a(8) and S₁..S₈ of a(9). Sums above it — so far only S₉ of a(9),
-and S₉ and up for future terms — have probable-prime status from 24
-Miller–Rabin bases plus GMP's BPSW test; a PARI/GP `isprime` certificate
-(APR-CL) makes them rigorous. All the sums involved have at most ~110 bits.
+every sum of a(8) and S₁..S₈ of a(9). Larger sums (S₉ of a(9), S₈..S₁₀ of
+a(10), and S₉ and up for future terms) get probable-prime status from 24
+Miller–Rabin bases plus GMP's BPSW test inside the tool; `certify.sh P` then
+proves them with PARI/GP's `isprime` (APR-CL), which takes milliseconds at
+these sizes (at most ~110 bits). All three new terms are certified this way.
 
 ## Files
 
@@ -373,7 +469,14 @@ Miller–Rabin bases plus GMP's BPSW test; a PARI/GP `isprime` certificate
 * `Makefile` — `make`, `make test`
 * `verify_a252768.py` — independent Python/numpy verification of one prime; `verify_py_a8.txt`, `verify_py_a9.txt` are its transcripts for the new terms
 * `estimate.py` — the calibrated density model: expected search ranges for a(10)..a(13) and the S_k bit sizes
+* `certify.sh` — proves the power sums of a hit prime with PARI/GP `isprime` (reads the hit line from a scan output file)
 * `scan_1e12.txt`, `scan_1e12.log` — output of the scan to 10¹² (all primes of depth ≥ 7)
+* `scan_1e14.txt`, `scan_1e14.log` — the resumed run on jeff-model1 over [10¹², 10¹⁴] that found a(10) (primes of depth ≥ 8)
+* `a252768_1e14.state` — checkpoint at 10¹⁴ (running sums, prime count); `m1_sums.txt`, `sums_at_1e14.txt` — the same twelve sums from jeff-model1's scan and jeff-model2's independent totals pass
+* `scan_1e14_1e15.txt`, `scan_1e14_1e15.log` — jeff-model2's run over [10¹⁴, 10¹⁵] (primes of depth ≥ 8); `state_at_1000000000000001.bak` — its checkpoint at 10¹⁵
+* `scan_1e15_2e15.txt`, `scan_1e15_2e15.log` — the continuation that found a(11), stopped at 1.039·10¹⁵ (`range_1e14_1e15.state` is its checkpoint; `chain_2e15.sh` the script that chained it)
+* `certify_a11.txt`, `certify_depth10_1e14_1e15.txt` — PARI certificates; `verify_a11_model2.txt`, `verify_a11_model3.txt` — the recomputations of a(11)'s sums
+* `verify_a10_pipeline.txt`, `verify_a10_direct.txt`, `verify_py_a10.txt` — the three verifications of a(10)
 * `a252768.state` — checkpoint of the scan (resume with the same `scan … -S a252768.state`)
 * `b252768.txt`, `DATA.txt` — b-file and OEIS DATA line with the new terms
 * `submission.md` — state of the OEIS entry (a(8), a(9) approved Sep 17 2026) and the items still worth submitting, as ready-to-paste OEIS lines

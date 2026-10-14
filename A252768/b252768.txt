@@ -1,8 +1,9 @@
 # A252768: Primes p with property that the sum of the k-th powers of the successive gaps
 # between primes <= p are prime numbers for k = 1 to n.
-# Table of n, a(n) for n = 1..9.
-# a(1)-a(7) as in the OEIS entry; a(8), a(9) computed with a252768.c (Sep 16 2026),
-# exhaustive scan of the primes below 10^12: a(10) > 10^12.
+# Table of n, a(n) for n = 1..11.
+# a(1)-a(7) as in the OEIS entry; a(8), a(9) computed with a252768.c (Sep 16 2026) by an
+# exhaustive scan of the primes below 10^12; a(10) by continuing the scan to 10^14 (Oct 13 2026),
+# a(11) by continuing it to 1.04*10^15 (Oct 14 2026).
 1 5
 2 5
 3 13
@@ -12,3 +13,5 @@
 7 541613713
 8 7952072743
 9 21814967833
+10 3770303151073
+11 1009809788912233

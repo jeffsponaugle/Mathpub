@@ -1,11 +1,16 @@
-# A252768 tool. Needs primesieve (brew install primesieve); GMP (brew install gmp) adds independent primality checks.
-BREW_PREFIX ?= $(shell brew --prefix 2>/dev/null || echo /usr/local)
-CC      ?= cc
-CFLAGS  ?= -O2 -std=gnu11 -Wall -Wextra -pthread -I$(BREW_PREFIX)/include
-LDFLAGS ?= -L$(BREW_PREFIX)/lib
+# A252768 tool. Needs primesieve >= 11 (brew install primesieve / apt install libprimesieve-dev);
+# GMP (brew install gmp / apt install libgmp-dev) is optional and adds independent primality checks.
+#
+# PREFIX is where primesieve (and GMP) live when they are not in the compiler's default paths:
+# the Homebrew prefix on macOS, /usr/local elsewhere.  Override with `make PREFIX=/opt/foo`.
+PREFIX  ?= $(shell brew --prefix 2>/dev/null || echo /usr/local)
+CFLAGS  ?= -O2 -std=gnu11 -Wall -Wextra -pthread -I$(PREFIX)/include
+LDFLAGS ?= -L$(PREFIX)/lib -Wl,-rpath,$(PREFIX)/lib
 LDLIBS  ?= -lprimesieve -lm
 
-ifneq ($(wildcard $(BREW_PREFIX)/include/gmp.h),)
+# enable GMP if the compiler can find gmp.h (any location, not just PREFIX)
+HAVE_GMP := $(shell echo '\#include <gmp.h>' | $(CC) $(CFLAGS) -E -x c - >/dev/null 2>&1 && echo yes)
+ifeq ($(HAVE_GMP),yes)
 CFLAGS  += -DHAVE_GMP
 LDLIBS  += -lgmp
 endif

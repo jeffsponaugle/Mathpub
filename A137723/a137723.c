@@ -1,76 +1,266 @@
 /*
- * a137723.c
+ * a137723.c -- compute and extend OEIS A137723
+ * =============================================
  *
- * Compute and extend OEIS A137723:
+ *   A137723: "First occurrence of a set of n consecutive numbers having at
+ *   least one prime gap in their factorization: a(n) = smallest number of
+ *   this set."
  *
- *   "First occurrence of a set of n consecutive numbers having at least one
- *    prime gap in their factorization: a(n) = smallest number of this set."
+ * The original entry listed a(1..31) (built in below as KNOWN[]) and noted
+ * a(32) > 10^11.  This program found a(32) = 2^54 - 32 and every term up to
+ * a(193); they were added to the OEIS in Sep 2026 (b-file n = 1..193).  The
+ * first open term is a(194) > 2^64 - 194.  README.md describes the results
+ * and the method in prose; submission.md tracks the OEIS status.
  *
- * Known terms (n = 1..31):
- *   10, 33, 20, 55, 84, 114, 390, 513, 182, 200, 468, 2941, 774, 65522, 1832,
- *   1261, 1130, 1332, 1638, 524289, 1952, 4298, 4524, 69960, 5120, 16385, 2972,
- *   4832, 5352, 10801, 5592;   a(32) > 10^11 (Lucas A. Brown, Oct 2024).
  *
- * Definitions
- * -----------
- * A number has a "prime gap in its factorization" (A073490(m) > 0, called
- * "gapful" below) when its distinct prime factors are not consecutive primes:
- * 10 = 2*5 skips 3, 84 = 2^2*3*7 skips 5.  Numbers with no gap (A073491,
- * "gapless") are 1, the primes, the prime powers, and products of consecutive
- * primes with arbitrary exponents: 12 = 2^2*3, 35 = 5*7, 2940 = 2^2*3*5*7^2.
+ * THEORY OF OPERATION
+ * ===================
  *
- * If g < g' are consecutive gapless numbers, then g+1 .. g'-1 is a maximal run
- * of n = g'-g-1 gapful numbers, and a(n) is the smallest g+1 over all runs of
- * length exactly n.  Example: 83 and 89 are consecutive gapless numbers and
- * 84..88 are all gapful, so a(5) = 84.
+ * 1. Definitions
+ * --------------
+ * p_1 = 2, p_2 = 3, p_3 = 5, ... are the primes in increasing order.  A number
+ * m >= 1 is GAPLESS (OEIS A073491; "gap-free" in the README) when its distinct
+ * prime factors are consecutive primes p_i, p_(i+1), ..., p_j, with arbitrary
+ * exponents >= 1.  The gapless numbers are 1, the primes, the prime powers and
+ * products such as 12 = 2^2*3, 35 = 5*7 and 2940 = 2^2*3*5*7^2.  Every other
+ * number is GAPFUL (A073492): its factorization skips a prime, e.g. 10 = 2*5
+ * skips 3 and 84 = 2^2*3*7 skips 5.  A073490(m) counts the skipped places;
+ * A073490(110) = 2 because 110 = 2*5*11 skips 3 and 7.
  *
- * Methods
- * -------
- * scan N      Exhaustive.  Gapless numbers are sparse (about N/ln N primes
- *             plus O(sqrt N) composites), so instead of factoring every
- *             integer we generate them directly: primes with primesieve,
- *             composite gapless numbers by a recursive enumeration of
- *             consecutive-prime products.  Worker threads take chunks of
- *             [1, N] from an atomic counter, merge the two sorted streams and
- *             record every difference.  Every a(n) <= N is found exactly, and
- *             every n not found has a(n) > N.
+ * The problem is really about the gaps between consecutive gapless numbers:
  *
- * search n    Structural search for EVEN n (odd d = n+1).  The bounding
- *             gapless numbers L and L+d then have different parity, so exactly
- *             one of them is even, and an even gapless number is necessarily
- *             E = 2^e1 3^e2 ... p_k^ek (the first k primes, all exponents >= 1).
- *             There are only ~10^6 such E below 2^64 and ~10^9 below 2^127, so
- *             we enumerate them all, test E+d and E-d for gaplessness, and
- *             verify that the n numbers in between are gapful.  The search is
- *             exhaustive for L <= limit-d, so the smallest hit IS a(n).  All
- *             arithmetic is 128-bit, so the search can go far beyond 2^64.
+ *     If L < R are CONSECUTIVE gapless numbers, then L+1, ..., R-1 is a
+ *     maximal run of n = R-L-1 gapful numbers, and a(n) is L+1 for the
+ *     smallest such L with R - L = n + 1.
  *
- *             Odd primes shared by d and E constrain the odd partner O = E+-d:
- *             if p | E and p | d then p | O, and if p | E but p does not divide
- *             d then p does not divide O.  Since O's primes must be
- *             consecutive, the odd primes <= p_k dividing d must form a
- *             contiguous block of primes (otherwise no E with k primes can
- *             work: this bounds k by "kmax"), and O can be prime only when no
- *             odd prime <= p_k divides d.  For d = 33 = 3*11 this forces
- *             E = 2^a whenever O is prime, which is why a(32) is so large:
- *             only 36 powers of two lie below 10^11.  The same happens for
- *             every n == 2 (mod 6).
+ * Example: 83 and 89 are consecutive gapless numbers and 84..88 are gapful,
+ * so a(5) = 84.  Notation used throughout the code:
  *
- * Usage
- * -----
- *   a137723 scan N [-t T] [-m MAXN] [-o FILE]
- *   a137723 search n [n ...] [-l LIMIT] [-t T]      default LIMIT 2^64; above 2^127 uses GMP
- *   a137723 next [-N SCANLIMIT] [-l LIMIT] [-t T]   scan, then search missing even n
- *   a137723 check m                                  factor m, count its prime gaps
- *   a137723 run m                                    show the maximal run around m
- *   a137723 selftest [-t T]
+ *     d = n + 1     the distance R - L between the two bounding numbers
+ *     pair (L, R)   two consecutive gapless numbers, i.e. one maximal run
+ *     E, O          for even n: the even one and the odd one of L and R
+ *     k             the number of distinct primes of E
  *
- * Numbers may be written as decimal, 2^k, 10^k, 1e15, or 2^54-32.
+ * Two facts carry the correctness arguments below: every number strictly
+ * inside a run is gapful, and therefore two different runs never overlap.
  *
- * Build:  cc -O2 -std=gnu11 -pthread -I/opt/homebrew/include a137723.c \
- *            -L/opt/homebrew/lib -lprimesieve -o a137723
+ *
+ * 2. Method 1, `scan N`: exhaustive enumeration (every n)
+ * -------------------------------------------------------
+ * Instead of factoring every integer up to N, the scan generates the gapless
+ * numbers in increasing order from two sorted streams:
+ *
+ *   - the primes, from a primesieve iterator (one per thread);
+ *   - the composite gapless numbers (p^e with e >= 2, and products of two or
+ *     more consecutive primes).  Each has a prime factor <= sqrt(N), so there
+ *     are only O(sqrt N) of them, about 9*10^4 below 10^11.
+ *     gen_composite_gapless() enumerates them recursively and sorts them once.
+ *
+ * [1, N] is cut into chunks that the worker threads claim through an atomic
+ * counter.  A worker merges the two streams from the start of its chunk and,
+ * for every pair of consecutive gapless numbers (g, g2) with g inside the
+ * chunk, records g+1 as a start for the length n = g2-g-1 if it has none
+ * yet.  The pair that crosses the end of a chunk belongs to the chunk that
+ * contains g (the worker reads past the end until it has seen g2), so no pair
+ * is lost or counted twice.  The per-thread minima are merged at the end.
+ *
+ * Guarantee: every pair with g <= N is examined, so each reported a(n) is
+ * exact, and an n that is not reported has a(n) > N + 1.  The cost is
+ * essentially one prime sieve of [1, N]: 10^11 takes about 3 s on 10 cores.
+ * Odd n can only be found this way (both bounding numbers are odd; see 3).
+ *
+ *
+ * 3. Method 2, `search n`: structural search for even n (128-bit)
+ * ---------------------------------------------------------------
+ * PARITY LEMMA.  For even n the distance d = n+1 is odd, so exactly one of L
+ * and R is even.  An even gapless number contains the prime 2 and its primes
+ * are consecutive from 2 on, so it has the form
+ *
+ *         E = 2^e1 * 3^e2 * 5^e3 * ... * p_k^ek        (every e_i >= 1).
+ *
+ * These are very sparse: 2,537,666 of them lie below 2^64 and about
+ * 1.74*10^10 below 2^127.  run_search() enumerates every such E up to the
+ * limit (depth first over the exponents) and tests both possible partners
+ * O = E + d and O = E - d: O must be gapless and the d-1 numbers between E
+ * and O must all be gapful (interior_gapful()).  Each hit is a genuine pair.
+ *
+ * COVERAGE LEMMA.  (a) A pair with L <= limit - d has its even endpoint at or
+ * below the limit, so it is found.  (b) If any pair is found, the smallest one
+ * found, (Lf, Rf), gives a(n) exactly.  Lf is at most the limit, so an unfound
+ * pair (L', R') with L' < Lf must have its even endpoint above the limit: L'
+ * is odd and R' > limit >= Lf.  The gapless Lf would then lie strictly inside
+ * the run (L', R'), which is impossible.  (c) If no pair is found, then
+ * a(n) > limit - n.
+ *
+ * CONSTRAINT PROPAGATION.  Let p be an odd prime with p <= p_k, so that p | E.
+ * Then p | d implies p | O, and p not dividing d implies p does not divide O.
+ * The primes of O must be consecutive, so the odd primes <= p_k that divide d
+ * must form one block of consecutive primes.  Once E would contain a second,
+ * separate prime factor of d, no partner can be gapless; that caps the number
+ * of primes of E at kmax (compute_kmax()).  In the same way O can only be a
+ * large prime when no odd prime <= p_k divides d (compute_kprime(), reported
+ * for information).  Example: d = 33 = 3*11 gives kmax = 4, and a prime
+ * partner forces k = 1, i.e. E = 2^a.  This is why a(32) = 2^54 - 32 is so
+ * large, and why every a(n) with n == 2 (mod 6) found so far is next to a
+ * power of 2.
+ *
+ * The top three levels of the enumeration (2^a, 2^a*3^b, 2^a*3^b*5^c) form a
+ * task list consumed through an atomic counter; the workers recurse into
+ * 7, 11, ... themselves.
+ *
+ *
+ * 4. Method 3, `search n -l LIMIT` with LIMIT >= 2^127: GMP mode
+ * --------------------------------------------------------------
+ * Above 2^127 there are far too many even gapless numbers to visit (well over
+ * 10^40 below 2^1000), so the same theorem is applied more selectively.  Let
+ * p_j be the smallest odd prime dividing d, and {p_j, ..., p_m} the maximal
+ * block of consecutive primes from p_j on that all divide d (z_analyze()).
+ * For an even endpoint with k primes, the odd partner O = E +- d is:
+ *
+ *     k <  j        coprime to p_1..p_k, may be prime      -> enumerate E
+ *     j <= k <= m   divisible by p_j..p_k, may continue    -> enumerate E
+ *     k >  m        exactly a product over {p_j..p_m}      -> enumerate O
+ *
+ * In the last case p_j..p_m divide O because they divide both E and d, while
+ * p_(m+1) divides E but not d, so it cannot divide O, and the primes of O are
+ * consecutive.  Hence E is enumerated only for k <= m (the "E side": 2^a,
+ * 2^a*3^b, ...), and for k > m the program enumerates the products O over the
+ * block instead (the "O side") and tests E = O +- d.  The two sides are
+ * disjoint and together cover every pair whose even endpoint is at most the
+ * limit, so the coverage lemma of section 3 still applies.
+ *
+ * For d = 63 = 3^2*7 the whole search is 2^a +- 63, 2^a*3^b +- 63 and the
+ * powers of 3: about 3*10^5 candidates below 2^1000, under a second.  Before
+ * starting, the program prints an estimate of the work (simplex volumes,
+ * z_est_E() and z_est_S()) and refuses to run if it exceeds --max-nodes.
+ *
+ *
+ * 5. The gapless test: is_gapless() and z_is_gapfree()
+ * ----------------------------------------------------
+ *   (i)   Trial division by the 6542 primes below SMALL_LIMIT = 2^16.  Once the
+ *         smallest prime factor p is known, m is gapless iff dividing out p,
+ *         nextprime(p), nextprime(nextprime(p)), ... reaches 1 (chain_from()).
+ *         Nearly every candidate is decided here, most after a few divisions.
+ *   (ii)  No factor below 2^16: m is gapless if it is prime.
+ *   (iii) Composite with no factor below 2^16: suppose m is gapless with t
+ *         prime factors counted with multiplicity, p_1 <= ... <= p_s.  Then
+ *         p_1^t <= m <= p_s^t.  With c = floor(m^(1/t)), either m = c^t with c
+ *         prime, or p_1 <= c < p_s; then the primes in [p_1, c] are among
+ *         p_1..p_(s-1), so p_1 is one of the t-1 largest primes <= c.  Every
+ *         factor exceeds 2^16, so t < log2(m)/16 (at most 7 below 2^128).
+ *         root_method() tries those few candidates with chain_from(); no
+ *         general factoring is needed.
+ *
+ *
+ * 6. Primality and rigor
+ * ----------------------
+ * is_prime64() is deterministic: Miller-Rabin with bases 2, 7, 61 below
+ * 4759123141 and Sinclair's seven bases below 2^64.  Above 2^64,
+ * is_prime128() is a strong probable-prime test to the first 24 prime bases,
+ * and z_is_prime() is GMP's mpz_probab_prime_p() with 30 rounds (Baillie-PSW
+ * plus Miller-Rabin).  A "composite" verdict is always correct; a "prime"
+ * verdict above 2^64 is probabilistic.  The only step of a reported term above
+ * 2^64 that is not a proof is therefore the primality of its prime endpoint;
+ * certify those with a proving algorithm such as PARI/GP isprime() (see
+ * primes_to_certify.txt).  Everything else -- scan results, the completeness
+ * of the enumerations, the gaplessness of E, the gapfulness of the interior --
+ * is exact.
+ *
+ *
+ * 7. Factorization (for display and independent checks only)
+ * ----------------------------------------------------------
+ * `check`, `run` and verify_pair() use a separate full factorizer: trial
+ * division, perfect-power detection and Pollard-Brent rho.  rho64() always
+ * succeeds; rho128() has an iteration budget and may leave a cofactor
+ * unfactored (shown as [C...]).  verify_pair() re-checks the smallest pair of
+ * a 128-bit search without calling is_gapless() and reports OK, FAILED or
+ * INCOMPLETE.  GMP mode prints a verify_run.py command for that purpose.
+ *
+ *
+ * 8. Commands (see main())
+ * ------------------------
+ *   scan N [-t T] [-m MAXN] [-o FILE]   exhaustive scan of 1..N
+ *                                       (100 <= N <= 2^63)
+ *   search n.. [-l LIMIT] [-t T]        structural search, even n only.
+ *                                       LIMIT below 2^127: 128-bit mode
+ *                                       (default 2^64); LIMIT >= 2^127: GMP
+ *                                       mode.  --gmp forces GMP mode and
+ *                                       --max-nodes X caps its work.
+ *                                       Without GMP the 128-bit mode accepts
+ *                                       LIMIT up to 2^127.
+ *   next [-N SCAN] [-l LIMIT] [-t T] [-m MAXN] [-o FILE]
+ *                                       scan to SCAN (default 10^10), then a
+ *                                       128-bit search for every even n the
+ *                                       scan left unknown
+ *   check m                             factor m, count its prime gaps
+ *   run m                               print the maximal run of gapful
+ *                                       numbers around m
+ *   selftest [-t T]                     consistency tests, about half a second
+ *
+ * Numbers may be written in decimal, as B^E or MeE (1e15), and as sums and
+ * differences such as 2^54-32.  Results go to stdout and progress to stderr
+ * (a live \r line on a terminal, one line every 15 s otherwise).  Exit status:
+ * 0 on success, 1 on errors (die()), 2 on usage errors; selftest exits with 0
+ * or 1.
+ *
+ *
+ * 9. Threads, memory and errors
+ * -----------------------------
+ * Each search keeps its parameters in one global descriptor (SC, SQ or ZQ)
+ * that is written before the workers start and only read while they run.
+ * Work is handed out through an atomic counter, and each worker owns its
+ * result buffer (and, in GMP mode, its own mpz scratch space zws_t), so no
+ * locks are needed.  The small-prime tables are built once in main() and are
+ * read-only afterwards.  The search functions are therefore not reentrant:
+ * one search at a time.
+ *
+ * Fatal conditions (bad arguments, out of memory, thread creation or
+ * primesieve failure) call die(), which prints "a137723: <message>" and exits
+ * with status 1.  Limits: scan N <= 2^63 (the prime table up to 2*sqrt(N)
+ * takes 8 bytes per prime, about 2.3 GB at N = 2^63); n <= 100000; the 128-bit
+ * search limit is at most 2^127; run lengths below MAXRUN = 65536 (prime gaps
+ * below 2^64 are shorter than 1600).
+ *
+ *
+ * 10. Self-test (cmd_selftest())
+ * ------------------------------
+ *   [1] primality code against a sieve and known primes and pseudoprimes
+ *   [2] is_gapless() against brute-force factorization for every m <= 2*10^6
+ *   [3] the root method on products of consecutive primes near 2^32, 2^41
+ *       and 2^62, and the gap counts of fmt_factor()
+ *   [4] the threaded scan against a brute-force scan and the 31 OEIS terms
+ *   [5] the 128-bit search against the even OEIS terms, and compute_kmax()
+ *   [6] search against scan for every even run length below 10^7
+ *   [7] (GMP builds) the big-number gap test, and the GMP search against the
+ *       OEIS terms, against a(32) and against the scan
+ *
+ *
+ * 11. Source map (in file order)
+ * ------------------------------
+ *   generic helpers ........ now, die, xmalloc, u128_str, parse_u128
+ *   small primes ........... sp[], small_isp[], r64tab[], mod_small
+ *   modular arithmetic ..... mulmod/powmod, sprp, is_prime64/128, next/prev
+ *   integer roots .......... isqrt128, iroot128
+ *   gapless test ........... chain_from, root_method, is_gapless
+ *   full factorization ..... rho64, rho128, factor128, fmt_factor
+ *   scan ................... gen_composite_gapless, scan_worker, run_scan
+ *   search (128-bit) ....... compute_kmax, test_E, dfs, run_search,
+ *                            verify_pair, cmd_search
+ *   next, check, run ....... cmd_next, cmd_check, print_run, cmd_run
+ *   GMP mode ............... z_is_gapfree, z_test_E, z_test_O,
+ *                            run_search_gmp, parse_mpz, cmd_*_gmp
+ *   selftest, main
+ *
+ * Build:  make    (cc -O2 -std=gnu11 -pthread, links -lprimesieve; adds
+ *                  -DHAVE_GMP -lgmp when gmp.h is installed)
  */
 
+/*
+ * Standard C11 and POSIX headers (threads, atomics, sysconf/isatty/usleep,
+ * clock_gettime) and primesieve (https://github.com/kimwalisch/primesieve),
+ * which supplies the small-prime table and the fast prime iterators of the
+ * scan.  gmp.h is included further down, only when HAVE_GMP is defined.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -85,10 +275,27 @@
 #include <inttypes.h>
 #include <primesieve.h>
 
+/*
+ * Short names for the integer types used everywhere.  unsigned __int128 is a
+ * GCC/Clang extension; it carries the 128-bit search and the exact products
+ * in the 64-bit modular arithmetic.
+ */
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef unsigned __int128 u128;
 
+/*
+ * Compile-time limits (see also header section 9):
+ *   SMALL_LIMIT  trial-division bound.  The 6542 primes below 2^16 are
+ *                tabulated, and a number with none of them as a factor has
+ *                all its prime factors >= 65537.
+ *   MAXRUN       size of the per-length result tables; longer runs would be
+ *                clamped.
+ *   NKNOWN       number of terms built into KNOWN[].
+ *   MAXPE        capacity of a factorization record.
+ * stderr_tty is set by main(): progress lines are repainted with \r only on a
+ * terminal.
+ */
 #define SMALL_LIMIT 65536u   /* trial-division bound (table of primes below it) */
 #define MAXRUN      65536    /* longest run we can record; prime gaps < 2^64 are < 1600 */
 #define NKNOWN      31
@@ -96,6 +303,12 @@ typedef unsigned __int128 u128;
 
 static bool stderr_tty;   /* live \r progress only on a terminal */
 
+/*
+ * KNOWN[1..31]: the terms of the OEIS entry as it stood before this program
+ * extended it (KNOWN[0] is unused).  The self-test checks the scan and both
+ * searches against them, and the tables mark agreement with "ok (OEIS)".  The
+ * later terms (several do not fit in 64 bits) are in b137723.txt.
+ */
 static const u64 KNOWN[NKNOWN + 1] = { 0,
     10, 33, 20, 55, 84, 114, 390, 513, 182, 200, 468, 2941, 774, 65522, 1832,
     1261, 1130, 1332, 1638, 524289, 1952, 4298, 4524, 69960, 5120, 16385, 2972,
@@ -104,7 +317,20 @@ static const u64 KNOWN[NKNOWN + 1] = { 0,
 /* ------------------------------------------------------------------ */
 /* Generic helpers                                                     */
 /* ------------------------------------------------------------------ */
+/*
+ * Timing, fatal errors, checked allocation, 128-bit decimal output and the
+ * parser for numeric command-line arguments.
+ */
 
+/*
+ * now - monotonic time in seconds.
+ *
+ * Function: reads CLOCK_MONOTONIC; used only for elapsed-time reports.
+ * Inputs:   none.
+ * Outputs:  seconds since an arbitrary fixed origin.
+ * Errors:   none (the clock_gettime() result is not checked; it cannot fail
+ *           for CLOCK_MONOTONIC on supported systems).
+ */
 static double now(void)
 {
     struct timespec ts;
@@ -112,6 +338,17 @@ static double now(void)
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/*
+ * die - report a fatal error and exit.
+ *
+ * Function: prints "a137723: <message>" and a newline to stderr, then exits
+ *           with status 1.  Every unrecoverable condition ends here.
+ * Inputs:   a printf-style format string and its arguments.
+ * Outputs:  never returns.  exit() flushes stdout, so results printed before
+ *           the error are kept.
+ * Errors:   none.  Called from a worker thread it ends the whole process,
+ *           which is the intended behaviour.
+ */
 static void die(const char *fmt, ...)
 {
     va_list ap;
@@ -123,6 +360,16 @@ static void die(const char *fmt, ...)
     exit(1);
 }
 
+/*
+ * xmalloc - malloc() that never returns NULL.
+ *
+ * Function: allocates n bytes, or 1 byte when n is 0, so the result is always
+ *           a valid pointer that can be passed to free().
+ * Inputs:   n, the size in bytes.
+ * Outputs:  a pointer to uninitialized memory; the caller frees it.
+ * Errors:   allocation failure -> die("out of memory").  A size computed as
+ *           count * size must not overflow (the caller's responsibility).
+ */
 static void *xmalloc(size_t n)
 {
     void *p = malloc(n ? n : 1);
@@ -130,6 +377,15 @@ static void *xmalloc(size_t n)
     return p;
 }
 
+/*
+ * xcalloc - calloc() that never returns NULL.
+ *
+ * Function: allocates n zero-filled elements of sz bytes (at least one).
+ * Inputs:   n, the number of elements; sz, the element size.
+ * Outputs:  a pointer to zeroed memory; the caller frees it.
+ * Errors:   allocation failure -> die("out of memory").  calloc() itself
+ *           rejects an n * sz that overflows.
+ */
 static void *xcalloc(size_t n, size_t sz)
 {
     void *p = calloc(n ? n : 1, sz);
@@ -137,7 +393,18 @@ static void *xcalloc(size_t n, size_t sz)
     return p;
 }
 
-/* decimal string of a 128-bit value; buf must hold >= 40 chars */
+/*
+ * u128_str - decimal text of a 128-bit unsigned value.
+ *
+ * Function: converts v to decimal digits; printf() has no conversion for
+ *           unsigned __int128.
+ * Inputs:   v; buf, which must hold at least 40 bytes (2^128 - 1 has 39
+ *           digits, plus the terminating NUL).
+ * Outputs:  buf, NUL-terminated.  The same pointer is returned, so the call
+ *           can be used directly as a printf() argument (with a separate
+ *           buffer for every value printed by one call).
+ * Errors:   none; a buffer shorter than 40 bytes is a caller bug.
+ */
 static char *u128_str(u128 v, char *buf)
 {
     char tmp[48];
@@ -149,6 +416,16 @@ static char *u128_str(u128 v, char *buf)
     return buf;
 }
 
+/*
+ * bitlen128 - number of significant bits of v.
+ *
+ * Function: floor(log2(v)) + 1, from count-leading-zeros on the two 64-bit
+ *           halves.
+ * Inputs:   v.
+ * Outputs:  0 for v = 0, otherwise 1..128.
+ * Errors:   none; v = 0 is handled separately because __builtin_clzll(0) is
+ *           undefined.
+ */
 static int bitlen128(u128 v)
 {
     u64 hi = (u64)(v >> 64), lo = (u64)v;
@@ -156,6 +433,16 @@ static int bitlen128(u128 v)
     return lo ? 64 - __builtin_clzll(lo) : 0;
 }
 
+/*
+ * parse_dec - parse exactly len decimal digits into a 128-bit value.
+ *
+ * Function: r = 10*r + digit for each character, checking for overflow
+ *           before every step.
+ * Inputs:   s (need not be NUL-terminated); len; out.
+ * Outputs:  true with *out set, or false with *out unchanged.
+ * Errors:   false for len = 0, for any character other than '0'..'9' (signs
+ *           and spaces included) and for values of 2^128 or more.
+ */
 static bool parse_dec(const char *s, size_t len, u128 *out)
 {
     u128 r = 0;
@@ -170,11 +457,28 @@ static bool parse_dec(const char *s, size_t len, u128 *out)
     return true;
 }
 
-/* accepts "123", "2^64", "10^12", "1e15", and X+Y / X-Y of those ("2^54-32") */
+/*
+ * parse_u128 - parse a numeric command-line argument into 128 bits.
+ *
+ * Function: accepts
+ *             decimal              "123456"
+ *             power B^E            "2^64", "10^12"      (E <= 400)
+ *             scientific MeE       "1e15", "3E9"        (decimal M, E <= 40)
+ *             sums, differences    "2^54-32", "10^12+39", "2^64-2^32+1"
+ *           An expression is split at its LAST '+' or '-' and both sides are
+ *           parsed recursively, so the operators associate to the left.
+ * Inputs:   s, a NUL-terminated string; out.
+ * Outputs:  true with *out set, or false (*out unspecified).
+ * Errors:   false for empty or malformed text, a leading sign, results of
+ *           2^128 or more, negative differences, and a left operand longer
+ *           than 127 characters.
+ */
 static bool parse_u128(const char *s, u128 *out)
 {
-    const char *pm = strpbrk(s, "+-");
-    if (pm && pm != s) {
+    const char *pm = NULL;                       /* the LAST '+' or '-', not at s[0] */
+    for (const char *c = s; *c; c++)
+        if ((*c == '+' || *c == '-') && c != s) pm = c;
+    if (pm) {
         char head[128];
         size_t hl = (size_t)(pm - s);
         u128 a, b;
@@ -213,6 +517,14 @@ static bool parse_u128(const char *s, u128 *out)
     return parse_dec(s, strlen(s), out);
 }
 
+/*
+ * arg_u128 - parse a numeric command-line argument or exit.
+ *
+ * Function: parse_u128() with a fatal error instead of a return code.
+ * Inputs:   s, the argument text; what, its name for the error message.
+ * Outputs:  the value.
+ * Errors:   malformed or out-of-range input -> die("bad <what>: '<s>'").
+ */
 static u128 arg_u128(const char *s, const char *what)
 {
     u128 v;
@@ -220,6 +532,14 @@ static u128 arg_u128(const char *s, const char *what)
     return v;
 }
 
+/*
+ * arg_u64 - parse a numeric argument that must fit in 64 bits, or exit.
+ *
+ * Function: arg_u128() plus a range check.
+ * Inputs:   s; what, its name for the error message.
+ * Outputs:  the value.
+ * Errors:   malformed input or a value of 2^64 or more -> die().
+ */
 static u64 arg_u64(const char *s, const char *what)
 {
     u128 v = arg_u128(s, what);
@@ -227,6 +547,15 @@ static u64 arg_u64(const char *s, const char *what)
     return (u64)v;
 }
 
+/*
+ * cmp_u64 - qsort() comparator for u64 values in increasing order.
+ *
+ * Function: compares with two comparisons (a subtraction could overflow the
+ *           int result).
+ * Inputs:   pointers to two u64.
+ * Outputs:  -1, 0 or 1.
+ * Errors:   none.
+ */
 static int cmp_u64(const void *a, const void *b)
 {
     u64 x = *(const u64 *)a, y = *(const u64 *)b;
@@ -236,12 +565,36 @@ static int cmp_u64(const void *a, const void *b)
 /* ------------------------------------------------------------------ */
 /* Small primes (below SMALL_LIMIT)                                    */
 /* ------------------------------------------------------------------ */
+/*
+ * The 6542 primes below 2^16 drive trial division everywhere, and their
+ * indices give the p_k notation of the header (p_k = sp[k-1]).
+ */
 
+/*
+ * Tables built once by init_small_primes() and read-only afterwards, so every
+ * thread may use them without locking:
+ *   sp[0..nsp-1]  the nsp = 6542 primes below 2^16 (sp[0] = 2, sp[k-1] = p_k,
+ *                 sp[nsp-1] = 65521)
+ *   small_isp[x]  1 iff x is prime, for 0 <= x < 2^16
+ *   r64tab[i]     2^64 mod sp[i], used by mod_small() to reduce 128-bit values
+ */
 static u32     *sp;          /* primes < SMALL_LIMIT                       */
 static size_t   nsp;
 static uint8_t *small_isp;   /* small_isp[x] = 1 iff x is prime, x < 65536 */
 static u32     *r64tab;      /* r64tab[i] = 2^64 mod sp[i]                 */
 
+/*
+ * init_small_primes - build the small-prime tables sp[], nsp, small_isp[] and
+ *                     r64tab[].
+ *
+ * Function: asks primesieve for every prime below 2^16 (as 32-bit values),
+ *           marks them in small_isp[] and precomputes 2^64 mod p for each.
+ * Inputs:   none.  Must run once, before anything else uses the tables;
+ *           main() calls it first.
+ * Outputs:  the global tables.  They live for the whole run and are never
+ *           freed.
+ * Errors:   primesieve failure -> die(); out of memory -> die().
+ */
 static void init_small_primes(void)
 {
     size_t n = 0;
@@ -257,7 +610,18 @@ static void init_small_primes(void)
     }
 }
 
-/* m mod sp[i], using only 64-bit divisions */
+/*
+ * mod_small - m mod sp[i], using only 64-bit divisions.
+ *
+ * Function: below 2^64 a single 64-bit remainder.  Otherwise, writing
+ *           m = hi*2^64 + lo:  m mod p = ((hi mod p)*(2^64 mod p) + lo mod p)
+ *           mod p, with 2^64 mod p from r64tab[].  This avoids the slow
+ *           software 128-bit division.
+ * Inputs:   m; i, an index into sp[] (0 <= i < nsp).
+ * Outputs:  m mod sp[i].
+ * Errors:   none; every intermediate value stays below 2^33.  An out-of-range
+ *           i is a caller bug.
+ */
 static inline u32 mod_small(u128 m, size_t i)
 {
     u32 p = sp[i];
@@ -269,13 +633,36 @@ static inline u32 mod_small(u128 m, size_t i)
 /* ------------------------------------------------------------------ */
 /* Modular arithmetic and primality                                    */
 /* ------------------------------------------------------------------ */
+/*
+ * Two layers: 64-bit arithmetic (exact products through unsigned __int128)
+ * for moduli below 2^64, and a slower shift-and-add 128-bit layer that is
+ * only needed for the rare 128-bit candidates without small factors.  All
+ * functions are pure and thread-safe.
+ */
 
+/*
+ * mulmod64 - (a * b) mod m for 64-bit operands.
+ *
+ * Function: a plain 64-bit product when both factors are below 2^32,
+ *           otherwise the exact 128-bit product, followed by one remainder.
+ * Inputs:   a, b (need not be reduced); m >= 1.
+ * Outputs:  a*b mod m.
+ * Errors:   m = 0 would divide by zero; no caller passes it.
+ */
 static inline u64 mulmod64(u64 a, u64 b, u64 m)
 {
     if ((a | b) < ((u64)1 << 32)) return (a * b) % m;
     return (u64)(((u128)a * b) % m);
 }
 
+/*
+ * powmod64 - a^e mod m by square-and-multiply.
+ *
+ * Function: scans the bits of e from the lowest, squaring a at every step.
+ * Inputs:   a (any); e; m >= 1.
+ * Outputs:  a^e mod m.  (For e = 0 the result is 1, even when m = 1.)
+ * Errors:   m = 0 would divide by zero; no caller passes it.
+ */
 static u64 powmod64(u64 a, u64 e, u64 m)
 {
     u64 r = 1;
@@ -288,7 +675,19 @@ static u64 powmod64(u64 a, u64 e, u64 m)
     return r;
 }
 
-/* strong probable prime test, n odd > 2 */
+/*
+ * sprp64 - strong probable-prime (Miller-Rabin) test of n to base a.
+ *
+ * Function: writes n - 1 = d*2^s with d odd and accepts n if a^d = 1, or
+ *           a^(d*2^r) = n - 1 for some 0 <= r < s (all mod n).
+ * Inputs:   n odd, n > 2; a, any base.  The base is reduced mod n, and a base
+ *           that is a multiple of n counts as a pass, as Sinclair's base set
+ *           requires.
+ * Outputs:  false: n is certainly composite.  true: n is a strong probable
+ *           prime to base a.
+ * Errors:   n = 1 would loop forever (d = 0 never becomes odd); is_prime64()
+ *           only calls it for n > 1681.
+ */
 static bool sprp64(u64 n, u64 a)
 {
     a %= n;
@@ -306,7 +705,17 @@ static bool sprp64(u64 n, u64 a)
     return false;
 }
 
-/* deterministic for all n < 2^64 */
+/*
+ * is_prime64 - deterministic primality test for 64-bit numbers.
+ *
+ * Function: trial division by the primes up to 37 (which settles every
+ *           n < 41^2), then Miller-Rabin: bases 2, 7 and 61 for n < 4759123141
+ *           (Jaeschke), otherwise Sinclair's seven bases, which no composite
+ *           below 2^64 passes.
+ * Inputs:   any n.
+ * Outputs:  true iff n is prime (0 and 1 are not prime).
+ * Errors:   none; the answer is exact for every 64-bit input.
+ */
 static bool is_prime64(u64 n)
 {
     static const u32 tiny[] = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37 };
@@ -315,15 +724,28 @@ static bool is_prime64(u64 n)
     if (n < 2) return false;
     for (int i = 0; i < 12; i++)
         if (n % tiny[i] == 0) return n == tiny[i];
+    /* no factor up to 37, so every n below 41^2 = 1681 is prime */
     if (n < 41u * 41u) return true;
+    /* bases 2, 7 and 61 are a proof below 4759123141 (Jaeschke) */
     if (n < 4759123141ULL) {
         for (int i = 0; i < 3; i++) if (!sprp64(n, b3[i])) return false;
         return true;
     }
+    /* Sinclair's bases: no composite below 2^64 passes all seven */
     for (int i = 0; i < 7; i++) if (!sprp64(n, b7[i])) return false;
     return true;
 }
 
+/*
+ * addmod128 - (a + b) mod m for reduced 128-bit operands.
+ *
+ * Function: adds, then subtracts m once if the sum reached m.  When m > 2^127
+ *           the sum can carry out of 128 bits; that shows as s < a, and the
+ *           wrapped subtraction then still gives the right residue.
+ * Inputs:   a < m, b < m.
+ * Outputs:  (a + b) mod m.
+ * Errors:   unreduced inputs give a wrong result (caller contract).
+ */
 static inline u128 addmod128(u128 a, u128 b, u128 m)   /* a, b < m */
 {
     u128 s = a + b;
@@ -331,6 +753,17 @@ static inline u128 addmod128(u128 a, u128 b, u128 m)   /* a, b < m */
     return s;
 }
 
+/*
+ * mulmod128 - (a * b) mod m for 128-bit operands.
+ *
+ * Function: delegates to mulmod64() when m < 2^64.  Otherwise double-and-add
+ *           over the bits of the smaller factor, i.e. up to 128 modular
+ *           additions.  Slow, but only used for the few 128-bit candidates
+ *           that survive trial division.
+ * Inputs:   a, b (any); m >= 1.
+ * Outputs:  a*b mod m.
+ * Errors:   m = 0 would divide by zero; no caller passes it.
+ */
 static u128 mulmod128(u128 a, u128 b, u128 m)
 {
     if (m <= UINT64_MAX) return mulmod64((u64)(a % m), (u64)(b % m), (u64)m);
@@ -346,6 +779,14 @@ static u128 mulmod128(u128 a, u128 b, u128 m)
     return r;
 }
 
+/*
+ * powmod128 - a^e mod m for 128-bit operands.
+ *
+ * Function: square-and-multiply with mulmod128().
+ * Inputs:   a, e (any); m >= 1.
+ * Outputs:  a^e mod m.
+ * Errors:   m = 0 would divide by zero; no caller passes it.
+ */
 static u128 powmod128(u128 a, u128 e, u128 m)
 {
     u128 r = 1;
@@ -358,6 +799,16 @@ static u128 powmod128(u128 a, u128 e, u128 m)
     return r;
 }
 
+/*
+ * sprp128 - strong probable-prime test of n to base a (128-bit sprp64()).
+ *
+ * Function: n - 1 = d*2^s with d odd; accept if a^d = 1 or a^(d*2^r) = n - 1
+ *           (mod n) for some 0 <= r < s.
+ * Inputs:   n odd, n > 2; a, any base (reduced mod n; a multiple of n passes).
+ * Outputs:  false: certainly composite.  true: strong probable prime to a.
+ * Errors:   n = 1 would loop forever; is_prime128() only calls it for
+ *           n > 2^64.
+ */
 static bool sprp128(u128 n, u128 a)
 {
     a %= n;
@@ -375,8 +826,20 @@ static bool sprp128(u128 n, u128 a)
     return false;
 }
 
-/* deterministic below 2^64; above, strong probable prime to the first 24
- * prime bases (a composite passes with probability far below 4^-24)       */
+/*
+ * is_prime128 - primality test for 128-bit numbers.
+ *
+ * Function: below 2^64 is_prime64() (exact).  Above, trial division by the
+ *           primes below 2000, then strong probable-prime tests to the first
+ *           24 prime bases (2 .. 89).
+ * Inputs:   any n.
+ * Outputs:  true iff n is prime, exactly below 2^64; above 2^64 true means
+ *           "strong probable prime to 24 bases".
+ * Errors:   above 2^64 a composite could in principle pass.  None can below
+ *           3.3*10^24, where the first 13 prime bases are already a proof, and
+ *           none is known above; reported primes are certified externally
+ *           anyway (header section 6).
+ */
 static bool is_prime128(u128 n)
 {
     if (n <= UINT64_MAX) return is_prime64((u64)n);
@@ -387,7 +850,16 @@ static bool is_prime128(u128 n)
     return true;
 }
 
-/* smallest prime > x */
+/*
+ * next_prime128 - smallest prime > x.
+ *
+ * Function: a lookup in small_isp[] for x < 65521, otherwise odd candidates
+ *           tested with is_prime128().
+ * Inputs:   x below 2^128 - 159 (the largest prime below 2^128).
+ * Outputs:  the next prime (a probable prime above 2^64).
+ * Errors:   from x >= 2^128 - 159 on the candidates would wrap around 2^128
+ *           and the result would be meaningless; no caller comes near that.
+ */
 static u128 next_prime128(u128 x)
 {
     if (x < 65521) {                 /* 65521 is the largest prime < 2^16 */
@@ -401,7 +873,14 @@ static u128 next_prime128(u128 x)
     return c;
 }
 
-/* largest prime < x, 0 if none */
+/*
+ * prev_prime128 - largest prime < x.
+ *
+ * Function: odd candidates below x tested with is_prime128().
+ * Inputs:   any x.
+ * Outputs:  the previous prime, or 0 when x <= 2 (there is none).
+ * Errors:   none.
+ */
 static u128 prev_prime128(u128 x)
 {
     if (x <= 2) return 0;
@@ -415,7 +894,21 @@ static u128 prev_prime128(u128 x)
 /* ------------------------------------------------------------------ */
 /* Integer roots                                                       */
 /* ------------------------------------------------------------------ */
+/*
+ * Exact integer square and t-th roots for the root method (header section 5)
+ * and for perfect-power detection in the factorizer.
+ */
 
+/*
+ * isqrt128 - floor(sqrt(n)) for a 128-bit n.
+ *
+ * Function: Newton's iteration x <- (x + n/x)/2 from a power of two that is at
+ *           least sqrt(n).  The values decrease until they reach
+ *           floor(sqrt(n)), and the first step that does not decrease ends it.
+ * Inputs:   n.
+ * Outputs:  floor(sqrt(n)); n itself for n < 2.
+ * Errors:   none; x never exceeds 2^64, so x + n/x cannot overflow.
+ */
 static u128 isqrt128(u128 n)
 {
     if (n < 2) return n;
@@ -427,6 +920,16 @@ static u128 isqrt128(u128 n)
     }
 }
 
+/*
+ * pow_le - is x^t <= n?  Overflow-safe.
+ *
+ * Function: builds r = x^i one factor at a time and stops as soon as the next
+ *           product would exceed n (tested as r > n/x), so no intermediate
+ *           value can overflow.
+ * Inputs:   x; t >= 0; n.
+ * Outputs:  true iff x^t <= n.
+ * Errors:   none.
+ */
 static bool pow_le(u128 x, int t, u128 n)   /* x^t <= n, overflow-safe */
 {
     u128 r = 1;
@@ -437,6 +940,14 @@ static bool pow_le(u128 x, int t, u128 n)   /* x^t <= n, overflow-safe */
     return r <= n;
 }
 
+/*
+ * pow_eq - is x^t == n?  Overflow-safe, like pow_le().
+ *
+ * Function: the loop of pow_le() with an equality test at the end.
+ * Inputs:   x; t >= 0; n.
+ * Outputs:  true iff x^t == n.
+ * Errors:   none.
+ */
 static bool pow_eq(u128 x, int t, u128 n)
 {
     u128 r = 1;
@@ -447,6 +958,15 @@ static bool pow_eq(u128 x, int t, u128 n)
     return r == n;
 }
 
+/*
+ * iroot128 - floor(n^(1/t)) for a 128-bit n.
+ *
+ * Function: t = 2 uses isqrt128().  Otherwise a binary search between 1 and
+ *           2^ceil(bits/t) that keeps lo^t <= n < hi^t.
+ * Inputs:   n; t.
+ * Outputs:  the integer t-th root; n itself when t <= 1 or n < 2.
+ * Errors:   none.
+ */
 static u128 iroot128(u128 n, int t)         /* floor(n^(1/t)) */
 {
     if (t <= 1 || n < 2) return n;
@@ -463,18 +983,50 @@ static u128 iroot128(u128 n, int t)         /* floor(n^(1/t)) */
 /* ------------------------------------------------------------------ */
 /* Gapless test (A073490(m) == 0 ?)                                    */
 /* ------------------------------------------------------------------ */
+/*
+ * The core predicate of the program, used by every method (header section 5).
+ * The GMP version is z_is_gapfree(), in the GMP section.
+ */
 
+/*
+ * pe_t: one prime power p^e of a factorization.
+ * gl_t: the result of the gapless test: the verdict and, for a gapless number,
+ *       its factorization f[0..nf-1] in increasing order of the primes.
+ *       MAXPE = 48 entries are plenty: a number below 2^128 has at most 26
+ *       distinct primes (2*3*5*...*101 < 2^128 < 2*3*5*...*103).
+ */
 typedef struct { u128 p; int e; } pe_t;
 typedef struct { pe_t f[MAXPE]; int nf; bool gapless; } gl_t;
 
+/*
+ * gl_push - append p^e to the factorization in g.
+ *
+ * Function: stores (p, e) at g->f[g->nf] and increments nf.
+ * Inputs:   g; a prime p; an exponent e >= 1.
+ * Outputs:  g updated.
+ * Errors:   past MAXPE entries the factor is dropped but still counted in nf;
+ *           impossible below 2^128 (see gl_t).
+ */
 static void gl_push(gl_t *g, u128 p, int e)
 {
     if (g->nf < MAXPE) { g->f[g->nf].p = p; g->f[g->nf].e = e; }
     g->nf++;
 }
 
-/* Try to write r as p^e * nextprime(p)^f * ... , a complete factorization
- * into consecutive primes starting at p.  On success fills g.            */
+/*
+ * chain_from - is r exactly p^e1 * nextprime(p)^e2 * nextprime(...)^e3 * ...?
+ *
+ * Function: divides out p completely, then the next prime, and so on.  It
+ *           succeeds when the quotient reaches 1 and fails as soon as the
+ *           current prime does not divide.  Called with p = the smallest prime
+ *           factor of r, it decides whether r is gapless.
+ * Inputs:   r >= 1; a prime p; g for the result.
+ * Outputs:  true with *g = the factorization (g->gapless = true), or false
+ *           with *g unchanged.
+ * Errors:   none.  Cost: one division per prime power plus one next_prime128()
+ *           per distinct prime (a table lookup below 2^16, a primality test
+ *           above).
+ */
 static bool chain_from(u128 r, u128 p, gl_t *g)
 {
     gl_t t;
@@ -493,10 +1045,22 @@ static bool chain_from(u128 r, u128 p, gl_t *g)
     return true;
 }
 
-/* r is composite and has no prime factor <= SMALL_LIMIT.  If r is gapless it
- * is p1^e1 ... ps^es with consecutive primes, t = sum(e) total factors,
- * p1 < r^(1/t) < ps, so p1 is one of the (t-1) largest primes below r^(1/t)
- * (or r = p^t).  Since every prime factor exceeds SMALL_LIMIT, r > SMALL_LIMIT^t. */
+/*
+ * root_method - gapless test for a composite r without prime factors below
+ *               2^16 (step (iii) of header section 5).
+ *
+ * Function: for t = 2, 3, ... while c = floor(r^(1/t)) > 2^16 (every factor
+ *           exceeds 2^16, so r has fewer than log2(r)/16 of them): if r = c^t
+ *           with c prime, r is gapless.  Otherwise, were r gapless with t
+ *           factors, its smallest prime would be one of the t-1 largest primes
+ *           <= c; each of those is tried with chain_from().
+ * Inputs:   r, composite, with no prime factor below SMALL_LIMIT (so
+ *           r > 2^32); g.
+ * Outputs:  true with *g filled if r is gapless; false (g->gapless = false)
+ *           otherwise.
+ * Errors:   none.  t never exceeds 7 below 2^128 (the loop bound 8 is a
+ *           margin).  Primality above 2^64 is probabilistic (is_prime128()).
+ */
 static bool root_method(u128 r, gl_t *g)
 {
     for (int t = 2; t <= 8; t++) {
@@ -509,18 +1073,34 @@ static bool root_method(u128 r, gl_t *g)
             g->gapless = true;
             return true;
         }
+        /* q = the largest prime <= c (below c when c^t = r with c composite) */
         u128 q = exact ? prev_prime128(c) : (is_prime128(c) ? c : prev_prime128(c));
         for (int j = 0; j < t - 1 && q > SMALL_LIMIT; j++) {
             if (chain_from(r, q, g)) return true;
-            q = prev_prime128(q);
+            if (j + 1 < t - 1) q = prev_prime128(q);       /* only when another candidate follows */
         }
     }
     g->gapless = false;
     return false;
 }
 
-/* true iff m has no prime gap in its factorization (m is in A073491).
- * If g is given and m is gapless, g receives the full factorization.   */
+/*
+ * is_gapless - is A073490(m) = 0, i.e. are the distinct primes of m
+ *              consecutive?  The hot path of every search.
+ *
+ * Function: (i) trial division by the primes below 2^16 until the smallest
+ *           prime factor p appears, then chain_from(m, p).  Below 2^64 the
+ *           loop also stops once p^2 > m, which proves m prime.  (ii) No
+ *           factor below 2^16: m is gapless if it is prime.  (iii) Otherwise
+ *           root_method().  See header section 5.
+ * Inputs:   any m; g, optional (NULL when only the verdict is needed).
+ * Outputs:  true iff m is gapless (1 is gapless, 0 is not).  If g is given it
+ *           receives the verdict and, for a gapless m, the factorization (one
+ *           entry m^1 for a prime m).
+ * Errors:   none.  Exact below 2^64; above, the primality steps use
+ *           is_prime128(), whose "prime" verdict is probabilistic.
+ *           Thread-safe: it only reads the global tables.
+ */
 static bool is_gapless(u128 m, gl_t *g)
 {
     gl_t tmp;
@@ -556,9 +1136,29 @@ static bool is_gapless(u128 m, gl_t *g)
 /* ------------------------------------------------------------------ */
 /* Full factorization (for display; Pollard-Brent rho)                 */
 /* ------------------------------------------------------------------ */
+/*
+ * Only for output (`check`, `run`, the run tables) and for verify_pair().  The
+ * searches never factor anything completely: is_gapless() decides
+ * gaplessness without it.
+ */
 
+/*
+ * fac_t: a factorization for display, possibly partial.  f[0..nf-1] are the
+ * primes found (sorted by factor128_ex()), and unf^unf_e is a composite
+ * cofactor that could not be split (unf = 0 when the factorization is
+ * complete).
+ */
 typedef struct { pe_t f[MAXPE]; int nf; u128 unf; int unf_e; } fac_t;
 
+/*
+ * fac_add - add p^e to a factorization, merging with an existing entry for p.
+ *
+ * Function: a linear search for p; increments its exponent or appends it.
+ * Inputs:   F; a prime p; e >= 1.
+ * Outputs:  F updated.
+ * Errors:   more than MAXPE distinct primes cannot occur below 2^128; extra
+ *           primes would be dropped silently.
+ */
 static void fac_add(fac_t *F, u128 p, int e)
 {
     for (int i = 0; i < F->nf; i++)
@@ -566,18 +1166,42 @@ static void fac_add(fac_t *F, u128 p, int e)
     if (F->nf < MAXPE) { F->f[F->nf].p = p; F->f[F->nf].e = e; F->nf++; }
 }
 
+/*
+ * gcd64 - greatest common divisor of two 64-bit numbers (Euclid).
+ *
+ * Function: repeated remainders.
+ * Inputs:   a, b.
+ * Outputs:  gcd(a, b); gcd(a, 0) = a.
+ * Errors:   none.
+ */
 static u64 gcd64(u64 a, u64 b)
 {
     while (b) { u64 t = a % b; a = b; b = t; }
     return a;
 }
 
+/*
+ * gcd128 - greatest common divisor of two 128-bit numbers (Euclid).
+ *
+ * Function: repeated remainders.
+ * Inputs:   a, b.
+ * Outputs:  gcd(a, b); gcd(a, 0) = a.
+ * Errors:   none.
+ */
 static u128 gcd128(u128 a, u128 b)
 {
     while (b) { u128 t = a % b; a = b; b = t; }
     return a;
 }
 
+/*
+ * addc64 - (x + c) mod n for x, c < n, safe against a carry out of 64 bits.
+ *
+ * Function: adds, and subtracts n if the sum carried or reached n.
+ * Inputs:   x < n; c < n.
+ * Outputs:  (x + c) mod n.
+ * Errors:   unreduced inputs give a wrong result (caller contract).
+ */
 static inline u64 addc64(u64 x, u64 c, u64 n)   /* (x + c) mod n, x < n, c < n */
 {
     u64 s = x + c;
@@ -585,7 +1209,21 @@ static inline u64 addc64(u64 x, u64 c, u64 n)   /* (x + c) mod n, x < n, c < n *
     return s;
 }
 
-/* nontrivial factor of odd composite n (not a prime power) */
+/*
+ * rho64 - a nontrivial factor of a 64-bit composite (Pollard-Brent rho).
+ *
+ * Function: iterates y <- y^2 + c mod n with Brent's cycle detection,
+ *           multiplying the differences |x - y| into q and taking one gcd per
+ *           batch of up to 128 steps.  If a batch overshoots (gcd = n) it
+ *           backtracks one step at a time from ys; if the sequence still only
+ *           yields n, the next constant c is tried.
+ * Inputs:   n, composite and not a perfect power (factor_rec() removes those
+ *           first).
+ * Outputs:  a divisor g with 1 < g < n (2 for even n).
+ * Errors:   none for valid input; the expected work is about n^(1/4) steps.
+ *           For a prime n or n = 1 it would loop forever, which the callers
+ *           rule out.
+ */
 static u64 rho64(u64 n)
 {
     if (n % 2 == 0) return 2;
@@ -597,6 +1235,7 @@ static u64 rho64(u64 n)
             u64 k = 0;
             do {
                 ys = y;
+                /* up to 128 steps share one gcd */
                 u64 lim = (r - k < 128) ? r - k : 128;
                 for (u64 i = 0; i < lim; i++) {
                     y = addc64(mulmod64(y, y, n), c, n);
@@ -617,7 +1256,19 @@ static u64 rho64(u64 n)
     }
 }
 
-/* 128-bit variant with an iteration budget; returns 0 on failure */
+/*
+ * rho128 - Pollard-Brent rho for a 128-bit n, with an iteration budget.
+ *
+ * Function: the algorithm of rho64() with mulmod128() arithmetic.  Only the
+ *           batched steps count against the budget; the steps that advance y
+ *           before each batch do not, so the work can be about twice the
+ *           budget.
+ * Inputs:   n, composite and not a perfect power; budget (factor_rec() uses
+ *           2^22).
+ * Outputs:  a nontrivial divisor, or 0 if the budget runs out (typical when
+ *           the smallest prime factor of n exceeds about 2^44).
+ * Errors:   none; 0 is the failure value.
+ */
 static u128 rho128(u128 n, u64 budget)
 {
     if (n % 2 == 0) return 2;
@@ -653,7 +1304,22 @@ static u128 rho128(u128 n, u64 budget)
     return 0;
 }
 
-/* heavy: also try (slow) 128-bit Pollard rho on cofactors above 2^64 */
+/*
+ * factor_rec - split n into primes, recording each with multiplicity mult.
+ *
+ * Function: n prime: record it.  n = c^t, a perfect power: recurse on c with
+ *           multiplicity mult*t (rho does not split prime powers reliably).
+ *           Otherwise split n with rho64() (below 2^64) or, if heavy, with
+ *           rho128(), and recurse on both parts.
+ * Inputs:   n >= 1; F, the factorization being built; mult >= 1; heavy:
+ *           whether to try the slow 128-bit rho.
+ * Outputs:  primes added to F.  A part that cannot be split is stored as
+ *           F->unf^F->unf_e.
+ * Errors:   none fatal.  Only one unsplit cofactor can be stored, and a second
+ *           would overwrite the first.  That cannot happen for 128-bit input
+ *           after trial division: rho128() only fails on parts whose factors
+ *           all exceed about 2^44, and two such parts would exceed 2^128.
+ */
 static void factor_rec(u128 n, fac_t *F, int mult, bool heavy)
 {
     if (n == 1) return;
@@ -671,12 +1337,35 @@ static void factor_rec(u128 n, fac_t *F, int mult, bool heavy)
     factor_rec(n / d, F, mult, heavy);
 }
 
+/*
+ * cmp_pe - qsort() comparator for pe_t by prime, increasing.
+ *
+ * Function: compares the p fields (without a subtraction).
+ * Inputs:   pointers to two pe_t.
+ * Outputs:  -1, 0 or 1.
+ * Errors:   none.
+ */
 static int cmp_pe(const void *a, const void *b)
 {
     const pe_t *x = a, *y = b;
     return x->p < y->p ? -1 : x->p > y->p;
 }
 
+/*
+ * factor128_ex - factor m as far as possible, for display or verification.
+ *
+ * Function: trial division by the primes below 2^16 (for a remainder below
+ *           2^64 it stops once p^2 exceeds it, which proves the rest prime),
+ *           then factor_rec() on the cofactor, then sorts the primes.
+ * Inputs:   m; F, the result; heavy: also try rho128() on a composite cofactor
+ *           above 2^64 (slower, and it can still fail).
+ * Outputs:  *F with the primes found.  If the factorization is incomplete,
+ *           the unsplit cofactor is in F->unf; every prime below 2^16 was then
+ *           tried, so all its prime factors exceed 2^16.  m < 2 gives an empty
+ *           F.
+ * Errors:   none fatal.  A cofactor above 2^64 stays unfactored when heavy is
+ *           false or when rho128() exhausts its budget.
+ */
 static void factor128_ex(u128 m, fac_t *F, bool heavy)
 {
     memset(F, 0, sizeof *F);
@@ -693,14 +1382,34 @@ static void factor128_ex(u128 m, fac_t *F, bool heavy)
     qsort(F->f, (size_t)F->nf, sizeof(pe_t), cmp_pe);
 }
 
+/*
+ * factor128 - full-effort factorization: factor128_ex(m, F, true).
+ *
+ * Function: wrapper.
+ * Inputs:   m; F.
+ * Outputs:  *F as described at factor128_ex().
+ * Errors:   as factor128_ex(); a cofactor above 2^64 may stay unfactored.
+ */
 static void factor128(u128 m, fac_t *F)
 {
     factor128_ex(m, F, true);
 }
 
-/* "2^2*3 | 7": consecutive primes joined by '*', a gap shown as " | "
- * (or as '*' too when markers is false).
- * Returns the number of gaps (A073490), or -1 if part is unfactored.    */
+/*
+ * fmt_factor_ex - human-readable factorization with prime-gap markers.
+ *
+ * Function: factor128() (full effort), then prints the primes in increasing
+ *           order: consecutive primes are joined by '*' and a prime gap is
+ *           shown as " | ", e.g. 84 -> "2^2*3 | 7" (with markers false every
+ *           separator is '*').  An unsplit cofactor is appended as "[C...]".
+ * Inputs:   m; buf and its size cap; markers.
+ * Outputs:  buf, always NUL-terminated (truncated to cap).  Returns the
+ *           number of gaps, i.e. A073490(m), or -1 when a cofactor stayed
+ *           unfactored.  For m = 0 and m = 1 it prints "0" or "1" and
+ *           returns 0.
+ * Errors:   truncation is silent.  The 0 returned for m = 0 is not a claim
+ *           that 0 is gapless; cmd_check() rejects m = 0.
+ */
 static int fmt_factor_ex(u128 m, char *buf, size_t cap, bool markers)
 {
     fac_t F;
@@ -729,12 +1438,30 @@ static int fmt_factor_ex(u128 m, char *buf, size_t cap, bool markers)
     return gaps;
 }
 
+/*
+ * fmt_factor - fmt_factor_ex() with gap markers.
+ *
+ * Function: wrapper; see fmt_factor_ex().
+ * Inputs:   m; buf; cap.
+ * Outputs:  as fmt_factor_ex(): the text and the gap count (or -1).
+ * Errors:   as fmt_factor_ex().
+ */
 static int fmt_factor(u128 m, char *buf, size_t cap)
 {
     return fmt_factor_ex(m, buf, cap, true);
 }
 
-/* short description of a gapless number: "prime", "2^16", "5*7", ... */
+/*
+ * describe_gapless - short structural description of a gapless number.
+ *
+ * Function: "1", "prime", or the factorization from is_gapless(), e.g.
+ *           "2^24*3^28" or "31*37".
+ * Inputs:   m; buf and its size cap.
+ * Outputs:  buf (truncated to cap).
+ * Errors:   if m is not gapless the text is "NOT GAPLESS?!", an alarm that
+ *           should never appear because callers only pass bounds of runs.
+ *           m = 0 also produces it.
+ */
 static void describe_gapless(u128 m, char *buf, size_t cap)
 {
     gl_t g;
@@ -752,9 +1479,24 @@ static void describe_gapless(u128 m, char *buf, size_t cap)
 /* ------------------------------------------------------------------ */
 /* scan: exhaustive enumeration of gapless numbers up to N              */
 /* ------------------------------------------------------------------ */
+/*
+ * Method 1 of the header (section 2): generate the gapless numbers up to N in
+ * increasing order and record the first run of every length.
+ */
 
+/*
+ * vec64_t: a growable array of u64; v[0..n-1] are in use, cap are allocated.
+ */
 typedef struct { u64 *v; size_t n, cap; } vec64_t;
 
+/*
+ * vec64_push - append x to a vec64_t.
+ *
+ * Function: doubles the capacity when full (4096 entries at first).
+ * Inputs:   v (zero-initialized before the first push); x.
+ * Outputs:  v->v[v->n++] = x.
+ * Errors:   out of memory -> die().
+ */
 static void vec64_push(vec64_t *v, u64 x)
 {
     if (v->n == v->cap) {
@@ -765,7 +1507,20 @@ static void vec64_push(vec64_t *v, u64 x)
     v->v[v->n++] = x;
 }
 
-/* multiply v (whose largest prime is pr[idx-1]) by powers of pr[idx], recurse */
+/*
+ * comp_extend - push every v * pr[idx]^e1 * pr[idx+1]^e2 * ... <= N.
+ *
+ * Function: v is gapless and its largest prime is pr[idx-1].  Each product
+ *           v * pr[idx]^e (e >= 1) up to N is gapless with one more prime: it
+ *           is pushed, and the recursion then tries to append pr[idx+1].
+ * Inputs:   out; v; idx; the prime table pr[0..np-1]; np; N.
+ * Outputs:  the new numbers appended to out (not sorted).
+ * Errors:   none.  It returns when idx >= np, which loses nothing: if
+ *           v * pr[idx] <= N then pr[idx-1] < sqrt(N), so by Bertrand's
+ *           postulate pr[idx] < 2*sqrt(N), which is inside the table.  The
+ *           u128 products cannot overflow (v <= N < 2^64, pr[idx] < 2^33), and
+ *           the recursion is at most 15 deep (2*3*...*47 < 2^64).
+ */
 static void comp_extend(vec64_t *out, u128 v, size_t idx, const u64 *pr, size_t np, u64 N)
 {
     if (idx >= np) return;    /* pr[idx] > 2 sqrt(N): no product can fit */
@@ -777,7 +1532,22 @@ static void comp_extend(vec64_t *out, u128 v, size_t idx, const u64 *pr, size_t 
     }
 }
 
-/* all composite gapless numbers <= N (plus the number 1), sorted */
+/*
+ * gen_composite_gapless - every composite gapless number <= N, plus 1,
+ *                         sorted.
+ *
+ * Function: for each prime p with p^2 <= N: the powers p^e (e >= 2) and,
+ *           through comp_extend(), every p^e * nextprime(p)^f * ... <= N.
+ *           Each composite gapless number arises exactly once, from its
+ *           smallest prime and its exponents.  The number 1 is included
+ *           because it is gapless too, so the scan can start with it.
+ * Inputs:   N < 2^64; out, an empty vec64_t.
+ * Outputs:  out->v[0..n-1] in increasing order, starting with 1.
+ * Errors:   primesieve failure or out of memory -> die().  Memory is
+ *           dominated by the prime table up to P = 2*sqrt(N) + 10^5, 8 bytes
+ *           per prime (about 2.3 GB at N = 2^63); the output itself is small
+ *           (about 9*10^4 entries at N = 10^11).
+ */
 static void gen_composite_gapless(u64 N, vec64_t *out)
 {
     u64 P = 2 * (u64)isqrt128(N) + 100000;
@@ -799,6 +1569,14 @@ static void gen_composite_gapless(u64 N, vec64_t *out)
     qsort(out->v, out->n, sizeof(u64), cmp_u64);
 }
 
+/*
+ * lower_bound64 - the first index i with a[i] >= x in a sorted array.
+ *
+ * Function: binary search.
+ * Inputs:   a[0..n-1], sorted increasing; n; x.
+ * Outputs:  the index, or n if every element is below x.
+ * Errors:   none.
+ */
 static size_t lower_bound64(const u64 *a, size_t n, u64 x)
 {
     size_t lo = 0, hi = n;
@@ -809,6 +1587,16 @@ static size_t lower_bound64(const u64 *a, size_t n, u64 x)
     return lo;
 }
 
+/*
+ * scanres_t: the results of one scan worker: first[n] = the smallest start of
+ *            a run of length n it has seen (0 = none), and maxrun = the
+ *            longest run it has seen.  About 512 KB, one per thread.
+ * SC:        the scan descriptor shared by all workers, set by run_scan()
+ *            before they start: the bound N, the chunk size and count, the
+ *            atomic counters next (next chunk to claim) and done (chunks
+ *            finished, for the progress line), and the sorted list of
+ *            composite gapless numbers.
+ */
 typedef struct { u64 first[MAXRUN]; int maxrun; } scanres_t;
 
 static struct {
@@ -818,6 +1606,25 @@ static struct {
     size_t ncomp;
 } SC;
 
+/*
+ * scan_worker - thread body of the scan.
+ *
+ * Function: claims chunks [lo, hi) of [1, N+1) until none are left.  For each
+ *           chunk it positions a primesieve iterator at lo, binary-searches
+ *           the composite list for lo, and merges the two streams.  For every
+ *           consecutive pair (g, g2) with lo <= g < hi it records g+1 as a
+ *           start for the length n = g2 - g - 1 if none was seen yet.  The last
+ *           g of the chunk is paired with the first gapless number past hi, so
+ *           a run that crosses a chunk boundary is counted once, by the chunk
+ *           that holds its lower bound.
+ * Inputs:   arg, this thread's zeroed scanres_t; the global SC.
+ * Outputs:  res->first[] and res->maxrun; SC.done is incremented per chunk.
+ * Errors:   primesieve errors are not checked: primesieve_next_prime() would
+ *           return PRIMESIEVE_ERROR (UINT64_MAX), which cannot happen because
+ *           main() keeps N <= 2^63.  Lengths of MAXRUN or more would be
+ *           clamped to MAXRUN-1; prime gaps below 2^64 are shorter than 1600.
+ *           A composite never equals a prime, so the merge sees no ties.
+ */
 static void *scan_worker(void *arg)
 {
     scanres_t *res = arg;
@@ -831,6 +1638,7 @@ static void *scan_worker(void *arg)
         if (hi > SC.N + 1) hi = SC.N + 1;         /* process pairs (g, g') with lo <= g < hi */
         if (lo >= hi) { atomic_fetch_add(&SC.done, 1); continue; }
 
+        /* both streams start at the first gapless number >= lo; g is the current one */
         primesieve_jump_to(&it, lo, hi + 1000000);
         u64 p = primesieve_next_prime(&it);
         size_t idx = lower_bound64(SC.comp, SC.ncomp, lo);
@@ -838,6 +1646,7 @@ static void *scan_worker(void *arg)
         u64 g;
         if (c < p) { g = c; c = idx < SC.ncomp ? SC.comp[idx++] : UINT64_MAX; }
         else       { g = p; p = primesieve_next_prime(&it); }
+        /* every pair (g, g2) with g in this chunk; the last g2 may lie past hi */
         while (g < hi) {
             u64 g2;
             if (c < p) { g2 = c; c = idx < SC.ncomp ? SC.comp[idx++] : UINT64_MAX; }
@@ -856,11 +1665,26 @@ static void *scan_worker(void *arg)
     return NULL;
 }
 
-/* first[n] = a(n) for every n with a(n) <= N (0 otherwise); *maxrun = largest n seen */
+/*
+ * run_scan - exhaustive scan of 1..N with `threads` workers.
+ *
+ * Function: builds the composite gapless list up to N + 2*10^6 (a margin for
+ *           the pair that crosses N), sizes the chunks (about 64 per thread
+ *           for load balance, at least 2^22 numbers each), runs the workers,
+ *           prints progress if asked, and merges the per-thread minima.
+ * Inputs:   N <= 2^63; threads >= 1; first, an array of MAXRUN entries;
+ *           maxrun; verbose (progress on stderr).
+ * Outputs:  first[n] = a(n) for every n whose first run starts at or below
+ *           N + 1, and 0 for the others (first[0] is unused); *maxrun = the
+ *           longest run seen.
+ * Errors:   out of memory, primesieve or pthread_create() failure -> die().
+ *           Not reentrant (uses the global SC).
+ */
 static void run_scan(u64 N, int threads, u64 *first, int *maxrun, bool verbose)
 {
     double t0 = now();
     vec64_t comp = { 0, 0, 0 };
+    /* the margin covers the pair that crosses N (gaps below 2^64 are < 1600) */
     gen_composite_gapless(N + 2000000, &comp);
     if (verbose)
         fprintf(stderr, "[scan] %zu composite gapless numbers <= %" PRIu64 " generated in %.2fs\n",
@@ -869,6 +1693,7 @@ static void run_scan(u64 N, int threads, u64 *first, int *maxrun, bool verbose)
     SC.N = N;
     SC.comp = comp.v;
     SC.ncomp = comp.n;
+    /* about 64 chunks per thread for load balance, each at least 2^22 numbers */
     u64 target = (u64)threads * 64;
     u64 chunk = (N + target) / target;
     if (chunk < ((u64)1 << 22)) chunk = (u64)1 << 22;
@@ -915,7 +1740,21 @@ static void run_scan(u64 N, int threads, u64 *first, int *maxrun, bool verbose)
     free(comp.v);
 }
 
-/* print the a(n) table; a[] is 128-bit so search results can be merged in */
+/*
+ * print_table - the result table: one line per n with a(n), both bounding
+ *               gapless numbers with their structure, and a note.
+ *
+ * Function: for n = 1..top prints "n  a(n)  L (structure)  R (structure)
+ *           note".  The note compares n <= 31 with the built-in OEIS terms
+ *           ("ok (OEIS)" or "MISMATCH!"), marks values above the scan bound N
+ *           as found by the structural search, and calls the rest "new"
+ *           (relative to the 31 built-in terms).
+ * Inputs:   fp; a[1..top] (0 = unknown; 128-bit so search results fit); top;
+ *           N, the scan bound; note_unknown, the text for unknown entries.
+ * Outputs:  text on fp.
+ * Errors:   none.  "NOT GAPLESS?!" in a structure column would indicate a bug
+ *           elsewhere.
+ */
 static void print_table(FILE *fp, const u128 *a, int top, u64 N, const char *note_unknown)
 {
     char b1[48], b2[48], b3[48], d1[200], d2[200];
@@ -946,6 +1785,15 @@ static void print_table(FILE *fp, const u128 *a, int top, u64 N, const char *not
     }
 }
 
+/*
+ * print_summary - the consecutive range, the DATA line and the unknown n.
+ *
+ * Function: finds the largest k with a(1..k) all known, prints those terms as
+ *           an OEIS DATA line, and lists up to 40 unknown n <= top.
+ * Inputs:   fp; a[1..top]; top.
+ * Outputs:  text on fp.
+ * Errors:   none.
+ */
 static void print_summary(FILE *fp, const u128 *a, int top)
 {
     int k = 0;
@@ -958,7 +1806,7 @@ static void print_summary(FILE *fp, const u128 *a, int top)
             fprintf(fp, "%s%s", n > 1 ? ", " : "", u128_str(a[n], b));
         }
         fprintf(fp, "\n");
-        if (k > NKNOWN) fprintf(fp, "(%d term%s beyond the current OEIS entry)\n", k - NKNOWN, k - NKNOWN > 1 ? "s" : "");
+        if (k > NKNOWN) fprintf(fp, "(%d term%s beyond the %d built-in OEIS terms)\n", k - NKNOWN, k - NKNOWN > 1 ? "s" : "", NKNOWN);
     }
     int miss = 0;
     for (int n = k + 1; n <= top; n++) if (!a[n]) miss++;
@@ -972,6 +1820,18 @@ static void print_summary(FILE *fp, const u128 *a, int top)
     }
 }
 
+/*
+ * cmd_scan - the `scan N` command.
+ *
+ * Function: run_scan() with progress, then the table for n = 1..top (top =
+ *           the longest run found, capped by -m, but at least 31) and the
+ *           summary, on stdout and, with -o, in FILE.
+ * Inputs:   N (100 <= N <= 2^63, enforced by main()); threads; maxn (0 = no
+ *           cap); outfile (NULL = none).
+ * Outputs:  the table on stdout and in FILE; progress on stderr.
+ * Errors:   FILE cannot be created -> die(), after the table went to stdout.
+ *           Uses static arrays of about 1.5 MB, so it is not reentrant.
+ */
 static void cmd_scan(u64 N, int threads, int maxn, const char *outfile)
 {
     static u64 first[MAXRUN];
@@ -1004,7 +1864,24 @@ static void cmd_scan(u64 N, int threads, int maxn, const char *outfile)
 /* ------------------------------------------------------------------ */
 /* search: structural search for even n                                */
 /* ------------------------------------------------------------------ */
+/*
+ * Method 2 of the header (section 3): for even n, enumerate the even gapless
+ * endpoints E up to a 128-bit limit and test both partners E +- d.
+ */
 
+/*
+ * pair_t:  one run found by a search: its bounding gapless numbers L and
+ *          R = L + d.
+ * sres_t:  the results of one search worker: the pairs v[0..n-1] (growable)
+ *          and the number of even endpoints tested.
+ * stask_t: one unit of search work: an even endpoint E with k primes
+ *          (2^a, 2^a*3^b or 2^a*3^b*5^c) and whether the worker should go on to
+ *          append 7, 11, ... (only for k = 3; the extensions of the k = 1 and
+ *          k = 2 tasks by 3 and 5 are tasks of their own).
+ * SQ:      the search descriptor shared by the workers: limit, d = n + 1, n,
+ *          kmax, the task list, and the atomic counters next (next task to
+ *          claim) and done (tasks finished).
+ */
 typedef struct { u128 L, R; } pair_t;
 typedef struct { pair_t *v; size_t n, cap; u64 tested; } sres_t;
 
@@ -1019,8 +1896,24 @@ static struct {
     atomic_size_t next, done;
 } SQ;
 
-/* Largest k such that the odd primes <= p_k dividing d form a contiguous
- * block of consecutive primes (or none).  INT_MAX if never violated.     */
+/*
+ * compute_kmax - the most primes an even endpoint can have for this d.
+ *
+ * Function: walks the odd primes 3, 5, 7, ... (up to p_60 = 281) and tracks
+ *           the first block of consecutive primes dividing d.  At the first
+ *           prime factor of d that is not adjacent to that block, E can no
+ *           longer contain it (header section 3), so the answer is its index
+ *           minus one.
+ * Inputs:   d = n + 1, odd.
+ * Outputs:  kmax (always >= 3), or INT_MAX if there is no such factor (the
+ *           odd prime factors of d up to 281 form one block, or there are
+ *           none).
+ * Errors:   none.  Factors of d above 281 are not examined, so kmax can come
+ *           out larger than necessary.  That only weakens the pruning, never
+ *           the correctness; below 2^128 an even gapless number has at most
+ *           26 primes anyway.
+ *           Examples: d = 33 = 3*11 -> 4;  d = 21 = 3*7 -> 3;  d = 35 -> INT_MAX.
+ */
 static int compute_kmax(u64 d)
 {
     int first = -1, last = -1;
@@ -1035,7 +1928,20 @@ static int compute_kmax(u64 d)
     return INT_MAX;
 }
 
-/* k such that E with more than k primes can never have a PRIME partner */
+/*
+ * compute_kprime - the most primes E can have while its partner can still be
+ *                  a (large) prime.
+ *
+ * Function: the smallest odd prime p_k dividing d divides every E with at
+ *           least k primes, and therefore its partner O, so O can only be
+ *           prime when E has fewer than k primes.
+ * Inputs:   d, odd.
+ * Outputs:  k - 1 for the index k of the smallest odd prime factor of d (if
+ *           that factor is at most p_60 = 281), otherwise INT_MAX.
+ * Errors:   none.  Only used in the progress report; the search tests every
+ *           partner regardless.  (O = p_k itself is a prime divisible by p_k;
+ *           such tiny cases are covered by the search anyway.)
+ */
 static int compute_kprime(u64 d)
 {
     for (int k = 2; k <= 60; k++)
@@ -1043,6 +1949,14 @@ static int compute_kprime(u64 d)
     return INT_MAX;
 }
 
+/*
+ * add_pair - append the pair (L, R) to a result list.
+ *
+ * Function: doubles the capacity when full (64 entries at first).
+ * Inputs:   r (zero-initialized before the first use); L; R.
+ * Outputs:  r->v[r->n++] = (L, R).
+ * Errors:   out of memory -> die().
+ */
 static void add_pair(sres_t *r, u128 L, u128 R)
 {
     if (r->n == r->cap) {
@@ -1055,6 +1969,15 @@ static void add_pair(sres_t *r, u128 L, u128 R)
     r->n++;
 }
 
+/*
+ * interior_gapful - is every number strictly between L and R gapful?
+ *
+ * Function: is_gapless() on L+1, ..., R-1, stopping at the first gapless one.
+ * Inputs:   L < R.
+ * Outputs:  true iff none of them is gapless.
+ * Errors:   none.  Up to d-1 tests, but only reached when the partner O is
+ *           gapless, which is rare.
+ */
 static bool interior_gapful(u128 L, u128 R)
 {
     for (u128 m = L + 1; m < R; m++)
@@ -1062,6 +1985,19 @@ static bool interior_gapful(u128 L, u128 R)
     return true;
 }
 
+/*
+ * test_E - try both partners of one even endpoint E (128-bit search).
+ *
+ * Function: O = E + d gives the candidate pair (E, O), and O = E - d (when
+ *           E > d) gives (O, E).  A pair is recorded when O is gapless and the
+ *           numbers in between are all gapful.  E is gapless by construction
+ *           and is not tested here.
+ * Inputs:   E, even and gapless, at most SQ.limit <= 2^127 (so E + d cannot
+ *           overflow); res, the worker's result list.
+ * Outputs:  pairs appended to res; res->tested incremented.
+ * Errors:   none.  O = 1 (for E = d + 1) counts as gapless, consistent with
+ *           the scan, which treats 1 as gapless too.
+ */
 static void test_E(u128 E, sres_t *res)
 {
     u128 O;
@@ -1074,7 +2010,18 @@ static void test_E(u128 E, sres_t *res)
     }
 }
 
-/* E has k-1 primes; append powers of the k-th prime and recurse */
+/*
+ * dfs - extend an even endpoint by the next prime, depth first.
+ *
+ * Function: E has the k-1 primes p_1..p_(k-1).  For e = 1, 2, ... while
+ *           E * p_k^e <= limit, the product is tested and, if k+1 <= kmax,
+ *           extended in turn by p_(k+1).
+ * Inputs:   E; k, the index of the prime to append (k >= 4, since the tasks
+ *           go up to 5); res.
+ * Outputs:  pairs appended to res through test_E().
+ * Errors:   none.  The test p > limit/w prevents overflow.  The depth is at
+ *           most 26 below 2^128.
+ */
 static void dfs(u128 E, int k, sres_t *res)
 {
     u128 p = sp[k - 1], w = E;
@@ -1086,6 +2033,16 @@ static void dfs(u128 E, int k, sres_t *res)
     }
 }
 
+/*
+ * search_worker - thread body of the 128-bit search.
+ *
+ * Function: claims tasks through SQ.next.  For each task it tests E and, if
+ *           the task is marked for recursion (k = 3 and kmax >= 4), explores
+ *           every extension by 7, 11, ... with dfs().
+ * Inputs:   arg, this thread's zeroed sres_t; the global SQ.
+ * Outputs:  pairs and counts in the sres_t; SQ.done incremented per task.
+ * Errors:   out of memory inside add_pair() -> die().
+ */
 static void *search_worker(void *arg)
 {
     sres_t *res = arg;
@@ -1100,12 +2057,29 @@ static void *search_worker(void *arg)
     return NULL;
 }
 
+/*
+ * cmp_pair - qsort() comparator for pair_t by L, increasing.
+ *
+ * Function: compares the L fields (without a subtraction).
+ * Inputs:   pointers to two pair_t.
+ * Outputs:  -1, 0 or 1.
+ * Errors:   none.
+ */
 static int cmp_pair(const void *a, const void *b)
 {
     const pair_t *x = a, *y = b;
     return x->L < y->L ? -1 : x->L > y->L;
 }
 
+/*
+ * add_task - append a task to a growable stask_t array.
+ *
+ * Function: doubles the capacity when full (1024 entries at first).
+ * Inputs:   t, n, cap (the array, its length and capacity); E; k; rec
+ *           (whether the worker should recurse).
+ * Outputs:  the task appended; *t, *n and *cap updated.
+ * Errors:   out of memory -> die().
+ */
 static void add_task(stask_t **t, size_t *n, size_t *cap, u128 E, int k, bool rec)
 {
     if (*n == *cap) {
@@ -1119,21 +2093,51 @@ static void add_task(stask_t **t, size_t *n, size_t *cap, u128 E, int k, bool re
     (*n)++;
 }
 
-/* Is m certainly gapful even though factor128 left a composite cofactor?
- * The cofactor's primes all exceed SMALL_LIMIT.  If the small primes found
- * are not consecutive, or the prime following the largest small prime is
- * below SMALL_LIMIT (so it was tested and does not divide m), there is a gap. */
+/*
+ * gapful_by_partial - does a partial factorization already prove a prime gap?
+ *
+ * Function: F holds the primes found and an unsplit cofactor whose primes all
+ *           exceed 2^16 (see factor128_ex()).  Every prime below 2^16 was
+ *           tried by trial division, so a prime q < 2^16 missing from F does
+ *           not divide m.  A gap is therefore certain when, for some known
+ *           prime p, the next prime q is below 2^16 and missing while m has a
+ *           prime larger than p: the next known prime, or any prime of the
+ *           cofactor when p is the largest known prime.
+ * Inputs:   F from factor128_ex(), with F->unf != 0.
+ * Outputs:  true: m certainly has a prime gap.  false: undecided.
+ * Errors:   none.  Primes above 2^16 that are absent from F may be hiding in
+ *           the cofactor, so they never count as missing.
+ */
 static bool gapful_by_partial(const fac_t *F)
 {
     if (F->nf == 0) return false;
-    for (int i = 1; i < F->nf; i++)
-        if (next_prime128(F->f[i - 1].p) != F->f[i].p) return true;
+    for (int i = 1; i < F->nf; i++) {
+        u128 q = next_prime128(F->f[i - 1].p);
+        if (q != F->f[i].p && q < SMALL_LIMIT) return true;   /* q was tried: missing */
+    }
     return next_prime128(F->f[F->nf - 1].p) < SMALL_LIMIT;
 }
 
-/* Independent re-check of one pair using full factorizations (trial division,
- * Pollard rho, Miller-Rabin), i.e. not is_gapless().  Returns 1 = verified,
- * 0 = contradiction found, 2 = could not be certified (unfactored 128-bit part). */
+/*
+ * verify_pair - independent re-check of one run, using full factorizations.
+ *
+ * Function: factors L and R (fmt_factor()) and every interior number, and
+ *           checks the gap counts taken from the factorizations: 0 for L and
+ *           R, at least 1 for each interior number.  For an interior number a
+ *           cheap factorization (no 128-bit rho) comes first and often already
+ *           proves a gap through gapful_by_partial(); otherwise the
+ *           full-effort one decides.  is_gapless() is not used, so an error in
+ *           the search's gap test would show up here.
+ * Inputs:   L < R; why and its size cap, for a message.
+ * Outputs:  1: verified.  0: contradiction, described in why.  2: could not be
+ *           certified because a number above 2^64 could not be factored
+ *           completely, described in why.
+ * Errors:   none fatal.  Primality inside the factorizer is the same
+ *           is_prime128() the search uses, so this is not an independent
+ *           primality check (use verify_run.py or PARI/GP for that).  Interior
+ *           numbers may be factored up to three times, which is only slow for
+ *           runs above 2^64.
+ */
 static int verify_pair(u128 L, u128 R, char *why, size_t cap)
 {
     char fb[512], b[48];
@@ -1161,8 +2165,28 @@ static int verify_pair(u128 L, u128 R, char *why, size_t cap)
     return result;
 }
 
-/* Returns a(n) (as L+1 of the smallest pair) or 0 if none with L <= limit-d.
- * All pairs found are returned in *out (sorted by L) when out != NULL.  */
+/*
+ * run_search - the 128-bit structural search for one even n (header
+ *              section 3).
+ *
+ * Function: sets up SQ (d = n + 1, kmax), builds the task list -- 2^a (k = 1),
+ *           2^a*3^b (k = 2) and 2^a*3^b*5^c (k = 3, recursing further when
+ *           kmax >= 4), each product checked against the limit before it is
+ *           formed -- runs the workers, collects and sorts the pairs by L, and
+ *           re-checks every pair with is_gapless() and interior_gapful() (the
+ *           enumeration never tests E itself, so this guards it).
+ * Inputs:   n, even, >= 2; limit <= 2^127; threads >= 1; verbose (report and
+ *           progress on stderr); out, optional.
+ * Outputs:  a(n) = L + 1 for the smallest pair found, or 0 if no pair has its
+ *           even endpoint at or below the limit.  By the coverage lemma a
+ *           nonzero result is exactly a(n), and 0 means a(n) > limit - n.  If
+ *           out is given it receives all pairs sorted by L (the caller frees
+ *           out->v); otherwise they are freed here.
+ * Errors:   out of memory or pthread_create() failure -> die().  A pair that
+ *           fails the re-check is reported as "INTERNAL ERROR" on stderr and
+ *           dropped.  Not reentrant (global SQ).  A limit below 2 gives no
+ *           tasks and returns 0.
+ */
 static u128 run_search(int n, u128 limit, int threads, bool verbose, sres_t *out)
 {
     char lb[48];
@@ -1266,6 +2290,20 @@ static u128 run_search(int n, u128 limit, int threads, bool verbose, sres_t *out
     return result;
 }
 
+/*
+ * cmd_search - the `search n` command in 128-bit mode.
+ *
+ * Function: validates the arguments, runs run_search(), prints up to 40 runs
+ *           found with the structure of their bounds, re-checks the smallest
+ *           with verify_pair(), and prints a(n), or the bound a(n) > limit - n
+ *           when nothing was found.
+ * Inputs:   n; limit, with n + 1 <= limit <= 2^127; threads.
+ * Outputs:  the report on stdout (flushed); progress on stderr.
+ * Errors:   n < 1, odd n, limit > 2^127 or limit < n + 1 -> die().  When the
+ *           smallest pair found starts above limit - n the report calls it a
+ *           candidate; by the coverage lemma it is still exactly a(n), so that
+ *           wording is merely conservative.
+ */
 static void cmd_search(int n, u128 limit, int threads)
 {
     char b1[48], b2[48], b3[48], d1[200], d2[200];
@@ -1273,6 +2311,7 @@ static void cmd_search(int n, u128 limit, int threads)
     if (n % 2) die("search handles even n only (odd n: the two bounding gapless numbers "
                    "have the same parity, so use 'scan')");
     if (limit > ((u128)1 << 127)) die("limit must be <= 2^127");
+    if (limit < (u128)n + 1) die("limit must be at least n+1 = %d", n + 1);
     sres_t all;
     u128 a = run_search(n, limit, threads, true, &all);
     u64 d = (u64)n + 1;
@@ -1295,6 +2334,8 @@ static void cmd_search(int n, u128 limit, int threads)
         printf("\nIndependent verification of the smallest run (full factorizations): %s%s\n",
                vr == 1 ? "OK" : vr == 0 ? "FAILED: " : "INCOMPLETE: ", vr == 1 ? "" : why);
         printf("a(%d) = %s", n, u128_str(a, b1));
+        /* the second message is only conservative: by the coverage lemma the
+         * smallest pair found is a(n) either way */
         if (a - 1 <= limit - d) printf("   (exhaustive: every run of exactly %d starting <= %s was enumerated)\n",
                                        n, u128_str(limit - d + 1, b2));
         else printf("   (candidate only; smaller L in (%s, %s] were not all covered)\n",
@@ -1308,7 +2349,25 @@ static void cmd_search(int n, u128 limit, int threads)
 /* ------------------------------------------------------------------ */
 /* next: scan, then structurally search the missing even n             */
 /* ------------------------------------------------------------------ */
+/*
+ * The combined pipeline: an exhaustive scan for every n, then the 128-bit
+ * structural search for each even n that the scan could not reach.
+ */
 
+/*
+ * cmd_next - the `next` command: scan, then fill in the even n by search.
+ *
+ * Function: run_scan(N), then run_search(n, limit) for every even n <= top
+ *           (the longest run found, capped by -m, at least 32) that the scan
+ *           did not find; odd n can only come from the scan.  Prints the
+ *           merged table and summary on stdout and, with -o, in FILE.
+ * Inputs:   N, the scan bound; limit <= 2^127 (main() rejects GMP-sized
+ *           limits); threads; maxn (0 = no cap); outfile (NULL = none).
+ * Outputs:  the table on stdout and in FILE; per-n results and progress on
+ *           stderr.
+ * Errors:   limit > 2^127 or FILE not writable -> die().  For n >= limit the
+ *           bound printed for an unresolved n is the trivial a(n) > 0.
+ */
 static void cmd_next(u64 N, u128 limit, int threads, int maxn, const char *outfile)
 {
     static u64 first[MAXRUN];
@@ -1333,7 +2392,7 @@ static void cmd_next(u64 N, u128 limit, int threads, int maxn, const char *outfi
             fprintf(stderr, "[next]   a(%d) = %s\n", n, u128_str(r, lb));
             fflush(stderr);
         } else {
-            fprintf(stderr, "[next]   a(%d) > %s\n", n, u128_str(limit - (u128)n, lb));
+            fprintf(stderr, "[next]   a(%d) > %s\n", n, u128_str(limit > (u128)n ? limit - (u128)n : 0, lb));
         }
     }
     char nb[100];
@@ -1352,19 +2411,49 @@ static void cmd_next(u64 N, u128 limit, int threads, int maxn, const char *outfi
 /* ------------------------------------------------------------------ */
 /* check / run                                                         */
 /* ------------------------------------------------------------------ */
+/*
+ * Inspection commands for single numbers below 2^127 (GMP builds) or below
+ * 2^128 (without GMP).  The GMP versions are in the GMP section.
+ */
 
+/*
+ * cmd_check - the `check m` command for m below 2^127 (any 128-bit m without
+ *             GMP).
+ *
+ * Function: prints the factorization with gap markers and A073490(m),
+ *           cross-checks the verdict against is_gapless(), and says whether m
+ *           is prime.
+ * Inputs:   m >= 1.
+ * Outputs:  text on stdout.
+ * Errors:   m = 0 -> die() (0 has no factorization).  If a cofactor cannot be
+ *           factored, A073490(m) is reported as unknown.
+ */
 static void cmd_check(u128 m)
 {
     char b[48], fb[600];
+    if (m == 0) die("m must be >= 1 (0 has no factorization)");
     int g = fmt_factor(m, fb, sizeof fb);
     printf("%s = %s\n", u128_str(m, b), fb);
     if (g < 0) printf("A073490(m): unknown (unfactored part)\n");
     else printf("A073490(%s) = %d  ->  %s\n", u128_str(m, b), g, g ? "has a prime gap (gapful)" : "no prime gap (gapless, in A073491)");
     bool gl = is_gapless(m, NULL);
     if (g >= 0 && gl != (g == 0)) printf("!! is_gapless() disagrees with the factorization\n");
-    if (m > 2 && is_prime128(m)) printf("%s is prime\n", u128_str(m, b));
+    if (is_prime128(m)) printf("%s is prime\n", u128_str(m, b));
 }
 
+/*
+ * print_run - print one run (L, R) with the factorization of every number.
+ *
+ * Function: a header with both bounds and their structure; for runs of up to
+ *           200 numbers one fmt_factor() line per interior number; then, for
+ *           n <= 31, whether this is the first run of its length according to
+ *           the built-in OEIS terms.
+ * Inputs:   L < R, consecutive gapless numbers.
+ * Outputs:  text on stdout.
+ * Errors:   none.  Fully factoring 128-bit interior numbers can take a moment
+ *           and may leave [C...] cofactors.  For n > 31 the last line only
+ *           says "candidate"; compare it with the b-file (b137723.txt).
+ */
 static void print_run(u128 L, u128 R)
 {
     char b1[48], b2[48], d1[200], d2[200], fb[600];
@@ -1386,10 +2475,24 @@ static void print_run(u128 L, u128 R)
         if (L + 1 == KNOWN[ni]) printf("  -> this is a(%d) = %" PRIu64 " (OEIS)\n", ni, KNOWN[ni]);
         else printf("  -> a(%d) = %" PRIu64 " (OEIS), so this is a later run of that length\n", ni, KNOWN[ni]);
     } else if (n >= 1) {
-        printf("  -> candidate for a(%s) = %s (not in OEIS yet)\n", u128_str(n, b1), u128_str(L + 1, b2));
+        printf("  -> candidate for a(%s) = %s (beyond the %d built-in terms; compare with b137723.txt)\n",
+               u128_str(n, b1), u128_str(L + 1, b2), NKNOWN);
     }
 }
 
+/*
+ * cmd_run - the `run m` command for m below 2^127 (any 128-bit m without
+ *           GMP).
+ *
+ * Function: if m is gapless, prints the runs just below and just above it;
+ *           otherwise finds the gapless numbers L < m < R around m and prints
+ *           that run.
+ * Inputs:   m >= 2.
+ * Outputs:  text on stdout.
+ * Errors:   m < 2 -> die().  Without GMP, an m in the last prime gap below
+ *           2^128 (m > 2^128 - 159) would make R wrap around 2^128; with GMP
+ *           such m go to cmd_run_gmp() instead.
+ */
 static void cmd_run(u128 m)
 {
     char b[48], d[200];
@@ -1415,57 +2518,112 @@ static void cmd_run(u128 m)
 }
 
 /* ------------------------------------------------------------------ */
-/* GMP mode: structural search for even n above 2^127                  */
+/* GMP mode: structural search for even n with LIMIT >= 2^127          */
 /* ------------------------------------------------------------------ */
 /*
  * Same theorem as the 128-bit search, applied more selectively so that the
- * enumeration stays small at 1000+ bits.  Let d = n+1 (odd), p_j the smallest
- * odd prime dividing d, and {p_j, ..., p_m} the maximal block of consecutive
- * primes starting at p_j that all divide d.  For an even endpoint
- * E = 2^e1 3^e2 ... p_k^ek the odd partner O = E +- d satisfies:
+ * enumeration stays small at hundreds or thousands of bits (header section 4).
+ * Let d = n+1 (odd), p_j the smallest odd prime dividing d, and {p_j..p_m} the
+ * maximal block of consecutive primes from p_j on that all divide d.  For an
+ * even endpoint E = 2^e1 3^e2 ... p_k^ek the odd partner O = E +- d satisfies
  *
- *   k <  j : O is coprime to p_1..p_k                 -> may be prime: enumerate E
- *   j<=k<=m: O = p_j^f.. p_k^f.. (times a consecutive continuation beyond p_k)
- *                                                      -> open-ended: enumerate E
- *   m <  k : O = p_j^f * ... * p_m^f EXACTLY            -> enumerate these O instead
+ *   k <  j      : O is coprime to p_1..p_k             -> may be prime: enumerate E
+ *   j <= k <= m : O = p_j^f..p_k^f.. times a consecutive continuation beyond p_k
+ *                                                       -> open-ended: enumerate E
+ *   m <  k      : O = p_j^f * ... * p_m^f EXACTLY       -> enumerate these O instead
  *
- * (and k > kmax is impossible, kmax = index of the next odd prime factor of d
- * minus one).  So E is enumerated only for k <= m ("E side"), and for k > m the
- * partner O ranges over products of the fixed prime set {p_j..p_m} ("O side").
- * For d = 63 = 3^2*7: j = m = 2, kmax = 3: the E side is 2^a and 2^a*3^b, the
- * O side is the powers of 3.  Both are tiny even below 2^100000.
+ * (k > kmax is impossible, kmax = the index of the next odd prime factor of d
+ * minus one).  So E is enumerated only for k <= m (the "E side"), and for k > m
+ * the partner O ranges over the products of the fixed primes p_j..p_m (the "O
+ * side").  For d = 63 = 3^2*7: j = m = 2 and kmax = 3; the E side is 2^a and
+ * 2^a*3^b, the O side the powers of 3, about 3*10^5 candidates below 2^1000.
+ *
+ * Everything here works on mpz_t; numbers below 2^127 are handed to the
+ * 128-bit routines.  Prime verdicts come from z_is_prime() (probabilistic
+ * above 2^64).  Each worker owns a zws_t, so the hot paths never allocate.
  */
 #ifdef HAVE_GMP
 #include <gmp.h>
 #include <math.h>
 
+/*
+ * ZDEPTH: the number of mpz slots per worker for the E-side and O-side
+ * recursions (one per prime appended).  The E side needs at most m of them
+ * (m = the end of the block of d, below 10 for every d whose search is
+ * feasible), so 128 is plenty; run_search_gmp() checks the bound.
+ */
 #define ZDEPTH 128
 
+/*
+ * zws_t: one worker's GMP scratch space, so the hot loops never allocate.
+ *   x        the running quotient in z_chain_from() and z_partial_line()
+ *   p, q, c  prime candidates and roots in z_chain_from() and z_root_method()
+ *   tmp      the loop variable of z_interior_gapful(); also used for printing
+ *   E, O     the current even endpoint (z_test_O()) and odd partner
+ *            (z_test_E()); z_partial_line() keeps its cofactor in E
+ *   stk[]    one value per recursion level of z_dfs() and z_dfs_O()
+ * z_is_gapfree() clobbers x, p, q and c, never tmp, E, O or stk[]; the
+ * functions below rely on that.
+ */
 typedef struct {
     mpz_t x, p, q, c, tmp, E, O;
     mpz_t stk[ZDEPTH];
 } zws_t;
 
+/*
+ * zws_init - initialize every mpz_t of a zws_t.
+ *
+ * Function: mpz_init() on all fields (no large allocations yet).
+ * Inputs:   w, uninitialized.
+ * Outputs:  w ready for use; release it with zws_clear().
+ * Errors:   GMP aborts the process if memory runs out (its default policy).
+ */
 static void zws_init(zws_t *w)
 {
     mpz_inits(w->x, w->p, w->q, w->c, w->tmp, w->E, w->O, NULL);
     for (int i = 0; i < ZDEPTH; i++) mpz_init(w->stk[i]);
 }
 
+/*
+ * zws_clear - release every mpz_t of a zws_t.
+ *
+ * Function: mpz_clear() on all fields.
+ * Inputs:   w, initialized by zws_init().
+ * Outputs:  w must not be used again until it is re-initialized.
+ * Errors:   none.
+ */
 static void zws_clear(zws_t *w)
 {
     mpz_clears(w->x, w->p, w->q, w->c, w->tmp, w->E, w->O, NULL);
     for (int i = 0; i < ZDEPTH; i++) mpz_clear(w->stk[i]);
 }
 
-/* strong probable prime, 30 rounds (deterministic answer for composites is
- * certain; a "prime" verdict above 2^64 should be certified externally)  */
+/*
+ * z_is_prime - probable-prime test for a number of any size.
+ *
+ * Function: mpz_probab_prime_p(m, 30): trial division, a Baillie-PSW test and
+ *           6 more Miller-Rabin rounds (GMP 6.2 and later).
+ * Inputs:   m >= 0.
+ * Outputs:  true if m is prime or a probable prime; false if m is certainly
+ *           composite or m < 2.
+ * Errors:   no Baillie-PSW pseudoprime is known, but a true result above 2^64
+ *           is not a proof; reported endpoints should be certified.
+ */
 static bool z_is_prime(const mpz_t m)
 {
     return mpz_probab_prime_p(m, 30) > 0;
 }
 
-/* largest prime < x (x > 3); out may alias x */
+/*
+ * z_prevprime - largest (probable) prime below x.
+ *
+ * Function: steps down through the odd numbers below x with z_is_prime().
+ * Inputs:   out; x >= 4 (callers only pass values above 2^16).  out may be the
+ *           same variable as x.
+ * Outputs:  out = the previous prime.
+ * Errors:   for x <= 3 the search would continue below 2 into negative
+ *           numbers; no caller does that.
+ */
 static void z_prevprime(mpz_t out, const mpz_t x)
 {
     mpz_sub_ui(out, x, 1);
@@ -1473,6 +2631,16 @@ static void z_prevprime(mpz_t out, const mpz_t x)
     while (!z_is_prime(out)) mpz_sub_ui(out, out, 2);
 }
 
+/*
+ * z_to_u128 - convert an mpz_t below 2^128 to unsigned __int128.
+ *
+ * Function: exports the two least significant 64-bit words.
+ * Inputs:   m with 0 <= m < 2^128 (callers check mpz_sizeinbase(m, 2) first).
+ * Outputs:  the value.
+ * Errors:   m >= 2^128 would overflow the two-word buffer (memory
+ *           corruption), and a negative m would lose its sign; callers must
+ *           check the size first.
+ */
 static u128 z_to_u128(const mpz_t m)
 {
     u64 w[2] = { 0, 0 };
@@ -1481,6 +2649,17 @@ static u128 z_to_u128(const mpz_t m)
     return ((u128)w[1] << 64) | w[0];
 }
 
+/*
+ * zdesc_add - append "p^e" to a description string, with a '*' separator
+ *             after the first factor.
+ *
+ * Function: writes p in decimal and the exponent if e > 1; if the factor would
+ *           not fit, appends "..." instead.
+ * Inputs:   d, a NUL-terminated string in a buffer of cap bytes; p; e >= 1.
+ * Outputs:  d extended in place.
+ * Errors:   none; it never writes past cap (mpz_sizeinbase() may overestimate
+ *           the length by one, which only makes the check stricter).
+ */
 static void zdesc_add(char *d, size_t cap, const mpz_t p, unsigned e)
 {
     size_t len = strlen(d);
@@ -1493,8 +2672,22 @@ static void zdesc_add(char *d, size_t cap, const mpz_t p, unsigned e)
     if (e > 1) snprintf(d + len, cap - len, "^%u", e);
 }
 
-/* Is r = p^e * nextprime(p)^f * ... exactly?  p is clobbered.  On success the
- * factorization goes to desc and the number of distinct primes to *nprimes. */
+/*
+ * z_chain_from - GMP version of chain_from(): is r exactly
+ *                p^e1 * nextprime(p)^e2 * ...?
+ *
+ * Function: divides out p completely, then the next prime, and so on, until
+ *           the quotient is 1 (success) or the current prime does not divide
+ *           (failure).
+ * Inputs:   r >= 1; p, a prime, which is CLOBBERED (it ends at the last prime
+ *           used); w (x is clobbered); desc and cap, optional (desc may be
+ *           NULL), for the factorization text; nprimes, optional, for the
+ *           number of distinct primes.
+ * Outputs:  true with desc and *nprimes filled, or false.  After a failure
+ *           desc may hold a partial text and must be ignored.
+ * Errors:   none.  mpz_nextprime() is probabilistic in the same sense as
+ *           z_is_prime().
+ */
 static bool z_chain_from(const mpz_t r, mpz_t p, zws_t *w, char *desc, size_t cap, int *nprimes)
 {
     int cnt = 0;
@@ -1513,9 +2706,20 @@ static bool z_chain_from(const mpz_t r, mpz_t p, zws_t *w, char *desc, size_t ca
     return true;
 }
 
-/* r composite with no prime factor <= SMALL_LIMIT: gap-free only if it is
- * p^t, or a product of consecutive primes whose smallest one is among the t-1
- * largest primes below the t-th root (see root_method() for the argument). */
+/*
+ * z_root_method - GMP version of root_method() for a composite r without
+ *                 prime factors below 2^16.
+ *
+ * Function: for t = 2, 3, ... while c = floor(r^(1/t)) > 2^16: r = c^t with c
+ *           prime is gapless; otherwise the t-1 largest primes <= c are tried
+ *           as the smallest prime of a consecutive chain (see root_method()
+ *           for the proof).
+ * Inputs:   r; w (clobbers x, p, q and c); desc and cap, optional.
+ * Outputs:  true iff r is gapless (desc filled on success).
+ * Errors:   none.  The cost is dominated by the prime searches below r^(1/2)
+ *           and r^(1/3): for a 1000-bit r, a few hundred probable-prime tests
+ *           on 300- to 500-bit numbers.
+ */
 static bool z_root_method(const mpz_t r, zws_t *w, char *desc, size_t cap)
 {
     for (unsigned long t = 2; t < 100000; t++) {
@@ -1530,13 +2734,27 @@ static bool z_root_method(const mpz_t r, zws_t *w, char *desc, size_t cap)
         for (unsigned long jj = 0; jj < t - 1 && mpz_cmp_ui(w->q, SMALL_LIMIT) > 0; jj++) {
             mpz_set(w->p, w->q);
             if (z_chain_from(r, w->p, w, desc, cap, NULL)) return true;
-            z_prevprime(w->q, w->q);
+            if (jj + 1 < t - 1) z_prevprime(w->q, w->q);   /* only when another candidate follows */
         }
     }
     return false;
 }
 
-/* A073490(m) == 0 for an arbitrary-size m.  desc (optional) gets the structure. */
+/*
+ * z_is_gapfree - gapless test for a number of any size.
+ *
+ * Function: below 2^127 it calls is_gapless().  Otherwise: trial division by
+ *           the primes below 2^16 and z_chain_from() from the smallest one
+ *           found; with no small factor, a probable prime is gapless and
+ *           anything else goes to z_root_method().
+ * Inputs:   m >= 0; w (clobbers x, p, q and c, never tmp, E, O or stk[]);
+ *           desc and cap, optional, for a description: the structure from
+ *           describe_gapless() or z_chain_from(), "probable prime", or
+ *           "gapful" (the last only below 2^127).
+ * Outputs:  true iff m is gapless.
+ * Errors:   none.  Prime verdicts above 2^64 are probabilistic.  Above 2^127
+ *           desc is only meaningful when the result is true.
+ */
 static bool z_is_gapfree(const mpz_t m, zws_t *w, char *desc, size_t cap)
 {
     if (mpz_sizeinbase(m, 2) <= 127) {
@@ -1554,6 +2772,15 @@ static bool z_is_gapfree(const mpz_t m, zws_t *w, char *desc, size_t cap)
     return z_root_method(m, w, desc, cap);
 }
 
+/*
+ * z_interior_gapful - is every number strictly between L and R gapful?  (GMP)
+ *
+ * Function: z_is_gapfree() on L+1, ..., R-1, stopping at the first gapless
+ *           one.
+ * Inputs:   L < R, neither of them w->tmp (the loop variable); w.
+ * Outputs:  true iff none of them is gapless.
+ * Errors:   none.  Up to d-1 tests, only reached when the partner is gapless.
+ */
 static bool z_interior_gapful(const mpz_t L, const mpz_t R, zws_t *w)
 {
     for (mpz_add_ui(w->tmp, L, 1); mpz_cmp(w->tmp, R) < 0; mpz_add_ui(w->tmp, w->tmp, 1))
@@ -1561,7 +2788,21 @@ static bool z_interior_gapful(const mpz_t L, const mpz_t R, zws_t *w)
     return true;
 }
 
-/* ---- search state ---- */
+/*
+ * ---- GMP search state ----
+ *
+ * ztask_t: one unit of GMP work.  side 0 (E side): E = 2^a * 3^b (b = 0 for
+ *          k = 1); the worker tests E and, when b > 0, extends it by 5, 7, ...
+ *          up to kE primes.  side 1 (O side): O starts as p_j^f1 and the
+ *          worker multiplies in p_(j+1), ..., p_m.
+ * zpair_t: one run found, as mpz values owned by the list.
+ * zres_t:  the results of one worker: the pairs v[0..n-1] and the number of
+ *          candidates tested (nodes).
+ * ZQ:      the GMP search descriptor shared by the workers: limit and
+ *          limit + d, d, n, the block (j, m), kmax, kE = min(m, kmax) (the most
+ *          primes enumerated on the E side), the task list and its atomic
+ *          counters.
+ */
 
 typedef struct { int side; unsigned a, b, f1; } ztask_t;
 typedef struct { mpz_t L, R; } zpair_t;
@@ -1576,9 +2817,20 @@ static struct {
     atomic_size_t next, done;
 } ZQ;
 
-/* j = index of the smallest odd prime factor of d (p_1 = 2, p_2 = 3, ...),
- * m = end of the maximal block p_j, p_j+1, ..., p_m of primes dividing d,
- * kmax = (index of the next odd prime factor of d) - 1, or INT_MAX          */
+/*
+ * z_analyze - the prime structure of d that drives the GMP search.
+ *
+ * Function: finds j, the index of the smallest odd prime factor of d
+ *           (p_1 = 2); m, the end of the maximal block p_j, p_(j+1), ..., p_m
+ *           of primes that all divide d; and kmax, the index of the next prime
+ *           factor of d after a gap, minus one (INT_MAX if there is none below
+ *           2^16).
+ * Inputs:   d, odd; pointers for j, m and kmax.
+ * Outputs:  *j, *m and *kmax, with kmax > m.
+ * Errors:   d without an odd prime factor below 2^16 (d = 1, or a prime d
+ *           above 65521, i.e. n >= 65536) -> die().
+ *           Example: d = 63 = 3^2*7 gives j = m = 2 (the block {3}), kmax = 3.
+ */
 static void z_analyze(u64 d, int *j, int *m, int *kmax)
 {
     *j = 0; *m = 0; *kmax = INT_MAX;
@@ -1592,7 +2844,20 @@ static void z_analyze(u64 d, int *j, int *m, int *kmax)
     if (*j == 0) die("d = %" PRIu64 " has no odd prime factor below 2^16 (n too large for this mode)", d);
 }
 
-/* expected number of E = 2^e1..p_k^ek <= X (all e >= 1): volume of a simplex */
+/*
+ * z_est_E - estimated number of E = p_1^e1 * ... * p_k^ek <= X with every
+ *           e_i >= 1.
+ *
+ * Function: such exponent vectors satisfy sum (e_i - 1)*log p_i <=
+ *           ln X - sum log p_i, a k-dimensional simplex of volume
+ *           (ln X - sum log p_i)^k / (k! * prod log p_i).
+ * Inputs:   k >= 1; lnX = ln X.
+ * Outputs:  the estimate; 0 if p_1 * ... * p_k already exceeds X.
+ * Errors:   none.  The volume undercounts the lattice points: it is close for
+ *           the few primes of the E side, but summed over every k it is about
+ *           5 times too small below 2^64.  It only feeds the --max-nodes
+ *           guard.
+ */
 static double z_est_E(int k, double lnX)
 {
     double s = lnX, denom = 1;
@@ -1600,6 +2865,15 @@ static double z_est_E(int k, double lnX)
     return s <= 0 ? 0 : pow(s, k) / denom;
 }
 
+/*
+ * z_est_S - estimated number of products over the block p_j..p_m (every
+ *           exponent >= 1) up to X.
+ *
+ * Function: the simplex volume of z_est_E() with the primes p_j..p_m.
+ * Inputs:   j <= m, the block; lnX = ln X.
+ * Outputs:  the estimate.
+ * Errors:   none.
+ */
 static double z_est_S(int j, int m, double lnX)
 {
     double s = lnX, denom = 1;
@@ -1608,6 +2882,16 @@ static double z_est_S(int j, int m, double lnX)
     return s <= 0 ? 0 : pow(s, cnt) / denom;
 }
 
+/*
+ * zres_add - append copies of (L, R) to a GMP result list.
+ *
+ * Function: doubles the capacity when full (16 entries at first) and stores
+ *           new mpz copies.
+ * Inputs:   r (zero-initialized before the first use); L; R.
+ * Outputs:  the list owns the copies; the caller eventually mpz_clear()s
+ *           every entry and frees r->v.
+ * Errors:   out of memory -> die() (or a GMP abort inside mpz_init_set()).
+ */
 static void zres_add(zres_t *r, const mpz_t L, const mpz_t R)
 {
     if (r->n == r->cap) {
@@ -1620,6 +2904,17 @@ static void zres_add(zres_t *r, const mpz_t L, const mpz_t R)
     r->n++;
 }
 
+/*
+ * z_test_E - GMP version of test_E(): try O = E + d and O = E - d.
+ *
+ * Function: records (E, O) or (O, E) when O is gapless and every number in
+ *           between is gapful.
+ * Inputs:   E, even and gapless, at most the limit, and neither w->O nor
+ *           w->tmp; w (uses O and tmp; z_is_gapfree() clobbers x, p, q, c);
+ *           res.
+ * Outputs:  pairs appended to res; res->nodes incremented.
+ * Errors:   none.
+ */
 static void z_test_E(const mpz_t E, zws_t *w, zres_t *res)
 {
     res->nodes++;
@@ -1631,7 +2926,18 @@ static void z_test_E(const mpz_t E, zws_t *w, zres_t *res)
     }
 }
 
-/* E has k primes; append powers of p_(k+1) = sp[k] and recurse (E side) */
+/*
+ * z_dfs - E-side recursion: extend E (k primes) by powers of
+ *         p_(k+1) = sp[k].
+ *
+ * Function: for e = 1, 2, ... while E * p_(k+1)^e <= limit: test the product
+ *           and recurse.  It stops at kE primes, because larger k belong to
+ *           the O side (header section 4).
+ * Inputs:   E (not w->stk[k]); k >= 2; w (uses stk[k]); res.
+ * Outputs:  pairs through z_test_E().
+ * Errors:   none; the depth stays below kE < ZDEPTH - 2 (checked by
+ *           run_search_gmp()).
+ */
 static void z_dfs(const mpz_t E, int k, zws_t *w, zres_t *res)
 {
     if (k >= ZQ.kE || k >= ZDEPTH) return;
@@ -1645,8 +2951,18 @@ static void z_dfs(const mpz_t E, int k, zws_t *w, zres_t *res)
     }
 }
 
-/* O side: O is a product over {p_j..p_m}; its partners E = O +- d must be even
- * gap-free numbers with more than m primes (fewer were covered on the E side) */
+/*
+ * z_test_O - O-side test: O is a product over the block {p_j..p_m}; try the
+ *            even endpoints E = O + d and E = O - d.
+ *
+ * Function: E must be at most the limit, even, and gapless with k > m primes
+ *           (z_chain_from() from 2 counts them).  Smaller k are covered by the
+ *           E side, so no pair is reported twice.  Then the interior must be
+ *           gapful.  O itself is gapless by construction.
+ * Inputs:   O (neither w->E nor w->tmp); w (uses E, p, x and tmp); res.
+ * Outputs:  pairs appended to res; res->nodes incremented.
+ * Errors:   none.
+ */
 static void z_test_O(const mpz_t O, zws_t *w, zres_t *res)
 {
     res->nodes++;
@@ -1657,12 +2973,25 @@ static void z_test_O(const mpz_t O, zws_t *w, zres_t *res)
         int k = 0;
         mpz_set_ui(w->p, 2);
         if (!z_chain_from(w->E, w->p, w, NULL, 0, &k)) continue;
+        /* k <= m was covered on the E side */
         if (k <= ZQ.m) continue;
         if (sgn == 0) { if (z_interior_gapful(O, w->E, w)) zres_add(res, O, w->E); }
         else          { if (z_interior_gapful(w->E, O, w)) zres_add(res, w->E, O); }
     }
 }
 
+/*
+ * z_dfs_O - O-side recursion: multiply in p_i, p_(i+1), ..., p_m, each at
+ *           least once, and test every complete product.
+ *
+ * Function: for e = 1, 2, ... while O * p_i^e <= limit + d: recurse with
+ *           i + 1; past p_m the product is complete and goes to z_test_O().
+ * Inputs:   O, a product over p_j..p_(i-1); i, with j+1 <= i <= m+1; w (uses
+ *           stk[i-j+1]); res.
+ * Outputs:  z_test_O() on every product over the whole block up to limit + d
+ *           (the bound that keeps E = O - d within the limit).
+ * Errors:   none; the depth is the block length (at most 5 for n <= 100000).
+ */
 static void z_dfs_O(const mpz_t O, int i, zws_t *w, zres_t *res)   /* multiply by p_i, i = j+1..m */
 {
     if (i > ZQ.m) { z_test_O(O, w, res); return; }
@@ -1677,6 +3006,17 @@ static void z_dfs_O(const mpz_t O, int i, zws_t *w, zres_t *res)   /* multiply b
     }
 }
 
+/*
+ * z_worker - thread body of the GMP search.
+ *
+ * Function: claims tasks through ZQ.next.  An E-side task (a, b) sets
+ *           E = 2^a * 3^b, tests it and, when b > 0, extends it with z_dfs().
+ *           An O-side task f1 sets O = p_j^f1 and completes it over the block
+ *           with z_dfs_O().
+ * Inputs:   arg, this thread's zeroed zres_t; the global ZQ.
+ * Outputs:  pairs and node counts in the zres_t; ZQ.done per task.
+ * Errors:   out of memory -> die() or a GMP abort.
+ */
 static void *z_worker(void *arg)
 {
     zres_t *res = arg;
@@ -1686,6 +3026,8 @@ static void *z_worker(void *arg)
         size_t ti = atomic_fetch_add(&ZQ.next, 1);
         if (ti >= ZQ.ntasks) break;
         ztask_t *t = &ZQ.tasks[ti];
+        /* E side: E = 2^a * 3^b, then 5, 7, ... through z_dfs(); O side: O = p_j^f1,
+         * completed over the block by z_dfs_O() */
         if (t->side == 0) {
             mpz_ui_pow_ui(w.stk[0], 2, t->a);
             if (t->b) { mpz_ui_pow_ui(w.tmp, 3, t->b); mpz_mul(w.stk[0], w.stk[0], w.tmp); }
@@ -1701,11 +3043,28 @@ static void *z_worker(void *arg)
     return NULL;
 }
 
+/*
+ * cmp_zpair - qsort() comparator for zpair_t by L, increasing.
+ *
+ * Function: mpz_cmp() of the L fields.
+ * Inputs:   pointers to two zpair_t.
+ * Outputs:  negative, zero or positive.
+ * Errors:   none.
+ */
 static int cmp_zpair(const void *a, const void *b)
 {
     return mpz_cmp(((const zpair_t *)a)->L, ((const zpair_t *)b)->L);
 }
 
+/*
+ * ztask_add - append a task to a growable ztask_t array.
+ *
+ * Function: doubles the capacity when full (1024 entries at first).
+ * Inputs:   t, n, cap (the array, its length and capacity); side; a, b (E
+ *           side); f1 (O side).
+ * Outputs:  the task appended; *t, *n and *cap updated.
+ * Errors:   out of memory -> die().
+ */
 static void ztask_add(ztask_t **t, size_t *n, size_t *cap, int side, unsigned a, unsigned b, unsigned f1)
 {
     if (*n == *cap) {
@@ -1717,8 +3076,27 @@ static void ztask_add(ztask_t **t, size_t *n, size_t *cap, int side, unsigned a,
     (*n)++;
 }
 
-/* Runs the GMP structural search.  Returns the number of pairs; *out receives
- * them sorted by L (caller frees).  a(n) = L+1 of the first pair.           */
+/*
+ * run_search_gmp - the GMP structural search for one even n (header
+ *                  section 4).
+ *
+ * Function: z_analyze(d); the E side covers up to kE = min(m, kmax) primes and
+ *           the O side the products over the block.  It estimates the work and
+ *           refuses above max_nodes, builds the tasks (2^a and 2^a*3^b for the
+ *           E side, p_j^f for the O side), runs the workers, and merges and
+ *           sorts the pairs by L.
+ * Inputs:   n, even, >= 2 (cmd_search_gmp() checks); limit, of any size;
+ *           threads >= 1; max_nodes; verbose; out.
+ * Outputs:  the number of pairs found, and *out = the pairs sorted by L (the
+ *           caller mpz_clear()s every L and R and frees out->v).  By the
+ *           coverage lemma the first pair gives a(n) exactly; no pair means
+ *           a(n) > limit - n.
+ * Errors:   d without a small odd prime factor, an E side of ZDEPTH - 2 or
+ *           more primes, an estimate above max_nodes, out of memory or
+ *           pthread_create() failure -> die().  Not reentrant (global ZQ).
+ *           Unlike run_search() the pairs are not re-checked here;
+ *           cmd_search_gmp() prints a verify_run.py command instead.
+ */
 static size_t run_search_gmp(int n, const mpz_t limit, int threads, double max_nodes, bool verbose, zres_t *out)
 {
     unsigned long d = (unsigned long)n + 1;
@@ -1731,6 +3109,7 @@ static size_t run_search_gmp(int n, const mpz_t limit, int threads, double max_n
     ZQ.kE = m < kmax ? m : kmax;
     if (ZQ.kE >= ZDEPTH - 2) die("too many primes in the even endpoint (kE = %d)", ZQ.kE);
 
+    /* estimate the work first (ln X rounded up to whole bits) */
     double lnX = mpz_sizeinbase(limit, 2) * log(2.0);
     double estE = 0;
     for (int k = 1; k <= ZQ.kE; k++) estE += z_est_E(k, lnX);
@@ -1756,6 +3135,7 @@ static size_t run_search_gmp(int n, const mpz_t limit, int threads, double max_n
     size_t ntasks = 0, cap = 0;
     mpz_t t1, t2;
     mpz_inits(t1, t2, NULL);
+    /* E-side tasks 2^a and 2^a*3^b, then O-side tasks p_j^f */
     for (unsigned a = 1;; a++) {
         mpz_ui_pow_ui(t1, 2, a);
         if (mpz_cmp(t1, limit) > 0) break;
@@ -1820,11 +3200,25 @@ static size_t run_search_gmp(int n, const mpz_t limit, int threads, double max_n
     return all.n;
 }
 
+/*
+ * cmd_search_gmp - the `search n` command in GMP mode (LIMIT >= 2^127, or
+ *                  --gmp).
+ *
+ * Function: validates the arguments, runs run_search_gmp(), prints up to 20
+ *           runs with the structure of their bounds, then a(n) with its digit
+ *           count and the verify_run.py command for an independent check, or
+ *           the bound a(n) > limit - n.
+ * Inputs:   n; limit, at least n + 1; threads; max_nodes.
+ * Outputs:  the report on stdout (flushed); progress on stderr.
+ * Errors:   n < 1, odd n or limit < n + 1 -> die(), plus the errors of
+ *           run_search_gmp().
+ */
 static void cmd_search_gmp(int n, const mpz_t limit, int threads, double max_nodes)
 {
     if (n < 1) die("n must be >= 1");
     if (n % 2) die("search handles even n only (odd n: the two bounding gapless numbers "
                    "have the same parity, so use 'scan')");
+    if (mpz_cmp_ui(limit, (unsigned long)n + 1) < 0) die("limit must be at least n+1 = %d", n + 1);
     zres_t all;
     run_search_gmp(n, limit, threads, max_nodes, true, &all);
     unsigned long d = (unsigned long)n + 1;
@@ -1871,11 +3265,23 @@ static void cmd_search_gmp(int n, const mpz_t limit, int threads, double max_nod
     fflush(stdout);
 }
 
-/* parse "123", "2^1000", "10^40", "1e50", and X+Y / X-Y of those into an mpz */
+/*
+ * parse_mpz - parse a numeric argument of any size (GMP builds).
+ *
+ * Function: the syntax of parse_u128(): decimal, B^E (B <= 10^6, E <= 200000),
+ *           MeE (E <= 100000), and sums and differences split at the LAST '+'
+ *           or '-' (left-associative).
+ * Inputs:   s, NUL-terminated; out, an initialized mpz_t.
+ * Outputs:  true with out set; false otherwise (out may have been changed).
+ * Errors:   false for empty or malformed text, a leading sign, negative
+ *           differences, and left operands of 256 characters or more.
+ */
 static bool parse_mpz(const char *s, mpz_t out)
 {
-    const char *pm = strpbrk(s, "+-");
-    if (pm && pm != s) {
+    const char *pm = NULL;                       /* the LAST '+' or '-', not at s[0] */
+    for (const char *c = s; *c; c++)
+        if ((*c == '+' || *c == '-') && c != s) pm = c;
+    if (pm) {
         char head[256];
         size_t hl = (size_t)(pm - s);
         if (hl >= sizeof head) return false;
@@ -1917,9 +3323,24 @@ static bool parse_mpz(const char *s, mpz_t out)
     for (const char *c = s; *c; c++) if (*c < '0' || *c > '9') return false;
     return *s && mpz_set_str(out, s, 10) == 0;
 }
-/* One display line for a big number: small primes by trial division, then
- * the cofactor (probable prime, gap-free structure, or composite with a gap).
- * Returns the number of prime gaps; *exact tells whether that count is exact. */
+
+/*
+ * z_partial_line - one display line for a big number, without a full
+ *                  factorization.
+ *
+ * Function: divides out the primes below 2^16 (printed with gap markers like
+ *           fmt_factor()) and shows the rest as a probable prime, as its
+ *           gapless structure, or as "[C...: composite with a prime gap]".
+ *           Whether the last small prime and the cofactor are consecutive is
+ *           decided exactly: the next prime after it must divide the cofactor,
+ *           which only needs a test when that prime is 65537.
+ * Inputs:   m; w (x and E are clobbered, plus whatever z_is_gapfree() uses);
+ *           buf and its size cap; exact.
+ * Outputs:  buf; returns the number of prime gaps found.  *exact is false when
+ *           that number is only a lower bound, which happens when the cofactor
+ *           is composite with a gap (it may contain more than one).
+ * Errors:   none; the text is truncated to cap.
+ */
 static int z_partial_line(const mpz_t m, zws_t *w, char *buf, size_t cap, bool *exact)
 {
     size_t pos = 0;
@@ -1947,8 +3368,12 @@ static int z_partial_line(const mpz_t m, zws_t *w, char *buf, size_t cap, bool *
     if (mpz_cmp_ui(w->x, 1) > 0 && pos < cap) {
         /* every prime of the cofactor exceeds SMALL_LIMIT */
         if (any) {
-            if (next_prime128(prev) < SMALL_LIMIT) gaps++; else *exact = false;
-            pos += (size_t)snprintf(buf + pos, cap - pos, " | ");
+            /* gap-free here iff the prime after prev divides the cofactor; a
+             * prime below 2^16 was already tried, so only 65537 needs a test */
+            u128 q = next_prime128(prev);
+            bool joined = q >= SMALL_LIMIT && mpz_divisible_ui_p(w->x, (unsigned long)q);
+            if (!joined) gaps++;
+            pos += (size_t)snprintf(buf + pos, cap - pos, joined ? "*" : " | ");
         }
         mpz_set(w->E, w->x);                       /* z_is_gapfree clobbers w->x */
         char d2[600];
@@ -1967,6 +3392,16 @@ static int z_partial_line(const mpz_t m, zws_t *w, char *buf, size_t cap, bool *
     return gaps;
 }
 
+/*
+ * cmd_check_gmp - the `check m` command for m >= 2^127 (GMP builds).
+ *
+ * Function: prints z_partial_line(), the A073490 count (exact or a lower
+ *           bound), the verdict of z_is_gapfree() with the structure, and a
+ *           warning if the two disagree.
+ * Inputs:   m.
+ * Outputs:  text on stdout.
+ * Errors:   none.  Prime verdicts are probabilistic.
+ */
 static void cmd_check_gmp(const mpz_t m)
 {
     zws_t w;
@@ -1985,6 +3420,15 @@ static void cmd_check_gmp(const mpz_t m)
     zws_clear(&w);
 }
 
+/*
+ * z_print_run - GMP version of print_run().
+ *
+ * Function: prints the bounds of the run and their structure and, for runs of
+ *           up to 300 numbers, one z_partial_line() per interior number.
+ * Inputs:   L < R, consecutive gapless numbers; w.
+ * Outputs:  text on stdout.
+ * Errors:   none.
+ */
 static void z_print_run(const mpz_t L, const mpz_t R, zws_t *w)
 {
     char dL[600], dR[600], line[4096];
@@ -2014,6 +3458,17 @@ static void z_print_run(const mpz_t L, const mpz_t R, zws_t *w)
     mpz_clears(n, m, NULL);
 }
 
+/*
+ * cmd_run_gmp - the `run m` command for m >= 2^127 (GMP builds).
+ *
+ * Function: like cmd_run(): steps down and up from m to the nearest gapless
+ *           numbers with z_is_gapfree() and prints the run, or both runs if m
+ *           itself is gapless.
+ * Inputs:   m.
+ * Outputs:  text on stdout.
+ * Errors:   none.  Each step can need a root-method test on a big composite,
+ *           so at thousands of bits this takes seconds.
+ */
 static void cmd_run_gmp(const mpz_t m0)
 {
     zws_t w;
@@ -2047,9 +3502,23 @@ static void cmd_run_gmp(const mpz_t m0)
 /* ------------------------------------------------------------------ */
 /* selftest                                                            */
 /* ------------------------------------------------------------------ */
+/*
+ * Internal consistency tests (header section 10).
+ */
 
+/*
+ * tfail: the number of failed expectations in the running self-test.
+ */
 static int tfail;
 
+/*
+ * expect - record one self-test expectation.
+ *
+ * Function: on failure increments tfail and prints "  FAIL: <message>".
+ * Inputs:   cond; a printf-style message, only formatted on failure.
+ * Outputs:  nothing on success.
+ * Errors:   none.
+ */
 static void expect(bool cond, const char *fmt, ...)
 {
     va_list ap;
@@ -2062,7 +3531,17 @@ static void expect(bool cond, const char *fmt, ...)
     fputc('\n', stdout);
 }
 
-/* brute-force gapful indicator for 2..M via smallest-prime-factor sieve */
+/*
+ * brute_gapful - reference prime-gap indicator for 2..M, by plain
+ *                factorization.
+ *
+ * Function: a smallest-prime-factor sieve, then for each m its distinct primes
+ *           in order, each compared with the prime after the previous one.
+ * Inputs:   M (the self-test uses 2*10^6).
+ * Outputs:  g[0..M], freed by the caller: g[m] = 1 iff m >= 2 has a prime gap
+ *           (g[0] = g[1] = 0).
+ * Errors:   out of memory -> die().  Memory 5*(M+1) bytes.
+ */
 static uint8_t *brute_gapful(u64 M)
 {
     u32 *spf = xcalloc(M + 1, sizeof(u32));
@@ -2091,6 +3570,16 @@ static uint8_t *brute_gapful(u64 M)
     return g;
 }
 
+/*
+ * cmd_selftest - the `selftest` command: groups [1]..[7] of header
+ *                section 10.
+ *
+ * Function: runs every group and prints each failed expectation.
+ * Inputs:   threads, for the scans and searches it runs.
+ * Outputs:  progress and failures on stdout.  Never returns: exits with 0 if
+ *           everything passed, 1 otherwise.
+ * Errors:   resource failures -> die().
+ */
 static void cmd_selftest(int threads)
 {
     double t0 = now();
@@ -2312,14 +3801,26 @@ static void cmd_selftest(int threads)
 /* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
+/*
+ * Option parsing and command dispatch.
+ */
 
+/*
+ * usage - print the command summary to stderr and exit with status 2.
+ *
+ * Function: called for a missing or unknown command, a wrong number of
+ *           arguments, or an unknown option.
+ * Inputs:   none.
+ * Outputs:  never returns.
+ * Errors:   none.
+ */
 static void usage(void)
 {
     fprintf(stderr,
         "usage:\n"
         "  a137723 scan N [-t T] [-m MAXN] [-o FILE]   exhaustive: every a(n) <= N\n"
         "  a137723 search n [n ...] [-l LIMIT] [-t T]  structural search for even n (default LIMIT 2^64);\n"
-        "                                              LIMIT above 2^127 (e.g. 2^1000) uses GMP; --gmp forces it,\n"
+        "                                              LIMIT >= 2^127 (e.g. 2^1000) uses GMP; --gmp forces it,\n"
         "                                              --max-nodes X caps the estimated enumeration (default 5e9)\n"
         "  a137723 next [-N SCAN] [-l LIMIT] [-t T] [-m MAXN] [-o FILE]\n"
         "                                              scan to SCAN (default 10^10), then search missing even n\n"
@@ -2331,6 +3832,22 @@ static void usage(void)
     exit(2);
 }
 
+/*
+ * main - command-line entry point.
+ *
+ * Function: builds the small-prime tables, parses the options (they may
+ *           appear anywhere after the command; everything else is a
+ *           positional argument), chooses 128-bit or GMP mode from the size of
+ *           -l, and dispatches to the command.
+ * Inputs:   argv[1], the command; options -t T (threads; default: the online
+ *           CPUs, at least 1), -m MAXN, -o FILE, -l LIMIT, -N SCAN, --gmp,
+ *           --max-nodes X.
+ * Outputs:  exit status 0 on success (selftest: 0 or 1), 1 after die(), 2
+ *           after usage().
+ * Errors:   unknown options -> usage(); malformed numbers -> die(); a scan N
+ *           below 100 is raised to 100; more than 64 positional arguments are
+ *           ignored; -t with a non-number gives one thread (atoi()).
+ */
 int main(int argc, char **argv)
 {
     if (argc < 2) usage();
@@ -2360,6 +3877,7 @@ int main(int argc, char **argv)
         else if (npos < 64) pos[npos++] = argv[i];
     }
 
+    /* 128-bit mode for LIMIT < 2^127, GMP mode for LIMIT >= 2^127 or --gmp */
     bool gmp_mode = force_gmp;
 #ifdef HAVE_GMP
     mpz_t zlimit;
@@ -2374,6 +3892,7 @@ int main(int argc, char **argv)
     if (limit_str) limit = arg_u128(limit_str, "limit");
     if (limit > ((u128)1 << 127)) die("limit above 2^127 needs the GMP build (make with gmp.h available)");
     if (force_gmp) die("this build has no GMP support");
+    (void)max_nodes;                             /* --max-nodes only matters in GMP mode */
 #endif
 
     if (!strcmp(cmd, "scan")) {
@@ -2403,6 +3922,7 @@ int main(int argc, char **argv)
         mpz_t zm;
         mpz_init(zm);
         if (!parse_mpz(pos[0], zm)) die("bad m: '%s'", pos[0]);
+        /* numbers of 2^127 and above go to the GMP versions */
         if (mpz_sizeinbase(zm, 2) > 127) {
             if (is_check) cmd_check_gmp(zm); else cmd_run_gmp(zm);
             mpz_clear(zm);
