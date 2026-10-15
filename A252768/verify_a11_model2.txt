@@ -1,0 +1,16 @@
+p = 1009809788912233 is prime; 30128552685785 primes <= p, 30128552685784 gaps (37200.7 s)
+S_1  = 1009809788912231  (50 bits)  prime  [mr]  [gmp: prime]
+S_2  = 62234731803809413  (56 bits)  prime  [mr]  [gmp: probable prime]
+S_3  = 5657529453243494201  (63 bits)  prime  [mr]  [gmp: probable prime]
+S_4  = 680258345614629409297  (70 bits)  prime  [mr]  [gmp: probable prime]
+S_5  = 101712366014944608886241  (77 bits)  prime  [mr]  [gmp: probable prime]
+S_6  = 18180346330505067326217793  (84 bits)  prime  [mr]  [gmp: probable prime]
+S_7  = 3780026913945005398382926721  (92 bits)  prime  [mr]  [gmp: probable prime]
+S_8  = 896081555456003024041519984897  (100 bits)  prime  [mr]  [gmp: probable prime]
+S_9  = 238503222782742830604007067123201  (108 bits)  prime  [mr]  [gmp: probable prime]
+S_10 = 70414217271582880302629394661942273  (116 bits)  prime  [mr]  [gmp: probable prime]
+S_11 = 22833087308636059205086630623560611841  (125 bits)  prime  [mr]  [gmp: probable prime]
+S_12 = 8066007422440485148327075748850168631297  (133 bits)  composite  [gmp: composite]
+S_13 = 3082782485490714385447917691440691208642561  (142 bits)  composite  [gmp: composite]
+S_14 = 1267154115129025264975535240796647595995185153  (150 bits)  composite  [gmp: composite]
+depth(1009809788912233) = 11: S_1..S_11 are prime

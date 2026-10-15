@@ -21,8 +21,8 @@ When this work started (Sep 16 2026) the OEIS entry (keyword `hard,more`)
 listed a(1..7): 5, 5, 13, 14593, 372313, 2315773, 541613713. The two terms
 found below were submitted the same day and approved on Sep 17 2026
 (revision #21); the entry now lists a(1..9). **a(10) = 3770303151073** (Oct 13
-2026) and **a(11) = 1009809788912233** (Oct 14 2026, independent recomputation
-in progress) were found with this tool (see Results) and are not yet submitted;
+2026) and **a(11) = 1009809788912233** (Oct 14 2026) were found with this tool,
+verified and certified (see Results), and are not yet submitted;
 `submission.md` has the ready-to-paste lines.
 
 ## Results
@@ -40,7 +40,7 @@ which reproduce every power sum digit for digit.
 | 8 | **7952072743** | S₉ = 38009162738943211881748481 = composite |
 | 9 | **21814967833** | S₁₀ = 30245374383129007149396784129 = composite |
 | 10 | **3770303151073** | S₁₁ = 11167738558029370106410742901913601 = composite (S₁₂ happens to be prime) |
-| 11 | **1009809788912233** | S₁₂ exceeds 2¹²⁸, being recomputed with GMP (if prime, this p is also a(12)) |
+| 11 | **1009809788912233** | S₁₂ = 8066007422440485148327075748850168631297 = composite (133 bits, via GMP) |
 
 The exhaustive scan of all primes below 10¹² (37,607,912,018 primes, 111 s on the
 M1 Pro) found a(8) and a(9) and no prime of depth ≥ 10; the OEIS terms a(1..7)
@@ -65,11 +65,16 @@ so **a(11) > 10¹⁵**; the automatic continuation from its checkpoint then hit 
 prime of depth 11 after 37 minutes, at 1009809788912233 — only 1 % above 10¹⁵ —
 with every chunk below it complete, so it is the smallest. PARI/GP proves
 S₁..S₁₁ prime (`certify_a11.txt`). S₁₂ is beyond 128 bits at this size, so the
-scan could not test it; `verify` (parallel gap-histogram mode, GMP) is
-recomputing all sums on jeff-model2 and, independently, on jeff-model3. By
-monotonicity a(12) ≥ a(11): a(12) = a(11) if S₁₂ turns out prime, otherwise
-a(12) > 1009809788912233. The continuation was stopped at 1.039·10¹⁵ (it could
-not test k = 12 there).
+scan could not test it; `verify 1009809788912233 -k 14 -t 32` on jeff-model3
+(parallel gap-histogram mode, 6 h 08 min, a machine and chunking different from
+the scan's) recomputed everything from scratch: the same eleven sums digit for
+digit, 30,128,552,685,785 primes up to p, GMP's histogram sums agreeing with the
+128-bit pipeline sums, and **S₁₂ composite** (S₁₃, S₁₄ too), so the depth is
+exactly 11 and, a(n) being non-decreasing, **a(12) > 1009809788912233**
+(`verify_a11_model3.txt`). jeff-model2's own recomputation (10 h 20 min, 22
+threads) then reproduced the same fourteen sums and verdicts
+(`verify_a11_model2.txt`).
+The continuation was stopped at 1.039·10¹⁵ (it could not test k = 12 there).
 The sequence is now
 
 ```
@@ -101,7 +106,7 @@ p = 1009809788912233  S_1 = 1009809788912231    S_2 = 62234731803809413    S_3 =
                  S_6 = 18180346330505067326217793             S_7 = 3780026913945005398382926721
                  S_8 = 896081555456003024041519984897         S_9 = 238503222782742830604007067123201
                  S_10 = 70414217271582880302629394661942273   S_11 = 22833087308636059205086630623560611841
-                 S_12 > 2^128: pending (GMP recomputation)
+                 S_12 = 8066007422440485148327075748850168631297 (composite: 7043 divides it)
 ```
 
 a(10) was verified on the M1 Pro by `a252768 verify 3770303151073 -k 14 -t 10`
@@ -206,7 +211,8 @@ at 1.5·10¹⁴); see "Tips for the next run".
 | jeff-model1 (8-core EPYC 7B12, gcc 14): 10¹² .. 10¹⁴ | 4 h 19 min | 6.4·10⁹ numbers/s |
 | jeff-model2: totals-only pass 0 .. 10¹⁴ | 55 min | 3.0·10¹⁰ numbers/s |
 | jeff-model2: 10¹⁴ .. 10¹⁵ | 15.4 h | 1.62·10¹⁰ numbers/s |
-| jeff-model2: `verify 1009809788912233 -t 22` (pipeline + histogram) | ~7.6 h | 3.7·10¹⁰ numbers/s |
+| jeff-model3: `verify 1009809788912233 -t 32` (pipeline + histogram) | 6 h 08 min | 4.6·10¹⁰ numbers/s |
+| jeff-model2: the same with 22 threads | 10 h 20 min | 2.7·10¹⁰ numbers/s |
 | jeff-model3 (32-vCPU Xeon 8581C, gcc 14): 0 .. 10¹¹ | 3.9 s (4.9 s with 16 threads) | 2.6·10¹⁰ numbers/s |
 | jeff-model3: 0 .. 10¹² | 35.8 s | 2.8·10¹⁰ numbers/s |
 | jeff-model2 (22-vCPU Xeon 8481C, gcc 12): 0 .. 10¹¹ | 6.7 s (8.1 s with 11 threads) | 1.5·10¹⁰ numbers/s |

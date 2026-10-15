@@ -27,11 +27,12 @@ this work applies to them (A252655 already has a 1000-term b-file).
 Found by jeff-model2's continuation above 10^15 (37 minutes in, every chunk below it
 complete); the scans of [10^12, 10^14] (jeff-model1) and [10^14, 10^15] (jeff-model2)
 contain no prime of depth 11, so it is a(11). PARI/GP `isprime` proves S_1..S_11
-prime (`certify_a11.txt`). S_12 exceeds 2^128 and is being recomputed with GMP
-(`verify 1009809788912233 -k 14`, on jeff-model2 and jeff-model1 independently);
-until that finishes, treat the term as "certified, recomputation pending". Because
-a(n) is non-decreasing, a(12) >= a(11); if S_12 turns out prime then a(12) = a(11)
-too, otherwise the bound to submit is `a(12) > 1009809788912233`.
+prime (`certify_a11.txt`). The sums were recomputed from scratch on jeff-model3
+(`verify 1009809788912233 -k 14 -t 32`, 6 h: identical S_1..S_11, exact prime
+count, GMP agreeing) and S_12 = 8066007422440485148327075748850168631297 is
+composite (7043 divides it), so the depth is exactly 11; since a(n) is
+non-decreasing, the bound to submit alongside is `a(12) > 1009809788912233`.
+Submit-ready.
 
 ```
 %S A252768 5,5,13,14593,372313,2315773,541613713,7952072743,21814967833,3770303151073,1009809788912233
@@ -39,8 +40,7 @@ too, otherwise the bound to submit is `a(12) > 1009809788912233`.
 %E A252768 a(10)-a(11) from _Jeff Sponaugle_, Oct 14 2026
 ```
 
-(The bound comment of item 1 becomes `a(12) > 1009809788912233` once S_12 is known
-composite; item 2's last sentence becomes "a(10) = 3770303151073 and a(11) =
+(Item 1's bound comment is then `a(12) > 1009809788912233`; item 2's last sentence becomes "a(10) = 3770303151073 and a(11) =
 1009809788912233 lie at the heuristic's 21 % and 73 % points; it puts a(12) near
 3*10^16.")
 
@@ -82,11 +82,12 @@ k ≤ 12) found no prime of depth 10. OEIS convention is a one-line comment for
 the next term:
 
 ```
-%C A252768 a(11) > 10^14. - _Jeff Sponaugle_, Oct 13 2026
+%C A252768 a(12) > 1009809788912233. - _Jeff Sponaugle_, Oct 14 2026
 ```
 
-(The run to 10^14 is done; the a(10) bound is superseded by a(10) itself. If
-jeff-model2 finishes [10^14, 10^15] without a hit, make it `a(11) > 10^15`.)
+(a(n) is non-decreasing, so a(12) >= a(11); S_12(a(11)) is composite, hence the
+strict inequality. The earlier bounds for a(10) and a(11) are superseded by the
+terms themselves.)
 
 ### 2. Repair the Sep 16 comment  (recommended)
 

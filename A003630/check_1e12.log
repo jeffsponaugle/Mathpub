@@ -1,0 +1,2 @@
+checking [0, 1000000000000], 4 threads, chunk 10000000000, state a003630.state
+[ 88.0%] 88/101 chunks  1.47e+10 numbers/s  elapsed 60s  eta 8s

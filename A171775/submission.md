@@ -194,7 +194,7 @@ Approved and live (credited to Jeff Sponaugle):
 | A133697 | #27, Sep 22 2026 | a(14)-a(15) |
 | A306256 | #18, Oct 02 2026 | a(4) and the search-bound comment |
 | A063501 | #29, Oct 03 2026 | a(18)-a(20) |
-| A350826 | #36, Oct 08 2026 | **new:** a(18)-a(20) and the comment on sextuplets with members of different lengths |
+| A350826 | #36, Oct 08 2026 | **new:** a(18)-a(20), the comment on sextuplets with members of different lengths, the fixed link to Luhn's `PI_06.php` |
 | A053348 | #33, Oct 08 2026 | **new:** a(9) = 6082 |
 | A005344 | #39, Oct 08 2026 | **new:** a(8) = 6082 |
 | A157250 | #37, Oct 08 2026 | **new:** a(11), a(13), a(14) inserted, a(17)-a(30) added |
@@ -222,7 +222,7 @@ with the state of the OEIS entries on Oct 14:
 | `../A053686/submission.md` | comment listing the second occurrences, program link (entry still #28) |
 | `../A137723/submission.md` | follow-up edit (no computation needed); new terms need runs (entry still #18) |
 | `../A001220/submission.md` | bound updates when the search resumes; R. Fischer's A039951 edit was approved on Oct 08 (#137), so that entry is no longer blocked |
-| `../A350826/submission.md` | done (approved Oct 08); only the optional A063501 follow-up is left |
+| `../A350826/submission.md` | done (approved Oct 08; that file still says "to do"); only the optional A063501 follow-up is left. The live EXTENSIONS line reads "a(18)-a(19) from Karl Desfontaines confirmed by, a(20) added by _Jeff Sponaugle_, Oct 08 2026", which looks garbled and could be fixed in a follow-up |
 | `../A112389/` | A123829 a(10)-a(11), A123831 a(9)-a(10), A112390 corrections: ready, not submitted (entries unchanged) |
 | (no draft yet) | A055206(13) = 6470105925 (balanced primes below 10^13), from the A335406 scans (`../A335406/README.md`); A055206 still #13 |
 
